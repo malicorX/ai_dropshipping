@@ -1,1 +1,1 @@
-"""eBay Sell API helpers (OAuth first; listing later)."""
+"""eBay Sell API helpers (OAuth, unpublished offers, publish)."""

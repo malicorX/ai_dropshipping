@@ -4,7 +4,7 @@ REM   start.bat             production UI (builds ui\dist if missing)
 REM   start.bat rebuild     wipe ui\dist, reinstall npm deps, rebuild UI, then start
 REM   start.bat rebuild headless   same rebuild, then API-only
 REM   start.bat dev         API + PyWebView against Vite :5173 (run npm run dev in ui\)
-REM   start.bat headless    API only — open http://127.0.0.1:8770 in a browser
+REM   start.bat headless    API only — open https://127.0.0.1:8770 in a browser
 
 setlocal
 cd /d "%~dp0"

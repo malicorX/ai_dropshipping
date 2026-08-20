@@ -35,7 +35,9 @@ Headless API only:
 start.bat headless
 ```
 
-Then open http://127.0.0.1:8770
+Then open https://127.0.0.1:8770 (self-signed TLS — the browser will warn once; proceed). eBay OAuth requires HTTPS on the callback URL.
+
+eBay flow after Connect: Evaluate → generate draft → **Send unpublished offer to eBay** → **Publish on eBay** → **Open live item**. Sandbox My eBay / Seller Hub listing pages often error; the `sandbox.ebay.com/itm/…` URL after publish is the check that matters.
 
 Dev UI:
 

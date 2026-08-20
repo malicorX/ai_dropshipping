@@ -12,7 +12,13 @@ from dropship_desk import config
 from dropship_desk.models import MarginSettings
 
 # Don't overwrite these with a fresh Find PASS/FAIL.
-_PROTECTED_STATUSES = frozenset({"listed", "drafted"})
+_PROTECTED_STATUSES = frozenset({"listed", "drafted", "ebay_unpublished"})
+_PIPELINE_STATUSES = ("ready", "drafted", "ebay_unpublished", "listed")
+_CANDIDATE_COLS = (
+    "id, asin, title, amazon_total, ebay_price, max_amazon_buy, "
+    "status, offer_json, margin_json, hard_reject_json, "
+    "created_at, updated_at, listing_draft_json, ebay_listing_json"
+)
 
 
 def _utc_now() -> str:
@@ -66,6 +72,10 @@ def init_db() -> None:
         if "listing_draft_json" not in cols:
             conn.execute(
                 "ALTER TABLE candidates ADD COLUMN listing_draft_json TEXT NOT NULL DEFAULT ''"
+            )
+        if "ebay_listing_json" not in cols:
+            conn.execute(
+                "ALTER TABLE candidates ADD COLUMN ebay_listing_json TEXT NOT NULL DEFAULT ''"
             )
 
 
@@ -134,13 +144,11 @@ def get_candidate_by_asin(asin: str) -> dict[str, Any] | None:
     init_db()
     with connect() as conn:
         row = conn.execute(
-            """
-            SELECT id, asin, title, amazon_total, ebay_price, max_amazon_buy,
-                   status, offer_json, margin_json, hard_reject_json,
-                   created_at, updated_at, listing_draft_json
+            f"""
+            SELECT {_CANDIDATE_COLS}
             FROM candidates WHERE asin = ?
             """,
-            (asin,),
+            (asin.strip().upper(),),
         ).fetchone()
     if not row:
         return None
@@ -232,12 +240,22 @@ def list_candidates(
 ) -> list[dict[str, Any]]:
     init_db()
     with connect() as conn:
-        if status:
+        if status in ("active", "pipeline"):
+            placeholders = ",".join("?" for _ in _PIPELINE_STATUSES)
             rows = conn.execute(
-                """
-                SELECT id, asin, title, amazon_total, ebay_price, max_amazon_buy,
-                       status, offer_json, margin_json, hard_reject_json,
-                       created_at, updated_at, listing_draft_json
+                f"""
+                SELECT {_CANDIDATE_COLS}
+                FROM candidates
+                WHERE status IN ({placeholders})
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                (*_PIPELINE_STATUSES, limit),
+            ).fetchall()
+        elif status:
+            rows = conn.execute(
+                f"""
+                SELECT {_CANDIDATE_COLS}
                 FROM candidates
                 WHERE status = ?
                 ORDER BY updated_at DESC, id DESC
@@ -247,10 +265,8 @@ def list_candidates(
             ).fetchall()
         else:
             rows = conn.execute(
-                """
-                SELECT id, asin, title, amazon_total, ebay_price, max_amazon_buy,
-                       status, offer_json, margin_json, hard_reject_json,
-                       created_at, updated_at, listing_draft_json
+                f"""
+                SELECT {_CANDIDATE_COLS}
                 FROM candidates
                 ORDER BY updated_at DESC, id DESC
                 LIMIT ?
@@ -284,7 +300,7 @@ def save_listing_draft(asin: str, draft: dict[str, Any]) -> None:
             """
             UPDATE candidates
             SET listing_draft_json = ?, status = CASE
-                WHEN status IN ('listed', 'drafted') THEN status
+                WHEN status IN ('listed', 'drafted', 'ebay_unpublished') THEN status
                 ELSE 'drafted'
             END, updated_at = ?
             WHERE asin = ?
@@ -312,6 +328,26 @@ def patch_candidate_offer(asin: str, offer_patch: dict[str, Any]) -> bool:
     return True
 
 
+def save_ebay_listing(asin: str, listing: dict[str, Any]) -> None:
+    init_db()
+    now = _utc_now()
+    asin = asin.strip().upper()
+    status = str(listing.get("status") or "")
+    workflow = "listed" if status == "published" else "ebay_unpublished"
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE candidates
+            SET ebay_listing_json = ?, status = CASE
+                WHEN status = 'listed' AND ? != 'listed' THEN status
+                ELSE ?
+            END, updated_at = ?
+            WHERE asin = ?
+            """,
+            (json.dumps(listing, ensure_ascii=False), workflow, workflow, now, asin),
+        )
+
+
 def get_listing_draft(asin: str) -> dict[str, Any] | None:
     init_db()
     with connect() as conn:
@@ -336,6 +372,13 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
             draft = json.loads(draft_raw)
         except json.JSONDecodeError:
             draft = None
+    ebay_raw = row["ebay_listing_json"] if "ebay_listing_json" in keys else ""
+    ebay_listing = None
+    if ebay_raw:
+        try:
+            ebay_listing = json.loads(ebay_raw)
+        except json.JSONDecodeError:
+            ebay_listing = None
     return {
         "id": row["id"],
         "asin": row["asin"],
@@ -350,4 +393,5 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "listing_draft": draft,
+        "ebay_listing": ebay_listing,
     }

@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlencode
 
@@ -65,7 +65,7 @@ def authorize_url() -> str:
         raise ValueError(
             "eBay RuName missing. In developer.ebay.com → your app → User tokens, "
             "create an OAuth RuName whose Auth accepted URL is "
-            f"http://127.0.0.1:{config.DEFAULT_API_PORT}/api/ebay/oauth/callback "
+            f"https://127.0.0.1:{config.DEFAULT_API_PORT}/api/ebay/oauth/callback "
             "then set EBAY_SANDBOX_RUNAME (or EBAY_PROD_RUNAME) in .env"
         )
     params = {
@@ -134,3 +134,87 @@ def exchange_code(code: str) -> dict[str, Any]:
         payload = r.json()
     save_tokens(payload)
     return public_status()
+
+
+def access_token(*, skew_seconds: int = 120) -> str:
+    """Return a usable user access token, refreshing when close to expiry."""
+    tokens = load_tokens()
+    token = str(tokens.get("access_token") or "")
+    refresh = str(tokens.get("refresh_token") or "")
+    if not token and not refresh:
+        raise RuntimeError("eBay is not connected — use Settings → Connect eBay")
+    if token and not _token_expiring(tokens.get("expires_at"), skew_seconds=skew_seconds):
+        return token
+    if not refresh:
+        raise RuntimeError("eBay access token expired and no refresh token is stored")
+    return _refresh_access_token(refresh)
+
+
+def _token_expiring(expires_at: Any, *, skew_seconds: int) -> bool:
+    if not expires_at:
+        return True
+    try:
+        exp = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) + timedelta(seconds=skew_seconds) >= exp
+
+
+def _refresh_access_token(refresh_token: str) -> str:
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "scope": OAUTH_SCOPES,
+    }
+    with httpx.Client(timeout=30.0) as client:
+        r = client.post(
+            f"{config.ebay_api_base()}/identity/v1/oauth2/token",
+            data=data,
+            headers={
+                "Authorization": _basic_auth_header(),
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        if r.status_code >= 400:
+            raise RuntimeError(f"eBay token refresh failed ({r.status_code}): {r.text[:400]}")
+        payload = r.json()
+    save_tokens(payload)
+    token = str(payload.get("access_token") or "")
+    if not token:
+        raise RuntimeError("eBay token refresh returned no access_token")
+    return token
+
+
+_app_token_cache: dict[str, Any] = {"token": "", "expires_at": 0.0}
+
+
+def application_token() -> str:
+    """Client-credentials token for Taxonomy (category suggestions)."""
+    now = time.time()
+    cached = str(_app_token_cache.get("token") or "")
+    expires_at = float(_app_token_cache.get("expires_at") or 0)
+    if cached and now < expires_at - 60:
+        return cached
+    with httpx.Client(timeout=30.0) as client:
+        r = client.post(
+            f"{config.ebay_api_base()}/identity/v1/oauth2/token",
+            data={
+                "grant_type": "client_credentials",
+                "scope": "https://api.ebay.com/oauth/api_scope",
+            },
+            headers={
+                "Authorization": _basic_auth_header(),
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        if r.status_code >= 400:
+            raise RuntimeError(f"eBay application token failed ({r.status_code}): {r.text[:400]}")
+        payload = r.json()
+    token = str(payload.get("access_token") or "")
+    if not token:
+        raise RuntimeError("eBay application token missing")
+    _app_token_cache["token"] = token
+    _app_token_cache["expires_at"] = now + float(payload.get("expires_in") or 7200)
+    return token

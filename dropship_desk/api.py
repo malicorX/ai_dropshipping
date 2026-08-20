@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import sys
 import webbrowser
 from urllib.parse import urlparse
 
@@ -12,7 +15,9 @@ from fastapi.staticfiles import StaticFiles
 
 from dropship_desk import __version__, config
 from dropship_desk.amazon.product import fetch_product_offer
+from dropship_desk.ebay import listing as ebay_listing
 from dropship_desk.ebay import oauth as ebay_oauth
+from dropship_desk.ebay.client import EbayApiError
 from dropship_desk.db import (
     ensure_margin_policy,
     get_candidate_by_asin,
@@ -50,6 +55,7 @@ from dropship_desk.models import (
     SettingsIn,
     SettingsOut,
 )
+from dropship_desk.safety import check_ebay_sell
 
 _ALLOWED_OPEN_HOSTS = frozenset(
     {
@@ -61,8 +67,37 @@ _ALLOWED_OPEN_HOSTS = frozenset(
         "ebay.com",
         "auth.ebay.com",
         "auth.sandbox.ebay.com",
+        "www.sandbox.ebay.com",
+        "sandbox.ebay.com",
     }
 )
+
+
+def _ebay_health() -> dict:
+    sell = check_ebay_sell()
+    return {
+        **ebay_oauth.public_status(),
+        "sell_allowed": sell.ok,
+        "sell_block_reason": "" if sell.ok else sell.reason,
+    }
+
+
+class _SkipNoisyAccess(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return "/api/health" not in msg and "/api/find/status" not in msg
+
+
+def _benign_disconnect(exc: BaseException | None) -> bool:
+    if isinstance(exc, ConnectionResetError):
+        return True
+    return getattr(exc, "winerror", None) == 10054
+
+
+def _loop_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    if _benign_disconnect(context.get("exception")):
+        return
+    loop.default_exception_handler(context)
 
 
 def create_app() -> FastAPI:
@@ -76,11 +111,19 @@ def create_app() -> FastAPI:
             "http://127.0.0.1:5173",
             "http://localhost:8770",
             "http://127.0.0.1:8770",
+            "https://localhost:8770",
+            "https://127.0.0.1:8770",
         ],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.on_event("startup")
+    async def _quiet_webview_disconnects() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(_loop_exception_handler)
+        logging.getLogger("uvicorn.access").addFilter(_SkipNoisyAccess())
 
     @app.get("/api/health")
     def health() -> dict:
@@ -94,7 +137,7 @@ def create_app() -> FastAPI:
             "ollama_reachable": ollama_reachable(),
             "data_dir": str(config.DATA_DIR),
             "find_running": FIND_JOB.status()["running"],
-            "ebay": ebay_oauth.public_status(),
+            "ebay": _ebay_health(),
         }
 
     @app.get("/api/settings", response_model=SettingsOut)
@@ -156,6 +199,44 @@ def create_app() -> FastAPI:
             "<p>You can close this tab and return to Dropship Desk → Settings.</p>"
             "</body></html>"
         )
+
+    def _require_ebay_sell() -> None:
+        if not ebay_oauth.load_tokens().get("refresh_token"):
+            raise HTTPException(
+                status_code=400,
+                detail="eBay is not connected — Settings → Connect eBay",
+            )
+        decision = check_ebay_sell()
+        if not decision.ok:
+            raise HTTPException(status_code=403, detail=decision.reason)
+
+    @app.get("/api/ebay/listings/{asin}")
+    def ebay_listing_get(asin: str) -> dict:
+        return ebay_listing.public_listing(asin)
+
+    @app.post("/api/ebay/listings/{asin}/stage")
+    def ebay_listing_stage(asin: str, body: dict | None = None) -> dict:
+        _require_ebay_sell()
+        try:
+            return ebay_listing.stage_unpublished(asin, body or None)
+        except EbayApiError as e:
+            sys.stderr.write(f"[ebay] stage failed: {e}\n")
+            raise HTTPException(status_code=502, detail=str(e)) from e
+        except RuntimeError as e:
+            sys.stderr.write(f"[ebay] stage failed: {e}\n")
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+    @app.post("/api/ebay/listings/{asin}/publish")
+    def ebay_listing_publish(asin: str) -> dict:
+        _require_ebay_sell()
+        try:
+            return ebay_listing.publish_offer(asin)
+        except EbayApiError as e:
+            sys.stderr.write(f"[ebay] publish failed: {e}\n")
+            raise HTTPException(status_code=502, detail=str(e)) from e
+        except RuntimeError as e:
+            sys.stderr.write(f"[ebay] publish failed: {e}\n")
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
     @app.get("/api/candidates")
     def candidates(limit: int = 200, status: str | None = None) -> list[dict]:

@@ -18,6 +18,47 @@ type Health = {
     oauth_connected: boolean;
     app_id_hint: string;
     auto_publish: boolean;
+    sell_allowed?: boolean;
+    sell_block_reason?: string;
+  };
+};
+
+type EbayListing = {
+  asin?: string;
+  env?: string;
+  status: string;
+  sku?: string;
+  offer_id?: string;
+  listing_id?: string;
+  item_url?: string;
+  seller_hub_url?: string;
+  category_id?: string;
+  category_name?: string;
+  error?: string;
+};
+
+type ListingDraft = {
+  title?: string;
+  subtitle?: string;
+  bullet_points?: string[];
+  description_html?: string;
+  image_plan?: {
+    strategy?: string;
+    ordered_urls?: string[];
+    skip_urls?: string[];
+    caption_ideas?: string[];
+  };
+  model?: string;
+  media?: {
+    local_images?: { api_path?: string; source_url?: string; path?: string }[];
+    source_urls?: string[];
+    download_errors?: string[];
+  };
+  artifacts?: {
+    html_api?: string;
+    json_api?: string;
+    html_path?: string;
+    json_path?: string;
   };
 };
 
@@ -56,6 +97,8 @@ type Candidate = {
     price_source?: string;
     note?: string;
   };
+  listing_draft?: ListingDraft | null;
+  ebay_listing?: EbayListing | null;
 };
 
 type MarginSettings = {
@@ -91,6 +134,16 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     const text = await res.text();
+    try {
+      const parsed = JSON.parse(text) as { detail?: unknown };
+      if (typeof parsed.detail === "string" && parsed.detail) {
+        throw new Error(parsed.detail);
+      }
+    } catch (e) {
+      if (e instanceof Error && e.message && e.message !== text) {
+        throw e;
+      }
+    }
     throw new Error(text || res.statusText);
   }
   return res.json() as Promise<T>;
@@ -115,6 +168,13 @@ async function openAmazon(asin: string): Promise<void> {
   });
 }
 
+async function openExternal(url: string): Promise<void> {
+  await api<{ ok: boolean }>("/api/open-external", {
+    method: "POST",
+    body: JSON.stringify({ url }),
+  });
+}
+
 export default function App() {
   const [tab, setTab] = useState<Tab>("find");
   const [health, setHealth] = useState<Health | null>(null);
@@ -127,19 +187,24 @@ export default function App() {
     setError("");
   }, []);
 
-  const refreshHealth = useCallback(async () => {
+  const refreshHealth = useCallback(async (): Promise<Health | null> => {
     try {
       const h = await api<Health>("/api/health");
       setHealth(h);
-      setError("");
+      return h;
     } catch (e) {
       setHealth(null);
       setError(e instanceof Error ? e.message : String(e));
+      return null;
     }
   }, []);
 
   useEffect(() => {
     void refreshHealth();
+    const id = window.setInterval(() => {
+      void refreshHealth();
+    }, 20000);
+    return () => window.clearInterval(id);
   }, [refreshHealth]);
 
   return (
@@ -189,11 +254,13 @@ export default function App() {
       )}
       {tab === "orders" && (
         <div className="panel muted">
-          Order desk lands next. Flow for now: Find → Drafts → Prepare listing → Evaluate (set eBay
-          price) → list manually on eBay.
+          Order desk lands next. Flow: Find → Drafts → Prepare listing → Evaluate → Send unpublished
+          offer to eBay → Publish (manual).
         </div>
       )}
-      {tab === "settings" && <SettingsPanel onError={setError} health={health} />}
+      {tab === "settings" && (
+        <SettingsPanel onError={setError} health={health} refreshHealth={refreshHealth} />
+      )}
 
       {error ? <p className="error">{error}</p> : null}
     </div>
@@ -462,31 +529,6 @@ function FindPanel({
   );
 }
 
-type ListingDraft = {
-  title?: string;
-  subtitle?: string;
-  bullet_points?: string[];
-  description_html?: string;
-  image_plan?: {
-    strategy?: string;
-    ordered_urls?: string[];
-    skip_urls?: string[];
-    caption_ideas?: string[];
-  };
-  model?: string;
-  media?: {
-    local_images?: { api_path?: string; source_url?: string; path?: string }[];
-    source_urls?: string[];
-    download_errors?: string[];
-  };
-  artifacts?: {
-    html_api?: string;
-    json_api?: string;
-    html_path?: string;
-    json_path?: string;
-  };
-};
-
 function EvaluatePanel({
   onError,
   seed,
@@ -506,6 +548,8 @@ function EvaluatePanel({
   const [draftBusy, setDraftBusy] = useState(false);
   const [draft, setDraft] = useState<ListingDraft | null>(null);
   const [copied, setCopied] = useState("");
+  const [ebayListing, setEbayListing] = useState<EbayListing | null>(null);
+  const [ebayBusy, setEbayBusy] = useState<"stage" | "publish" | null>(null);
   const asinOnly = asinOrUrl.trim().match(/^[A-Z0-9]{10}$/i)?.[0];
 
   useEffect(() => {
@@ -517,8 +561,29 @@ function EvaluatePanel({
     setSellerCountry(seed.sellerCountry ?? "CN");
     setResult(null);
     setDraft(null);
+    setEbayListing(null);
     onSeedConsumed();
   }, [seed, onSeedConsumed]);
+
+  useEffect(() => {
+    if (!asinOnly) return;
+    void (async () => {
+      try {
+        const listing = await api<EbayListing>(`/api/ebay/listings/${asinOnly}`);
+        setEbayListing(listing);
+      } catch {
+        setEbayListing(null);
+      }
+      try {
+        const existing = await api<{ draft: ListingDraft }>(`/api/listing/${asinOnly}`);
+        if (existing.draft?.title) {
+          setDraft(existing.draft);
+        }
+      } catch {
+        /* no draft yet */
+      }
+    })();
+  }, [asinOnly]);
 
   useEffect(() => {
     if (!copied) return;
@@ -581,6 +646,11 @@ function EvaluatePanel({
         }),
       });
       setDraft(res.draft);
+      try {
+        setEbayListing(await api<EbayListing>(`/api/ebay/listings/${asinOnly}`));
+      } catch {
+        /* ignore */
+      }
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -598,11 +668,51 @@ function EvaluatePanel({
     }
   }
 
+  async function sendUnpublished() {
+    if (!asinOnly || !draft) return;
+    onError("");
+    setEbayBusy("stage");
+    try {
+      const res = await api<EbayListing>(`/api/ebay/listings/${asinOnly}/stage`, {
+        method: "POST",
+        body: JSON.stringify({
+          title: draft.title,
+          subtitle: draft.subtitle,
+          description_html: draft.description_html,
+          bullet_points: draft.bullet_points,
+        }),
+      });
+      setEbayListing(res);
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setEbayBusy(null);
+    }
+  }
+
+  async function publishListing() {
+    if (!asinOnly) return;
+    onError("");
+    setEbayBusy("publish");
+    try {
+      const res = await api<EbayListing>(`/api/ebay/listings/${asinOnly}/publish`, {
+        method: "POST",
+        body: "{}",
+      });
+      setEbayListing(res);
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setEbayBusy(null);
+    }
+  }
+
   return (
     <div className="panel grid">
       <p className="muted">
-        1) Set eBay price & analyze margin. 2) Generate listing draft = product copy via LLM + static
-        shop shell (Versand/Rückgabe/…). Paste or open draft page; eBay publish still manual for now.
+        1) Set eBay price & analyze margin. 2) Generate listing draft. 3) Send unpublished offer to
+        eBay (sandbox while EBAY_ENV=sandbox). 4) Publish only when you click Publish — never
+        automatic.
       </p>
       <div className="grid two">
         <label>
@@ -745,6 +855,61 @@ function EvaluatePanel({
               </button>
             ) : null}
           </div>
+          <div className="actions">
+            <button
+              type="button"
+              className="primary"
+              disabled={ebayBusy !== null || !asinOnly}
+              onClick={() => void sendUnpublished()}
+            >
+              {ebayBusy === "stage" ? "Sending to eBay…" : "Send unpublished offer to eBay"}
+            </button>
+            <button
+              type="button"
+              disabled={ebayBusy !== null || ebayListing?.status !== "unpublished"}
+              onClick={() => void publishListing()}
+            >
+              {ebayBusy === "publish" ? "Publishing…" : "Publish on eBay"}
+            </button>
+            {ebayListing?.seller_hub_url ? (
+              <button
+                type="button"
+                onClick={() =>
+                  void openExternal(ebayListing.seller_hub_url || "").catch((e) =>
+                    onError(String(e))
+                  )
+                }
+              >
+                {ebayListing.env === "sandbox" ? "Open sandbox My eBay" : "Open Seller Hub"}
+              </button>
+            ) : null}
+            {ebayListing?.item_url ? (
+              <button
+                type="button"
+                onClick={() =>
+                  void openExternal(ebayListing.item_url || "").catch((e) => onError(String(e)))
+                }
+              >
+                Open live item
+              </button>
+            ) : null}
+          </div>
+          {ebayListing && ebayListing.status && ebayListing.status !== "none" ? (
+            <p className="muted">
+              eBay {ebayListing.env || ""}: <span className="mono">{ebayListing.status}</span>
+              {ebayListing.category_name ? ` · ${ebayListing.category_name}` : ""}
+              {ebayListing.offer_id ? ` · offer ${ebayListing.offer_id}` : ""}
+              {ebayListing.listing_id ? ` · item ${ebayListing.listing_id}` : ""}
+              {ebayListing.status === "unpublished"
+                ? ". Not visible on eBay yet — click Publish on eBay. Sandbox My eBay → Active is unreliable; after publish use Open live item."
+                : ""}
+            </p>
+          ) : (
+            <p className="muted">
+              Send creates an unpublished offer on the connected eBay account (sandbox by default).
+              Publish is a second click — it does not run by itself.
+            </p>
+          )}
           {(draft.media?.local_images || []).length > 0 ? (
             <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem" }}>
               {(draft.media?.local_images || []).map((img) =>
@@ -864,6 +1029,17 @@ function EvaluatePanel({
   );
 }
 
+function ebayOfferLabel(r: Candidate): string {
+  const status = r.ebay_listing?.status;
+  if (status && status !== "none") {
+    return status;
+  }
+  if (r.listing_draft) {
+    return "draft";
+  }
+  return "—";
+}
+
 function formatTs(iso: string): string {
   try {
     const d = new Date(iso);
@@ -891,8 +1067,8 @@ function DraftsPanel({
   const [enrichMsg, setEnrichMsg] = useState("");
   const enrichPollRef = useRef<number | null>(null);
 
-  const load = useCallback(async () => {
-    const q = filter === "all" ? "" : `?status=${filter}`;
+    const load = useCallback(async () => {
+    const q = filter === "all" ? "" : filter === "ready" ? "?status=pipeline" : `?status=${filter}`;
     setRows(await api<Candidate[]>(`/api/candidates${q}`));
   }, [filter]);
 
@@ -1132,6 +1308,7 @@ function DraftsPanel({
             <th>eBay</th>
             <th>Src</th>
             <th>Updated</th>
+            <th>eBay offer</th>
             <th>Actions</th>
           </tr>
         </thead>
@@ -1154,6 +1331,7 @@ function DraftsPanel({
               <td>€{r.ebay_price.toFixed(2)}</td>
               <td className="mono">{r.offer?.price_source || "serp"}</td>
               <td className="mono">{formatTs(r.updated_at)}</td>
+              <td className="mono">{ebayOfferLabel(r)}</td>
               <td>
                 <button
                   type="button"
@@ -1176,13 +1354,16 @@ function DraftsPanel({
 function SettingsPanel({
   onError,
   health,
+  refreshHealth,
 }: {
   onError: (msg: string) => void;
   health: Health | null;
+  refreshHealth: () => Promise<Health | null>;
 }) {
   const [margin, setMargin] = useState<MarginSettings | null>(null);
   const [shop, setShop] = useState<ListingShopSettings | null>(null);
   const [saved, setSaved] = useState(false);
+  const [waitingOauth, setWaitingOauth] = useState(false);
 
   useEffect(() => {
     void (async () => {
@@ -1222,6 +1403,13 @@ function SettingsPanel({
     return <div className="panel muted">Loading settings…</div>;
   }
 
+  let oauthStatus = "not connected";
+  if (health?.ebay?.oauth_connected) {
+    oauthStatus = "connected";
+  } else if (waitingOauth) {
+    oauthStatus = "waiting for browser…";
+  }
+
   return (
     <div className="panel grid">
       <p className="muted">
@@ -1238,37 +1426,52 @@ function SettingsPanel({
         {" · "}
         RuName {health?.ebay?.runame_set ? "set" : "not set"}
         {" · "}
-        OAuth {health?.ebay?.oauth_connected ? "connected" : "not connected"}
+        OAuth {oauthStatus}
         {" · "}
         auto-publish {health?.ebay?.auto_publish ? "ON" : "off"}
+        {" · "}
+        send-to-eBay {health?.ebay?.sell_allowed ? "allowed" : health?.ebay?.sell_block_reason || "blocked"}
+      </p>
+      <div className="actions">
+        <button
+          type="button"
+          className="primary"
+          disabled={waitingOauth}
+          onClick={() => {
+            void (async () => {
+              try {
+                await api("/api/ebay/oauth/start", { method: "POST", body: "{}" });
+                setWaitingOauth(true);
+                const deadline = Date.now() + 180_000;
+                while (Date.now() < deadline) {
+                  await new Promise((r) => window.setTimeout(r, 1500));
+                  const h = await refreshHealth();
+                  if (h?.ebay?.oauth_connected) {
+                    break;
+                  }
+                }
+              } catch (e) {
+                onError(e instanceof Error ? e.message : String(e));
+              } finally {
+                setWaitingOauth(false);
+              }
+            })();
+          }}
+        >
+          {health?.ebay?.oauth_connected ? "Reconnect eBay (Sandbox)" : "Connect eBay (Sandbox)"}
+        </button>
+      </div>
+      <p className="muted">
+        Auth accepted URL:{" "}
+        <span className="mono">https://127.0.0.1:8770/api/ebay/oauth/callback</span>
+        . After eBay redirects, Chrome will warn about the local self-signed certificate — Advanced →
+        Proceed (the <span className="mono">code=</span> in the URL must stay).
       </p>
       {!health?.ebay?.runame_set ? (
         <p className="muted">
-          Next: in developer.ebay.com open the <strong>Sandbox</strong> app → User tokens / OAuth
-          (RuName). Auth accepted URL must be{" "}
-          <span className="mono">http://127.0.0.1:8770/api/ebay/oauth/callback</span>. Put the RuName
-          string into <span className="mono">EBAY_SANDBOX_RUNAME</span> in <span className="mono">.env</span>{" "}
-          and restart.
+          Put the RuName in <span className="mono">EBAY_SANDBOX_RUNAME</span>, then restart.
         </p>
-      ) : (
-        <div className="actions">
-          <button
-            type="button"
-            className="primary"
-            onClick={() => {
-              void (async () => {
-                try {
-                  await api("/api/ebay/oauth/start", { method: "POST", body: "{}" });
-                } catch (e) {
-                  onError(e instanceof Error ? e.message : String(e));
-                }
-              })();
-            }}
-          >
-            Connect eBay (Sandbox)
-          </button>
-        </div>
-      )}
+      ) : null}
       <h3 style={{ margin: "0.5rem 0 0" }}>Margin</h3>
       <div className="grid two">
         {(

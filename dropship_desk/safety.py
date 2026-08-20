@@ -53,3 +53,14 @@ def check_write_allowed(kind: AutomationKind) -> SafetyDecision:
 
     exhaustive: never = kind
     raise TypeError(f"unhandled AutomationKind: {exhaustive!r}")
+
+
+def check_ebay_sell() -> SafetyDecision:
+    """Sandbox: OAuth + click is enough. Production: env flags required."""
+    if config.ebay_env() != "production":
+        return SafetyDecision(True, "sandbox")
+    if not config.ebay_automation_enabled():
+        return SafetyDecision(False, "EBAY_AUTOMATION_ENABLED is false")
+    if not config.ebay_allow_list():
+        return SafetyDecision(False, "EBAY_ALLOW_LIST is false")
+    return SafetyDecision(True, "ok")

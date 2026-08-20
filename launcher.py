@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import sys
 import threading
@@ -11,6 +12,8 @@ import time
 import uvicorn
 
 from dropship_desk import config
+from dropship_desk.api import create_app
+from dropship_desk.local_tls import ensure_local_tls
 
 PORT_SEARCH_RANGE = 30
 
@@ -36,12 +39,18 @@ def _find_free_port(host: str, start_port: int) -> int:
     )
 
 
-def _start_backend(host: str, port: int) -> threading.Thread:
-    from dropship_desk.api import create_app
-
+def _start_backend(host: str, port: int, *, certfile: str, keyfile: str) -> threading.Thread:
     app = create_app()
     server = uvicorn.Server(
-        uvicorn.Config(app, host=host, port=port, log_level="info", access_log=True)
+        uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            log_level="info",
+            access_log=True,
+            ssl_certfile=certfile,
+            ssl_keyfile=keyfile,
+        )
     )
     thread = threading.Thread(target=server.run, name="uvicorn", daemon=True)
     thread.start()
@@ -59,6 +68,11 @@ def _start_backend(host: str, port: int) -> threading.Thread:
 def _open_window(url: str) -> None:
     import webview
 
+    # Local self-signed cert — WebView2 / Chromium would otherwise block the window.
+    os.environ.setdefault(
+        "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+        "--ignore-certificate-errors --allow-insecure-localhost",
+    )
     webview.create_window(
         title="Dropship Desk",
         url=url,
@@ -96,11 +110,16 @@ def main() -> int:
         print(f"[launcher] Port {args.port} busy, using {port}.", flush=True)
 
     config.ensure_data_dir()
-    _start_backend(args.host, port)
-    print(f"[launcher] API http://{args.host}:{port}/api/health", flush=True)
+    certfile, keyfile = ensure_local_tls()
+    _start_backend(args.host, port, certfile=str(certfile), keyfile=str(keyfile))
+    print(f"[launcher] API https://{args.host}:{port}/api/health (self-signed TLS)", flush=True)
+    print(
+        f"[launcher] eBay OAuth callback: https://127.0.0.1:{port}/api/ebay/oauth/callback",
+        flush=True,
+    )
 
     if args.headless:
-        print("[launcher] Headless — Ctrl+C to stop.")
+        print("[launcher] Headless — Ctrl+C to stop. Browser may warn about the certificate; proceed anyway.")
         try:
             while True:
                 time.sleep(3600)
@@ -117,7 +136,7 @@ def main() -> int:
                 "[launcher] Or use: python launcher.py --dev  (with Vite running)\n"
             )
             return 1
-        url = f"http://{args.host}:{port}/"
+        url = f"https://{args.host}:{port}/"
 
     _open_window(url)
     return 0
