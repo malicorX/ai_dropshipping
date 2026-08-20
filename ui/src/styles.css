@@ -1,0 +1,232 @@
+:root {
+  --bg: #1a1f1c;
+  --panel: #242b27;
+  --text: #e8eee9;
+  --muted: #9aab9f;
+  --accent: #3d8b6e;
+  --accent-dim: #2a5f4b;
+  --danger: #c45c4a;
+  --ok: #5fad7a;
+  --border: #354038;
+  --font: "IBM Plex Sans", "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100%;
+  background: radial-gradient(1200px 600px at 10% -10%, #2a3a32 0%, var(--bg) 55%);
+  color: var(--text);
+  font-family: var(--font);
+  /* Override pywebview's default user-select:none if injected */
+  -webkit-user-select: text !important;
+  user-select: text !important;
+  cursor: auto;
+}
+
+input,
+textarea,
+.mono,
+.panel,
+table,
+.error,
+p,
+h1,
+h2,
+h3,
+label {
+  -webkit-user-select: text !important;
+  user-select: text !important;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+.app {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 1.25rem 1.5rem 2rem;
+}
+
+header.top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.75rem;
+}
+
+header.top h1 {
+  margin: 0;
+  font-size: 1.35rem;
+  letter-spacing: 0.02em;
+  font-weight: 600;
+}
+
+.health {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+nav.tabs {
+  display: flex;
+  gap: 0.35rem;
+  margin-bottom: 1.25rem;
+}
+
+nav.tabs button {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 0.45rem 0.85rem;
+  cursor: pointer;
+}
+
+nav.tabs button.active {
+  color: var(--text);
+  border-color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.panel {
+  background: color-mix(in srgb, var(--panel) 92%, black);
+  border: 1px solid var(--border);
+  padding: 1rem 1.1rem;
+}
+
+.grid {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.grid.two {
+  grid-template-columns: 1fr 1fr;
+}
+
+@media (max-width: 800px) {
+  .grid.two {
+    grid-template-columns: 1fr;
+  }
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+input,
+textarea {
+  background: #151a17;
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 0.5rem 0.6rem;
+}
+
+.actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-top: 0.75rem;
+}
+
+button.primary {
+  background: var(--accent);
+  border: none;
+  color: #06140e;
+  font-weight: 600;
+  padding: 0.55rem 1rem;
+  cursor: pointer;
+}
+
+button.primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button:not(.primary) {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 0.55rem 1rem;
+  cursor: pointer;
+}
+
+button:not(.primary):disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button.linkish {
+  background: none;
+  border: none;
+  color: #7ec8a8;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  font: inherit;
+}
+
+button.linkish:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.2rem 0.55rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.badge.ok {
+  background: color-mix(in srgb, var(--ok) 35%, transparent);
+  color: var(--ok);
+}
+
+.badge.fail {
+  background: color-mix(in srgb, var(--danger) 35%, transparent);
+  color: #f0a89c;
+}
+
+.mono {
+  font-family: var(--mono);
+  font-size: 0.9rem;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.45rem 0.35rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.error {
+  color: #f0a89c;
+  margin-top: 0.75rem;
+}

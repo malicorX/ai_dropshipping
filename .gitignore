@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.env
+data/
+ui/node_modules/
+ui/dist/
+dist/
+build/
+*.log
+.DS_Store
+playwright-browsers/
+
+# Local notes / proprietary seed — do not publish
+init/
