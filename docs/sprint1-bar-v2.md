@@ -1,4 +1,4 @@
-## Bar v2.5 - decision table and dedup obligations (vote rounds 1-3, 2026-10-13)
+## Bar v2.5 (final text) - decision table and dedup obligations (vote rounds 1-3, 2026-10-13)
 
 **Identity.** One identity = (configured eBay marketplace, ASIN, SKU `DD-<ASIN>`). Counts key on this tuple and also per ASIN across ALL SKUs in the marketplace, so an alternate SKU cannot hide a duplicate.
 
@@ -7,10 +7,10 @@
 **Verdict, evaluated top to bottom, first match wins**
 1. Any request to a production eBay host (other than a stubbed C2 attempt that was refused), any live write, or any Amazon purchase -> **NOT_MET**.
 2. **NOT_MET** if ANY (this rule outranks every INCONCLUSIVE cause below, e.g. |E|=12 plus a duplicate read is NOT_MET) read after either scored run shows:
-   2a. a row whose terminal state or reason differs from its registered `expected_state` / `expected_reason` - except an expected-'published' row that ends `ERROR_RETRYABLE` or unpublished, which only lowers p. The exception applies to ordinary E rows only. 2a applies to ALL rows, including the mandatory scenarios M1-M5 and the 'also required' cases, which must in addition satisfy 2d (2d supplements 2a, never replaces it). A mandatory scenario for which zero requests were sent is excluded from 2a and falls under rule 3: an M3 target that ends `ERROR_RETRYABLE` is NOT_MET even if remote shows 1 / 1. A published row with the wrong reason IS a mismatch;
+   2a. a row whose terminal state or reason differs from its registered `expected_state` / `expected_reason` - except an expected-'published' row that ends `ERROR_RETRYABLE` or unpublished, which only lowers p. The exception applies to ordinary E rows only. 2a applies to ALL rows, including the mandatory scenarios M1-M7, which must in addition satisfy 2d (2d supplements 2a, never replaces it): an M3 target that ends `ERROR_RETRYABLE` is NOT_MET even if remote shows 1 / 1. A mandatory scenario for which zero requests were sent is excluded from 2a and falls under rule 3. A published row with the wrong reason IS a mismatch;
    2b. an identity, or an ASIN across all SKUs, with more than one offer or published item;
    2c. a first or second run creating anything not registered in E or the baseline;
-   2d. an executed mandatory scenario (M1-M7) (at least one request of the scenario's action was sent; 'could not be executed' in rule 3 means zero were sent) whose remote result differs from its table row: counts, offerId/listingId, or a send while remote state was unresolved;
+   2d. an executed mandatory scenario (M1-M7; at least one request of the scenario's action was sent, where 'request' means any HTTP call to the sandbox, reads included; 'could not be executed' in rule 3 means zero were sent) whose remote result differs from its table row: counts, offerId/listingId, or a send while remote state was unresolved;
    2e. a failed control (C1 undetected, C2 not refused).
 3. **INCONCLUSIVE** (only when rule 2 found no violation) if: registered |E| < 15 (T0 must register >= 15; 10-14 counts as under-registered); any change after the freeze to the sample, expected outcomes, E or the frozen docs, or any code change between the first and second scored run; or a dedup claim backed only by local files/mocks.
    Also INCONCLUSIVE (rule 2 found no violation) if two remote reads after the settle wait differ, or a mandatory scenario could not be executed in the window. A scenario is never dropped and never MET by omission.

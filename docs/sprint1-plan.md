@@ -1,6 +1,6 @@
 Repos in this sprint: ai_dropshipping
 
-# Sprint 1 plan (PLANNED, NOT FROZEN) - 2026-10-13
+# Sprint 1 plan (PLANNED, NOT FROZEN; commitment vote r7 UNANIMOUS 7/7) - 2026-10-13
 
 **Goal (#3):** given a list of Amazon.de item links, the app parses/analyses each and creates one sandbox eBay listing per distinct ASIN, no duplicates, no live side effects.
 **Operator decisions:** goal picked 2026-10-13; one listing per ASIN (variation groups -> backlog #17).
@@ -26,6 +26,7 @@ No cut line inside D: scenarios M1-M5 below are all mandatory.
 **Not in this sprint:** variation-group publishing, real orders/fulfillment, live eBay, scale beyond 25 rows, profitability claims.
 
 ## Plan changes (append-only)
+- 2026-10-13 (vote r7, unanimous): editorial only after the vote - one misplaced sentence in 2a reordered (its M3 example had landed after the zero-request clause) and opus's optional definition of 'request' (any HTTP call, reads included) added. Meaning matches the reading codex, sol and nv-nemotron described in their r7 answers; the operator may ask for a confirming round before freezing.
 - 2026-10-13 (vote r6): bar v2.5 - zero-request scenarios fall under rule 3 (opus); M6/M7 named for the 'also required' cases and M-row ids kept distinct from E rows (deepcode, nv-nemotron).
 - 2026-10-13 (vote r5): bar v2.4 - 2a applies to all rows incl. mandatory scenarios (2d supplements it); 'executed' = at least one request sent. Rejected: nv-nemotron's reading that mandatory rows are checked by 2d only (deepcode, deepseek, luna want 2a to apply).
 - 2026-10-13 (vote r4): bar v2.3 - violations (now rule 2) outrank every INCONCLUSIVE cause; the ERROR_RETRYABLE exception covers ordinary E rows only, mandatory-scenario rows follow 2d.
@@ -33,7 +34,7 @@ No cut line inside D: scenarios M1-M5 below are all mandatory.
 - 2026-10-13 (vote r2): per-ASIN-across-SKUs NOT_MET, rule 4/5 worked example, differing reads / unexecutable scenario -> INCONCLUSIVE, expected_reason, receipt observations, frozen-file assertion. Rejected: deepseek's move of M4/M5 to Sprint 2 (codex, sol, luna, opus keep them; cutting reopens round 1's cut-line objection).
 - 2026-10-13 (vote r1): bar v2 added (verdict table, identity tuple, M1-M5, guard-fails-first, freeze pins SHA). Rejected: nv-nemotron cosine threshold (near-title is flag-only, outside the bar) and a full failure-mode matrix (one rule: bounded retry -> ERROR_RETRYABLE).
 - 2026-10-13: cards re-cut after planning round 1 (consolidation doc); D card added; draft bar replaced by the E-based bar.
-## Bar v2.5 - decision table and dedup obligations (vote rounds 1-3, 2026-10-13)
+## Bar v2.5 (final text) - decision table and dedup obligations (vote rounds 1-3, 2026-10-13)
 
 **Identity.** One identity = (configured eBay marketplace, ASIN, SKU `DD-<ASIN>`). Counts key on this tuple and also per ASIN across ALL SKUs in the marketplace, so an alternate SKU cannot hide a duplicate.
 
@@ -42,10 +43,10 @@ No cut line inside D: scenarios M1-M5 below are all mandatory.
 **Verdict, evaluated top to bottom, first match wins**
 1. Any request to a production eBay host (other than a stubbed C2 attempt that was refused), any live write, or any Amazon purchase -> **NOT_MET**.
 2. **NOT_MET** if ANY (this rule outranks every INCONCLUSIVE cause below, e.g. |E|=12 plus a duplicate read is NOT_MET) read after either scored run shows:
-   2a. a row whose terminal state or reason differs from its registered `expected_state` / `expected_reason` - except an expected-'published' row that ends `ERROR_RETRYABLE` or unpublished, which only lowers p. The exception applies to ordinary E rows only. 2a applies to ALL rows, including the mandatory scenarios M1-M5 and the 'also required' cases, which must in addition satisfy 2d (2d supplements 2a, never replaces it). A mandatory scenario for which zero requests were sent is excluded from 2a and falls under rule 3: an M3 target that ends `ERROR_RETRYABLE` is NOT_MET even if remote shows 1 / 1. A published row with the wrong reason IS a mismatch;
+   2a. a row whose terminal state or reason differs from its registered `expected_state` / `expected_reason` - except an expected-'published' row that ends `ERROR_RETRYABLE` or unpublished, which only lowers p. The exception applies to ordinary E rows only. 2a applies to ALL rows, including the mandatory scenarios M1-M7, which must in addition satisfy 2d (2d supplements 2a, never replaces it): an M3 target that ends `ERROR_RETRYABLE` is NOT_MET even if remote shows 1 / 1. A mandatory scenario for which zero requests were sent is excluded from 2a and falls under rule 3. A published row with the wrong reason IS a mismatch;
    2b. an identity, or an ASIN across all SKUs, with more than one offer or published item;
    2c. a first or second run creating anything not registered in E or the baseline;
-   2d. an executed mandatory scenario (M1-M7) (at least one request of the scenario's action was sent; 'could not be executed' in rule 3 means zero were sent) whose remote result differs from its table row: counts, offerId/listingId, or a send while remote state was unresolved;
+   2d. an executed mandatory scenario (M1-M7; at least one request of the scenario's action was sent, where 'request' means any HTTP call to the sandbox, reads included; 'could not be executed' in rule 3 means zero were sent) whose remote result differs from its table row: counts, offerId/listingId, or a send while remote state was unresolved;
    2e. a failed control (C1 undetected, C2 not refused).
 3. **INCONCLUSIVE** (only when rule 2 found no violation) if: registered |E| < 15 (T0 must register >= 15; 10-14 counts as under-registered); any change after the freeze to the sample, expected outcomes, E or the frozen docs, or any code change between the first and second scored run; or a dedup claim backed only by local files/mocks.
    Also INCONCLUSIVE (rule 2 found no violation) if two remote reads after the settle wait differ, or a mandatory scenario could not be executed in the window. A scenario is never dropped and never MET by omission.
