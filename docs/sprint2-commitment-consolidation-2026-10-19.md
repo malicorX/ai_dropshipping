@@ -9,4 +9,13 @@
 | r1 | gpt61-sol | REQUEST-CHANGES | same three as codex |
 | r1 | gpt6-luna-max | REQUEST-CHANGES | run C executable via clean sandbox; C6 fail-closed; sandbox-only claim |
 
-All requested changes converge and none conflict; all applied in bar v2 (see plan 'Plan changes'). Next: r2 to all six seats.
+All requested changes converge and none conflict; all applied in bar v2 (see plan 'Plan changes'). 
+
+| r2 | codex | REQUEST-CHANGES | price-flip verdict precedence with worked cases |
+| r2 | deepcode | REQUEST-CHANGES | run C contradiction (blocker); per-run deadline; price-snapshot method |
+| r2 | opus | REQUEST-CHANGES | define run C reset; p after run A; where C6 is injected |
+| r2 | deepseek | REQUEST-CHANGES | census-anchored classification; deterministic run C kill; C5 hard network deny |
+| r2 | gpt61-sol | APPROVE-AS-IS | none |
+| r2 | gpt6-luna-max | APPROVE-AS-IS | none |
+
+r2 changes all applied in bar v3 (docs/sprint2-bar-v3.md). No conflict between seats. Next: r3 to all six.
