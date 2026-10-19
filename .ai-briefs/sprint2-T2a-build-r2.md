@@ -1,0 +1,11 @@
+# S2-T2a build brief, round 2 (builder: deepcode). Same worktree, branch s2-t2a (round 1 committed as 9500c63). Same rules as docs/sprint2-delta-d1.md and .ai-briefs/sprint2-T2a-build.md. Heartbeat to `_heartbeat.txt` each minute; report in `_report2.md`.
+
+## What the driver measured on round 1 (do not re-derive)
+- 60 tests pass. Mutant check by the driver: raising `MAX_CONSECUTIVE_FAILURES` from 20 to 2000 SURVIVES (10 passed): the cap test does not pin the constant or does not exercise the real default. Fix the test so that mutant fails.
+- Real re-run of the 15 ASINs that reset in T0's first snapshot: only 5 of 15 succeeded; 2 ended AMAZON_UNREACHABLE (3 attempts), 8 ended `RuntimeError: Could not parse product price from Amazon page`. Probing two of the eight: `B0HCNC2L81` returns a ~2 KB HTML document with an empty title (a block/interstitial page, no #productTitle) that `_looks_like_captcha` does not recognise; `B0DGPKBZZS` loads a full 1.5 MB page with a title but an empty price (genuinely no price: out of stock/no buy box).
+
+## Deliverable (only `dropship_desk/amazon/product.py` and `tests/test_amazon_fetch.py`)
+1. A response that is clearly a block page (HTML shorter than 20,000 characters AND no `id="productTitle"`) is a RETRYABLE failure in the same retry loop (max 3 attempts, same backoff) and, if all attempts fail, ends as `AMAZON_UNREACHABLE` naming `blocked_page`. A full page with a title but no price is NOT retried: it raises the existing price-parse error (a distinct, honest failure, not an unreachable Amazon).
+2. Tests: block page -> 3 attempts -> AmazonUnreachable mentioning blocked_page; block page then good page -> success on attempt 2; full page without price -> 1 attempt, price-parse error; the cap test must kill the 'cap 2000' mutant (assert the real default `product.MAX_CONSECUTIVE_FAILURES == 20` AND that the 21st call fails without launching, using the real constant, not a monkeypatched one).
+3. RED first: run the new tests on the current code and paste the failures into `_report2.md`; then GREEN with the full suite; then re-run these mutants and record that each FAILS the suite: cap 2000, MIN_GAP 0, remove channel="chrome", block-page retry removed.
+No real Amazon request in tests. Do not touch other files.
