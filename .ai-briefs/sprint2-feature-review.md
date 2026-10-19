@@ -1,0 +1,7 @@
+# Review brief: Sprint 2 upload-items feature (reviewer: opus; builder deepcode = different family). cwd = worktree, branch s2-feature (1 commit on main). <=400 words.
+
+Read `git diff main...HEAD` (dropship_desk/upload_items.py, listing_generate.py, api.py, ui/src/App.tsx, tests). Spec: .ai-briefs/sprint2-feature-build.md.
+Driver already verified: 85 tests pass, `npm run build` ok, mutant 'production gate compare removed' fails the suite.
+Find what is still wrong. You must produce values only obtainable by running: (1) run `python -m pytest -q` and report counts; (2) with a stubbed pipeline, start a run in Production env and show zero stub calls and the HTTP code; (3) invent ONE own mutant and say whether the suite catches it; (4) confirm the refactor of `/api/listing/generate` kept its behaviour: compare the old closure (git show main:dropship_desk/api.py) with the new callable for: Ollama unreachable, variation parent split, image download, draft save; list any behavioural difference.
+Specific risks to check: can any code path call `stage_unpublished`/`publish_offer`/eBay http while env is production (including a race where env flips mid-run)? Is the Amazon fetch going through `fetch_product_offer` (retry/pacing/cap)? Is a not-found ASIN skipped without stopping the run? Does a second click after completion create 0 offers (SKU `DD-<ASIN>` reuse)? Does the UI refuse/disable Start in production and reattach after reload? Any secrets/credentials in the diff?
+End with `VERDICT: PASS | PASS-WITH-FIX | BLOCK` and exact fixes.

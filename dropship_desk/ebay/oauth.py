@@ -140,9 +140,11 @@ def exchange_code(code: str) -> dict[str, Any]:
         "code": code,
         "redirect_uri": runame,
     }
+    url = f"{config.ebay_api_base()}/identity/v1/oauth2/token"
+    config.ensure_write_target_allowed(url)
     with httpx.Client(timeout=30.0) as client:
         r = client.post(
-            f"{config.ebay_api_base()}/identity/v1/oauth2/token",
+            url,
             data=data,
             headers={
                 "Authorization": _basic_auth_header(),
@@ -188,9 +190,11 @@ def _refresh_access_token(refresh_token: str) -> str:
         "refresh_token": refresh_token,
         "scope": OAUTH_SCOPES,
     }
+    url = f"{config.ebay_api_base()}/identity/v1/oauth2/token"
+    config.ensure_write_target_allowed(url)
     with httpx.Client(timeout=30.0) as client:
         r = client.post(
-            f"{config.ebay_api_base()}/identity/v1/oauth2/token",
+            url,
             data=data,
             headers={
                 "Authorization": _basic_auth_header(),
@@ -224,9 +228,11 @@ def application_token() -> str:
     expires_at = float(_app_token_cache.get("expires_at") or 0)
     if cached and _app_token_cache.get("env") == env and now < expires_at - 60:
         return cached
+    url = f"{config.ebay_api_base()}/identity/v1/oauth2/token"
+    config.ensure_write_target_allowed(url)
     with httpx.Client(timeout=30.0) as client:
         r = client.post(
-            f"{config.ebay_api_base()}/identity/v1/oauth2/token",
+            url,
             data={
                 "grant_type": "client_credentials",
                 "scope": "https://api.ebay.com/oauth/api_scope",

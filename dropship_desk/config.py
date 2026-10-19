@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -85,6 +87,55 @@ def ebay_env() -> str:
     if _ebay_env_override in ("sandbox", "production"):
         return _ebay_env_override
     return normalize_ebay_env(os.environ.get("EBAY_ENV", "sandbox"))
+
+
+# Transport-level guard for upload runs.  A background job can observe the
+# target as sandbox and then the process-wide env can flip to production
+# before the first HTTP write.  The pin closes that race: every eBay transport
+# helper asks this flag before opening a connection and refuses non-sandbox
+# hosts while it is set.
+_upload_pin_lock = threading.RLock()
+_upload_sandbox_pinned = False
+
+
+def pin_sandbox_for_upload(pinned: bool) -> bool:
+    """Pin or release the process-wide upload sandbox transport guard."""
+    global _upload_sandbox_pinned
+    with _upload_pin_lock:
+        _upload_sandbox_pinned = bool(pinned)
+        return _upload_sandbox_pinned
+
+
+def upload_sandbox_pinned() -> bool:
+    """True while an upload run requires every eBay host to be the sandbox."""
+    with _upload_pin_lock:
+        return _upload_sandbox_pinned
+
+
+def is_sandbox_host(host: str) -> bool:
+    """True for every eBay sandbox hostname (api/auth/www)."""
+    host = (host or "").strip().lower().rstrip(".")
+    return host == "sandbox.ebay.com" or host.endswith(".sandbox.ebay.com")
+
+
+def ensure_write_target_allowed(url: str) -> None:
+    """Refuse a non-sandbox eBay host while an upload run is pinned.
+
+    This lives in ``config`` (which imports no eBay transport module) so both
+    ``ebay.client`` and ``ebay.oauth`` can call it without an import cycle.
+    It is deliberately checked at the transport boundary, after the job's own
+    target checks and immediately before any HTTP client is created.  It
+    therefore still holds when ``config.ebay_env()`` flips between the job's
+    check and the actual request.
+    """
+    if not upload_sandbox_pinned():
+        return
+    host = urlparse(url).hostname or ""
+    if not is_sandbox_host(host):
+        raise RuntimeError(
+            "LIVE_WRITE_BLOCKED: upload run is pinned to the eBay sandbox; "
+            f"refusing to contact {host or url}"
+        )
 
 
 def _ebay_credential(env: str, sandbox_key: str, prod_key: str) -> str:

@@ -73,6 +73,10 @@ def _upload_one(path: Path) -> str:
         "XML Payload": (None, xml_body, "text/xml; charset=utf-8"),
         "file": (path.name, path.read_bytes(), "application/octet-stream"),
     }
+    endpoint = ebay_http.trading_endpoint()
+    # Guard before token acquisition (which can itself use the auth host) and
+    # before any HTTP client is constructed.
+    ebay_http.ensure_write_target_allowed(endpoint)
     headers = {
         "X-EBAY-API-SITEID": "77",
         "X-EBAY-API-COMPATIBILITY-LEVEL": "1399",
@@ -80,7 +84,7 @@ def _upload_one(path: Path) -> str:
         "X-EBAY-API-IAF-TOKEN": ebay_oauth.access_token(),
     }
     with httpx.Client(timeout=60.0) as client:
-        response = client.post(ebay_http.trading_endpoint(), headers=headers, files=files)
+        response = client.post(endpoint, headers=headers, files=files)
     if response.status_code >= 400:
         raise RuntimeError(f"picture upload HTTP {response.status_code}")
     url = _full_url_from_xml(response.text)

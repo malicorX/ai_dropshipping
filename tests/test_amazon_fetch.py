@@ -609,6 +609,41 @@ def test_variation_child_asin_not_found_is_skipped(harness, monkeypatch):
     assert calls == [CHILD1, CHILD2, CHILD3]
 
 
+def test_variation_all_children_failing_marks_scan_incomplete(harness, monkeypatch):
+    harness.page = _variation_parent_page()
+
+    def fake_fetch(asin: str):
+        raise product.AsinNotFound(f"ASIN_NOT_FOUND: {asin}")
+
+    monkeypatch.setattr(product, "fetch_product_offer", fake_fetch)
+
+    offers = product.fetch_variation_offers(ASIN)
+
+    assert [offer.asin for offer in offers] == [ASIN]
+    assert offers.reported_variations is True
+    assert offers.children_fetched == 0
+
+
+def test_plain_product_scan_reports_no_variations(harness):
+    harness.page = FakePage()
+
+    offers = product.fetch_variation_offers(ASIN)
+
+    assert [offer.asin for offer in offers] == [ASIN]
+    assert offers.reported_variations is False
+    assert offers.children_fetched == 0
+
+
+def test_variation_hint_without_children_marks_scan_incomplete(harness):
+    harness.page = FakePage(raw=dict(RAW, has_variations=True))
+
+    offers = product.fetch_variation_offers(ASIN)
+
+    assert [offer.asin for offer in offers] == [ASIN]
+    assert offers.reported_variations is True
+    assert offers.children_fetched == 0
+
+
 def test_variation_child_fetches_are_paced_through_fetch_product_offer(harness):
     harness.pages = [
         _variation_parent_page(),

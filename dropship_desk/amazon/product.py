@@ -373,18 +373,44 @@ def _offer_from_raw(asin: str, url: str, raw: dict[str, Any]) -> OfferIn:
     )
 
 
+class VariationOfferList(list[OfferIn]):
+    """Offer list that also records whether the PDP advertised variations.
+
+    A plain list loses the difference between "not a variation page" and
+    "variation page whose children could not be fetched" — both fall back to
+    the parent snapshot.  The upload job uses this metadata to reject the
+    latter as a variation parent.
+    """
+
+    def __init__(
+        self,
+        offers: list[OfferIn],
+        *,
+        reported_variations: bool,
+        children_fetched: int,
+    ) -> None:
+        super().__init__(offers)
+        self.reported_variations = reported_variations
+        self.children_fetched = children_fetched
+
+
 def fetch_variation_offers(
     asin: str,
     *,
     max_children: int = MAX_VARIATION_CHILDREN,
     pause_sec: float = _CHILD_PAUSE_SEC,
-) -> list[OfferIn]:
+) -> VariationOfferList:
     """Load the PDP; if Amazon has size/color children, fetch each child's price."""
     asin = asin.strip().upper()
-    parent, children, html = _fetch_pdp_bundle(asin)
+    parent, children, html, raw = _fetch_pdp_bundle(asin)
+    page_reports_variations = bool(raw.get("has_variations"))
     kids = _children_from_pdp(html, asin, children)
     if not kids:
-        return [parent]
+        return VariationOfferList(
+            [parent],
+            reported_variations=page_reports_variations,
+            children_fetched=0,
+        )
 
     offers: list[OfferIn] = []
     for kid in kids[: max(1, max_children)]:
@@ -422,7 +448,11 @@ def fetch_variation_offers(
                 }
             )
         offers.append(offer)
-    return offers or [parent]
+    return VariationOfferList(
+        offers or [parent],
+        reported_variations=True,
+        children_fetched=len(offers),
+    )
 
 
 def _children_from_pdp(
@@ -441,10 +471,12 @@ def _children_from_pdp(
     return kids if len(kids) > 1 else []
 
 
-def _fetch_pdp_bundle(asin: str) -> tuple[OfferIn, list[dict[str, Any]], str]:
+def _fetch_pdp_bundle(
+    asin: str,
+) -> tuple[OfferIn, list[dict[str, Any]], str, dict[str, Any]]:
     offer, html, raw = _load_pdp(asin)
     kids = raw.get("children") if isinstance(raw.get("children"), list) else []
-    return offer, [x for x in kids if isinstance(x, dict)], html
+    return offer, [x for x in kids if isinstance(x, dict)], html, raw
 
 
 def _looks_like_captcha(html: str) -> bool:

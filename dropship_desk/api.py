@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from dropship_desk import __version__, config
@@ -21,25 +21,21 @@ from dropship_desk.ebay.client import EbayApiError
 from dropship_desk.db import (
     apply_stored_ebay_target,
     ensure_margin_policy,
-    get_candidate_by_asin,
     get_listing_draft,
     get_margin_settings,
     init_db,
     list_candidates,
-    patch_candidate_offer,
     prune_rejected,
-    save_listing_draft,
     set_ebay_target,
     set_margin_settings,
 )
 from dropship_desk.enrich import ENRICH_JOB, enrich_missing
-from dropship_desk.ollama_client import generate_listing_draft, ollama_reachable
+from dropship_desk.listing_generate import ListingGenerateError, generate_draft
+from dropship_desk.ollama_client import ollama_reachable
 from dropship_desk.product_media import (
-    download_product_images,
     image_content_type,
     product_dir,
     resolve_image_file,
-    save_draft_artifacts,
 )
 from dropship_desk.reprice import reprice_candidates
 from dropship_desk.evaluate_service import run_evaluate
@@ -59,6 +55,15 @@ from dropship_desk.models import (
     SettingsOut,
 )
 from dropship_desk.safety import check_ebay_sell
+from dropship_desk.upload_items import (
+    UPLOAD_JOB,
+    LiveUploadDisabled,
+    NotSignedIn,
+    UploadAlreadyRunning,
+    UploadFileMissing,
+    read_upload_file,
+    upload_items_path,
+)
 
 _ALLOWED_OPEN_HOSTS = frozenset(
     {
@@ -169,6 +174,17 @@ def create_app() -> FastAPI:
     @app.post("/api/ebay/target")
     def ebay_target_set(body: dict | None = None) -> dict:
         env = config.normalize_ebay_env(str((body or {}).get("env") or ""))
+        if env == "production" and UPLOAD_JOB.status().get("running"):
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "code": "UPLOAD_RUNNING",
+                    "detail": (
+                        "UPLOAD_RUNNING: an upload-from-file run is active; switching to "
+                        "production is locked until it finishes (sandbox is allowed)"
+                    ),
+                },
+            )
         if env == "production" and not config.ebay_target_ready("production"):
             gaps = ", ".join(config.ebay_target_gaps("production")) or "production keys"
             raise HTTPException(
@@ -212,6 +228,18 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="missing code")
         if state:
             callback_env = config.normalize_ebay_env(state)
+            if callback_env == "production" and UPLOAD_JOB.status().get("running"):
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "code": "UPLOAD_RUNNING",
+                        "detail": (
+                            "UPLOAD_RUNNING: an upload-from-file run is active; "
+                            "switching to production is locked until it finishes "
+                            "(sandbox is allowed)"
+                        ),
+                    },
+                )
             if config.ebay_target_ready(callback_env):
                 set_ebay_target(callback_env)
         try:
@@ -307,6 +335,54 @@ def create_app() -> FastAPI:
     def candidates_enrich_stop() -> dict:
         return ENRICH_JOB.stop()
 
+    @app.get("/api/upload-items/preview")
+    def upload_items_preview() -> dict:
+        env = config.ebay_env()
+        try:
+            rows = read_upload_file()
+        except UploadFileMissing as e:
+            raise HTTPException(
+                status_code=404, detail=f"UPLOAD_FILE_MISSING: {e.path}"
+            ) from e
+        return {
+            "target_env": env,
+            "live_disabled": env == "production",
+            "path": str(upload_items_path()),
+            "rows": [row.to_dict() for row in rows],
+        }
+
+    @app.post("/api/upload-items/start")
+    def upload_items_start() -> dict:
+        try:
+            return UPLOAD_JOB.start()
+        except LiveUploadDisabled:
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "code": "LIVE_UPLOAD_DISABLED",
+                    "detail": (
+                        "LIVE_UPLOAD_DISABLED: upload-from-file refuses production; "
+                        "switch to sandbox first (no live eBay write was attempted)"
+                    ),
+                },
+            )
+        except UploadAlreadyRunning as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        except NotSignedIn as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        except UploadFileMissing as e:
+            raise HTTPException(
+                status_code=404, detail=f"UPLOAD_FILE_MISSING: {e.path}"
+            ) from e
+
+    @app.get("/api/upload-items/status")
+    def upload_items_status() -> dict:
+        return UPLOAD_JOB.status()
+
+    @app.post("/api/upload-items/stop")
+    def upload_items_stop() -> dict:
+        return UPLOAD_JOB.stop()
+
     @app.post("/api/open-external")
     def open_external(body: OpenExternalRequest) -> dict:
         parsed = urlparse(body.url.strip())
@@ -362,114 +438,16 @@ def create_app() -> FastAPI:
     @app.post("/api/listing/generate")
     def listing_generate(body: dict) -> dict:
         """Create unique eBay copy via sparky2 Ollama (not a 1:1 Amazon clone)."""
-        asin = str(body.get("asin") or "").strip().upper()
-        if len(asin) != 10:
-            raise HTTPException(status_code=400, detail="asin required (10 chars)")
-        if not ollama_reachable():
-            raise HTTPException(
-                status_code=503,
-                detail=f"Ollama unreachable at {config.OLLAMA_BASE_URL}",
-            )
-
-        row = get_candidate_by_asin(asin)
-        ebay_price = body.get("ebay_price")
-        amazon_title = str(body.get("title") or (row["title"] if row else "") or "")
-        amazon_total = body.get("amazon_total")
-        if amazon_total is None and row:
-            amazon_total = row["amazon_total"]
-        if ebay_price is None and row:
-            ebay_price = row["ebay_price"]
-        if amazon_total is None or ebay_price is None:
-            raise HTTPException(status_code=400, detail="amazon_total and ebay_price required")
-
-        image_urls: list[str] = []
-        offer_data = (row or {}).get("offer") or {}
-        image_urls = list(offer_data.get("image_urls") or [])
-        variation_label = str(offer_data.get("variation_label") or "")
         try:
-            offers = fetch_variation_offers(asin)
-            child_asins = {o.asin.strip().upper() for o in offers}
-            if len(offers) > 1 and asin not in child_asins:
-                persist_variation_offers(asin, offers, persist="pass_only")
-                labels = ", ".join(
-                    f"{(o.variation_label or o.asin)} ({o.asin})" for o in offers
-                )
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "This Amazon page is a variation parent (e.g. 20 kg vs 40 kg). "
-                        f"Split into: {labels}. Generate the listing from a child in Queue — "
-                        "do not publish the parent ASIN."
-                    ),
-                )
-            picked = next((o for o in offers if o.asin.strip().upper() == asin), offers[0])
-            amazon_title = picked.title or amazon_title
-            amazon_total = picked.amazon_total
-            image_urls = picked.image_urls or image_urls
-            variation_label = picked.variation_label or variation_label
-            if variation_label and variation_label.lower() not in amazon_title.lower():
-                amazon_title = f"{amazon_title} — {variation_label}"
-            run_evaluate(
-                EvaluateRequest(
-                    asin_or_url=asin,
-                    offer=picked.model_copy(
-                        update={
-                            "title": amazon_title,
-                            "variation_label": variation_label,
-                        }
-                    ),
-                    ebay_price=float(ebay_price),
-                    save=True,
-                ),
-                persist="always",
+            return generate_draft(
+                asin=body.get("asin"),
+                ebay_price=body.get("ebay_price"),
+                amazon_total=body.get("amazon_total"),
+                title=body.get("title"),
+                force_refresh_images=bool(body.get("force_refresh_images", False)),
             )
-        except HTTPException:
-            raise
-        except Exception:  # noqa: BLE001
-            pass
-
-        force_imgs = bool(body.get("force_refresh_images", False))
-        media = download_product_images(
-            asin,
-            image_urls,
-            force=force_imgs,
-        )
-        patch_candidate_offer(
-            asin,
-            {
-                "image_urls": media.get("source_urls") or image_urls,
-                "local_images": media.get("local_images") or [],
-            },
-        )
-
-        try:
-            draft = generate_listing_draft(
-                amazon_title=amazon_title,
-                asin=asin,
-                amazon_price=float(amazon_total),
-                ebay_price=float(ebay_price),
-                image_urls=image_urls,
-                bullets_hint=(
-                    f"Variante/Größe/Farbe: {variation_label}. "
-                    "Nur DIESE Variante beschreiben; Geschwistergrößen nicht erwähnen."
-                    if variation_label
-                    else ""
-                ),
-            )
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(status_code=502, detail=f"LLM generate failed: {e}") from e
-
-        artifacts = save_draft_artifacts(asin, draft, media)
-        draft["artifacts"] = artifacts
-        draft["media"] = {
-            "local_images": media.get("local_images") or [],
-            "source_urls": media.get("source_urls") or [],
-            "download_errors": media.get("errors") or [],
-        }
-
-        if row or get_candidate_by_asin(asin):
-            save_listing_draft(asin, draft)
-        return {"draft": draft, "asin": asin, "media": media, "artifacts": artifacts}
+        except ListingGenerateError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.detail) from e
 
     @app.get("/api/listing/{asin}")
     def listing_get(asin: str) -> dict:

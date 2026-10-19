@@ -318,3 +318,42 @@ td {
 html[data-ebay-target="production"] button.linkish {
   color: #f0b4aa;
 }
+
+.upload-panel h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.upload-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.upload-target {
+  display: inline-block;
+  align-self: center;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--text);
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+
+.upload-target.live {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 30%, transparent);
+  color: #f3c7c0;
+}
+
+.upload-warning {
+  margin: 0;
+  padding: 0.55rem 0.7rem;
+  border-left: 3px solid var(--danger);
+  background: color-mix(in srgb, var(--danger) 18%, transparent);
+  color: #f3c7c0;
+}

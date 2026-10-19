@@ -7,6 +7,7 @@ from typing import Any
 import httpx
 
 from dropship_desk import config
+from dropship_desk.config import ensure_write_target_allowed, is_sandbox_host
 from dropship_desk.ebay import oauth as ebay_oauth
 
 MARKETPLACE_ID = "EBAY_DE"
@@ -51,6 +52,11 @@ def request(
     extra_headers: dict[str, str] | None = None,
 ) -> Any:
     """Call api.ebay.com / sandbox REST. Returns parsed JSON or None for empty bodies."""
+    url = f"{config.ebay_api_base()}{path}"
+    # Guard before token acquisition as well: access_token() may itself hit
+    # the auth host.  The URL is fixed at this point, so a later env flip
+    # cannot redirect this request to production.
+    ensure_write_target_allowed(url)
     headers = {
         "Authorization": f"Bearer {token or ebay_oauth.access_token()}",
         "Accept": "application/json",
@@ -60,7 +66,6 @@ def request(
     }
     if extra_headers:
         headers.update(extra_headers)
-    url = f"{config.ebay_api_base()}{path}"
     with httpx.Client(timeout=timeout) as client:
         response = client.request(
             method,
@@ -81,5 +86,8 @@ def request(
 
 def trading_endpoint() -> str:
     if config.ebay_env() == "production":
-        return "https://api.ebay.com/ws/api.dll"
-    return "https://api.sandbox.ebay.com/ws/api.dll"
+        endpoint = "https://api.ebay.com/ws/api.dll"
+    else:
+        endpoint = "https://api.sandbox.ebay.com/ws/api.dll"
+    ensure_write_target_allowed(endpoint)
+    return endpoint
