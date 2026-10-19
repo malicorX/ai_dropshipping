@@ -38,12 +38,21 @@ def _offer(asin: str, total: float = 20.0) -> OfferIn:
     )
 
 
-def _install_stubs(monkeypatch, *, missing=(), fetch_hook=None, variation_hook=None):
+def _install_stubs(
+    monkeypatch,
+    *,
+    missing=(),
+    fetch_hook=None,
+    variation_hook=None,
+    draft_title=None,
+    draft_title_hook=None,
+):
     calls: dict[str, list] = {
         "fetch": [],
         "evaluate": [],
         "draft": [],
         "stage": [],
+        "stage_patch": [],
         "publish": [],
     }
 
@@ -84,10 +93,11 @@ def _install_stubs(monkeypatch, *, missing=(), fetch_hook=None, variation_hook=N
         evaluate=True,
     ):
         calls["draft"].append(asin)
+        title = draft_title_hook(asin) if draft_title_hook is not None else draft_title
         return {
             "asin": asin,
             "draft": {
-                "title": f"eBay title {asin}",
+                "title": title if title is not None else f"eBay title {asin}",
                 "description_html": "<p>copy</p>",
                 "bullet_points": ["one"],
             },
@@ -95,8 +105,9 @@ def _install_stubs(monkeypatch, *, missing=(), fetch_hook=None, variation_hook=N
             "artifacts": {},
         }
 
-    def fake_stage(asin):
+    def fake_stage(asin, draft_patch=None):
         calls["stage"].append(asin)
+        calls["stage_patch"].append((asin, draft_patch))
         ebay_listing.save_listing_state(
             asin,
             {"status": "unpublished", "offer_id": f"OFF-{asin}", "listing_id": ""},
@@ -616,6 +627,144 @@ def test_genuine_variation_child_passes(client, tmp_path, monkeypatch):
     assert status["rows"][0]["state"] == "published"
     assert calls["evaluate"] == [(child, "always")]
     assert calls["stage"] == [child]
+
+
+def test_missing_variation_label_is_patched_before_stage(client, tmp_path, monkeypatch):
+    child = "B0VAR00001"
+
+    def child_offers(_asin: str) -> list[OfferIn]:
+        return [
+            _offer(child).model_copy(
+                update={"parent_asin": "B0PARENT05", "variation_label": "Red / G2"}
+            )
+        ]
+
+    calls = _install_stubs(
+        monkeypatch,
+        variation_hook=child_offers,
+        draft_title=f"eBay title {child}",
+    )
+    _write_upload(tmp_path, monkeypatch, f"https://www.amazon.de/dp/{child}\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    assert status["rows"][0]["state"] == "published"
+    assert calls["stage"] == [child]
+    # The title is fixed deterministically; there is no second LLM draft.
+    assert calls["draft"] == [child]
+    assert calls["stage_patch"] == [(child, {"title": f"eBay title {child} - Red / G2"})]
+
+
+def test_present_variation_label_leaves_title_unchanged(client, tmp_path, monkeypatch):
+    child = "B0VAR00002"
+    draft_title = f"eBay title {child} – Red / G2"
+
+    def child_offers(_asin: str) -> list[OfferIn]:
+        return [
+            _offer(child).model_copy(
+                update={"parent_asin": "B0PARENT06", "variation_label": "Red / G2"}
+            )
+        ]
+
+    calls = _install_stubs(
+        monkeypatch,
+        variation_hook=child_offers,
+        draft_title=draft_title,
+    )
+    _write_upload(tmp_path, monkeypatch, f"https://www.amazon.de/dp/{child}\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    assert status["rows"][0]["state"] == "published"
+    assert calls["stage"] == [child]
+    assert calls["stage_patch"] == [(child, None)]
+
+
+def test_long_title_is_clipped_around_variation_label(client, tmp_path, monkeypatch):
+    child = "B0VAR00003"
+    long_title = "Langes Produkt " + ("x" * 120)
+
+    def child_offers(_asin: str) -> list[OfferIn]:
+        return [
+            _offer(child).model_copy(
+                update={"parent_asin": "B0PARENT07", "variation_label": "Red / G2"}
+            )
+        ]
+
+    calls = _install_stubs(
+        monkeypatch,
+        variation_hook=child_offers,
+        draft_title=long_title,
+    )
+    _write_upload(tmp_path, monkeypatch, f"https://www.amazon.de/dp/{child}\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    assert status["rows"][0]["state"] == "published"
+    patch = calls["stage_patch"][0][1]
+    assert patch is not None
+    title = patch["title"]
+    assert len(title) <= 80
+    assert title.endswith(" - Red / G2")
+    assert "Red / G2" in title
+
+
+def test_rows_record_monotonic_durations_for_published_and_error(
+    client, tmp_path, monkeypatch
+):
+    clock = {"t": 100.0}
+    monkeypatch.setattr(upload_items, "_monotonic", lambda: clock["t"])
+
+    def timed_fetch(asin: str) -> OfferIn:
+        if asin == "B0DUR00001":
+            clock["t"] = 105.0
+            return _offer(asin)
+        clock["t"] = 112.0
+        raise upload_items.AmazonUnreachable(
+            "AMAZON_UNREACHABLE: ASIN B0DUR00002 failed after 3 attempts"
+        )
+
+    _install_stubs(monkeypatch, fetch_hook=timed_fetch)
+    _write_upload(
+        tmp_path,
+        monkeypatch,
+        "https://www.amazon.de/dp/B0DUR00001\nhttps://www.amazon.de/dp/B0DUR00002\n",
+    )
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    first, second = status["rows"]
+    assert first["state"] == "published"
+    assert first["duration_sec"] == 5.0
+    assert first["started_at"]
+    assert first["finished_at"]
+    assert second["state"] == "error"
+    assert second["duration_sec"] == 7.0
+    assert second["started_at"]
+    assert second["finished_at"]
+
+
+def test_skipped_existing_row_records_near_zero_duration(
+    client, tmp_path, monkeypatch
+):
+    clock = {"t": 50.0}
+    monkeypatch.setattr(upload_items, "_monotonic", lambda: clock["t"])
+    _install_stubs(monkeypatch)
+    _seed_published("B0SKIP0001", "1100B0SKIP0001")
+    _write_upload(tmp_path, monkeypatch, "https://www.amazon.de/dp/B0SKIP0001\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    row = status["rows"][0]
+    assert row["state"] == "skipped_existing"
+    assert row["duration_sec"] == 0.0
+    assert row["started_at"]
+    assert row["finished_at"]
 
 
 def test_variation_parent_with_only_one_child_is_rejected(

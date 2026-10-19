@@ -140,6 +140,9 @@ type UploadRow = {
   offer_id: string;
   listing_id: string;
   item_url: string;
+  started_at: string;
+  finished_at: string;
+  duration_sec: number | null;
 };
 
 type UploadPreview = {
@@ -178,6 +181,31 @@ const UPLOAD_STATE_LABELS: Record<string, string> = {
 
 function uploadStateLabel(state: string): string {
   return UPLOAD_STATE_LABELS[state] ?? state.replace(/_/g, " ");
+}
+
+function formatDuration(seconds: number | null | undefined): string {
+  if (seconds === null || seconds === undefined || !Number.isFinite(seconds)) {
+    return "—";
+  }
+  const total = Math.max(0, Math.floor(seconds));
+  const minutes = Math.floor(total / 60);
+  const rest = total % 60;
+  return `${minutes}:${String(rest).padStart(2, "0")}`;
+}
+
+/** Finished rows use the recorded monotonic duration; the running row ticks. */
+function rowDurationSeconds(row: UploadRow, nowMs: number, live: boolean): number | null {
+  if (typeof row.duration_sec === "number" && Number.isFinite(row.duration_sec)) {
+    return row.duration_sec;
+  }
+  if (!live || !row.started_at) {
+    return null;
+  }
+  const started = Date.parse(row.started_at);
+  if (Number.isNaN(started)) {
+    return null;
+  }
+  return Math.max(0, (nowMs - started) / 1000);
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -1492,6 +1520,7 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
   const [status, setStatus] = useState<UploadStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
+  const [nowMs, setNowMs] = useState(() => Date.now());
 
   const loadPreview = useCallback(async () => {
     try {
@@ -1521,6 +1550,16 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
   const running = !!status?.running;
   const wasRunning = useRef(false);
 
+  // Tick once a second so the running row's Time cell advances.
+  useEffect(() => {
+    if (!running) {
+      return;
+    }
+    setNowMs(Date.now());
+    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [running]);
+
   // Preview loads on mount above.  Refresh it once after a run we observed
   // running has ended, so a later file-only preview sees the new listings.
   useEffect(() => {
@@ -1540,6 +1579,13 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
   const live = target === "production" || (!running && !!preview?.live_disabled);
   const rows = status?.rows?.length ? status.rows : preview?.rows ?? [];
   const counters = status?.counters ?? {};
+  const rowDurations = rows
+    .map((row) => rowDurationSeconds(row, nowMs, running))
+    .filter((value): value is number => value !== null);
+  const totalDurationSec = rowDurations.reduce((sum, value) => sum + value, 0);
+  const averageDurationSec = rowDurations.length
+    ? totalDurationSec / rowDurations.length
+    : null;
 
   async function start() {
     onError("");
@@ -1628,12 +1674,19 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
           : ""}
         {status?.error ? ` · ${status.error}` : ""}
       </p>
+      {rowDurations.length > 0 ? (
+        <p className="muted upload-duration-summary">
+          total {formatDuration(totalDurationSec)}, average per processed item{" "}
+          {formatDuration(averageDurationSec)}
+        </p>
+      ) : null}
       <table>
         <thead>
           <tr>
             <th>ASIN</th>
             <th>State</th>
             <th>Reason</th>
+            <th>Time</th>
             <th>Offer</th>
             <th>Sandbox item</th>
           </tr>
@@ -1651,6 +1704,9 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
                   </span>
                 </td>
                 <td>{row.reason || "—"}</td>
+                <td className="mono">
+                  {formatDuration(rowDurationSeconds(row, nowMs, running))}
+                </td>
                 <td className="mono">{row.offer_id || "—"}</td>
                 <td>
                   {row.item_url ? (

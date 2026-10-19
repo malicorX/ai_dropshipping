@@ -16,6 +16,9 @@ HttpFn = Callable[..., Any]
 
 SKU_PREFIX = "DD-"
 DEFAULT_QUANTITY = 5
+EAN_NOT_APPLICABLE = "Nicht zutreffend"
+_EAN_HINTS = ("ean", "gtin")
+_GTIN_RE = re.compile(r"\d{8,14}")
 
 
 def sku_for_asin(asin: str) -> str:
@@ -139,6 +142,7 @@ def stage_unpublished(
         category["category_id"], category["tree_id"], http=requester
     )
     brand, mpn = taxonomy.brand_mpn_fields(aspects)
+    ean = _candidate_ean(row)
     image_urls = pictures.collect_image_urls(asin, draft)
     if not image_urls:
         raise RuntimeError("No product images to send (download images when generating the draft)")
@@ -158,6 +162,7 @@ def stage_unpublished(
                 "imageUrls": image_urls,
                 "brand": brand,
                 "mpn": mpn,
+                "ean": [ean or EAN_NOT_APPLICABLE],
             },
         },
     )
@@ -244,6 +249,47 @@ def _offer_id_for_sku(sku: str, *, http: HttpFn) -> str:
     if not offers:
         return ""
     return str(offers[0].get("offerId") or "")
+
+
+def _candidate_ean(row: dict[str, Any]) -> str:
+    """Return a real GTIN/EAN from the candidate offer or draft, if present.
+
+    Amazon PDPs do not always expose one.  When they do, callers usually keep
+    it next to the offer (``ean``/``gtin``); accepting only 8-14 digits keeps
+    placeholders such as ``Nicht zutreffend`` out of the inventory item.
+    """
+    offer = row.get("offer") or {}
+    draft = row.get("listing_draft") or {}
+    for source in (offer, draft, row):
+        if not isinstance(source, dict):
+            continue
+        containers = (
+            source,
+            source.get("product") or {},
+            source.get("attributes") or {},
+            source.get("aspects") or {},
+        )
+        for container in containers:
+            if not isinstance(container, dict):
+                continue
+            for key, value in container.items():
+                if not any(hint in str(key).lower() for hint in _EAN_HINTS):
+                    continue
+                ean = _normalize_ean(value)
+                if ean:
+                    return ean
+    return ""
+
+
+def _normalize_ean(value: Any) -> str:
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            ean = _normalize_ean(item)
+            if ean:
+                return ean
+        return ""
+    text = re.sub(r"[\s-]", "", str(value or "").strip())
+    return text if _GTIN_RE.fullmatch(text) else ""
 
 
 def _clip(text: str, limit: int) -> str:
