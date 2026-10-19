@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import time
 from typing import Any
 
@@ -15,6 +16,112 @@ from dropship_desk.models import OfferIn
 
 MAX_VARIATION_CHILDREN = 8
 _CHILD_PAUSE_SEC = 1.2
+
+# Reliable-fetch policy (S2-T2a).  The gap applies between consecutive ASIN
+# loads in this process; the cap applies to consecutive terminal ASIN
+# failures (not individual retry attempts).
+MIN_GAP_SEC = 5.0
+MAX_CONSECUTIVE_FAILURES = 20
+MAX_FETCH_ATTEMPTS = 3
+_BACKOFF_BASE_SEC = 5.0
+_BACKOFF_JITTER_SEC = 1.0
+
+_last_load_monotonic: float | None = None
+_consecutive_failures = 0
+
+
+class AmazonUnreachable(RuntimeError):
+    """Every allowed attempt to load one ASIN failed in a retryable way."""
+
+
+class ChromeNotFound(RuntimeError):
+    """The installed Chrome channel/executable cannot be launched."""
+
+
+def reset_fetch_state() -> None:
+    """Reset pacing and consecutive-failure state (used by tests)."""
+    global _last_load_monotonic, _consecutive_failures
+    _last_load_monotonic = None
+    _consecutive_failures = 0
+
+
+def _playwright():
+    """Import Playwright lazily so importing this module needs no browser."""
+    from playwright.sync_api import sync_playwright
+
+    return sync_playwright()
+
+
+def _launch_browser(p):
+    """Launch the installed Chrome (not bundled Chromium), headless."""
+    return p.chromium.launch(channel="chrome", headless=True)
+
+
+def _goto(page, url: str) -> None:
+    """Navigate one page; kept small so tests can stub navigation."""
+    page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    if type(exc).__name__ in {"TimeoutError", "PlaywrightTimeoutError"}:
+        return True
+    try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    except Exception:  # pragma: no cover - playwright is a runtime dependency
+        return False
+    return isinstance(exc, PlaywrightTimeoutError)
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    return _is_timeout_error(exc) or "ERR_CONNECTION_RESET" in str(exc)
+
+
+def _is_chrome_missing(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    if "chrome" not in text:
+        return False
+    markers = (
+        "not found",
+        "missing",
+        "doesn't exist",
+        "does not exist",
+        "no such file",
+        "executable",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _pace_asin_load() -> None:
+    """Sleep so consecutive ASIN loads start at least MIN_GAP_SEC apart."""
+    global _last_load_monotonic
+    now = time.monotonic()
+    if _last_load_monotonic is not None:
+        remaining = MIN_GAP_SEC - (now - _last_load_monotonic)
+        if remaining > 0:
+            time.sleep(remaining)
+            now = time.monotonic()
+    _last_load_monotonic = now
+
+
+def _check_failure_cap(asin: str) -> None:
+    if _consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+        raise AmazonUnreachable(
+            "AMAZON_UNREACHABLE: failure cap reached after "
+            f"{_consecutive_failures} consecutive terminal failures; "
+            f"refusing ASIN {asin}"
+        )
+
+
+def _record_terminal_failure() -> None:
+    global _consecutive_failures
+    _consecutive_failures += 1
+
+
+def _record_success() -> None:
+    global _consecutive_failures
+    _consecutive_failures = 0
 
 _PDP_EXTRACT_JS = """
 () => {
@@ -86,28 +193,77 @@ def _load_pdp(asin: str) -> tuple[OfferIn, str, dict[str, Any]]:
     if len(asin) != 10:
         raise ValueError("ASIN must be 10 characters")
 
-    from playwright.sync_api import sync_playwright
+    _check_failure_cap(asin)
+    _pace_asin_load()
 
     url = f"https://www.amazon.de/dp/{asin}"
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            locale="de-DE",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
-        )
-        page = context.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-        time.sleep(1.5)
-        html = page.content()
-        if _looks_like_captcha(html):
-            browser.close()
-            raise RuntimeError("CAPTCHA on product page — try again later")
-        raw: dict[str, Any] = page.evaluate(_PDP_EXTRACT_JS) or {}
-        browser.close()
+    last_exc: BaseException | None = None
+    for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
+        try:
+            result = _load_pdp_once(asin, url)
+        except ChromeNotFound:
+            # A missing Chrome installation is systemic, not an ASIN failure.
+            raise
+        except Exception as exc:  # noqa: BLE001 - classified below
+            retryable = _is_retryable(exc)
+            if retryable and attempt < MAX_FETCH_ATTEMPTS:
+                last_exc = exc
+                time.sleep(_BACKOFF_BASE_SEC + random.uniform(0.0, _BACKOFF_JITTER_SEC))
+                continue
+
+            _record_terminal_failure()
+            if retryable:
+                raise AmazonUnreachable(
+                    f"AMAZON_UNREACHABLE: ASIN {asin} failed after {attempt} attempts; "
+                    f"last error {type(exc).__name__}: {exc}"
+                ) from exc
+            raise
+        else:
+            _record_success()
+            return result
+
+    # Defensive fallback: the loop normally returns or raises above.
+    _record_terminal_failure()
+    raise AmazonUnreachable(
+        f"AMAZON_UNREACHABLE: ASIN {asin} failed after {MAX_FETCH_ATTEMPTS} attempts; "
+        f"last error {type(last_exc).__name__ if last_exc is not None else 'UnknownError'}: "
+        f"{last_exc}"
+    )
+
+
+def _load_pdp_once(asin: str, url: str) -> tuple[OfferIn, str, dict[str, Any]]:
+    """One launch/navigate/parse attempt; fresh logged-out context every time."""
+    with _playwright() as p:
+        try:
+            browser = _launch_browser(p)
+        except Exception as exc:  # noqa: BLE001 - Chrome detection needs text
+            if _is_chrome_missing(exc):
+                raise ChromeNotFound(
+                    "CHROME_NOT_FOUND: unable to launch the installed Chrome channel: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            raise
+
+        try:
+            context = browser.new_context(
+                locale="de-DE",
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+            )
+            page = context.new_page()
+            _goto(page, url)
+            html = page.content()
+            if _looks_like_captcha(html):
+                raise RuntimeError("CAPTCHA on product page — try again later")
+            raw: dict[str, Any] = page.evaluate(_PDP_EXTRACT_JS) or {}
+        finally:
+            try:
+                browser.close()
+            except Exception:  # noqa: BLE001 - never mask the real fetch error
+                pass
 
     return _offer_from_raw(asin, url, raw), html, raw
 
