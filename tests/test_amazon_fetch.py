@@ -15,6 +15,16 @@ ASIN2 = "B0TEST0002"
 PRICE_HTML = "<html><body><span id='productTitle'>Test</span></body></html>"
 RAW = {"title": "Test product", "price": "€ 19,99", "stars": "4,6 von 5", "reviews": "123"}
 
+# Clearly a block/interstitial: tiny document with no product-title node.
+BLOCK_HTML = "<html><body><title></title><p>Something went wrong.</p></body></html>"
+# A real (large) page with a product title, but no buy box/price.
+NO_PRICE_HTML = (
+    "<html><body>"
+    + ("<div>filler</div>" * 2_000)
+    + '<span id="productTitle">Real but unavailable product</span>'
+    + "</body></html>"
+)
+
 
 class FakePage:
     def __init__(self, html: str = PRICE_HTML, raw: dict | None = None) -> None:
@@ -77,6 +87,8 @@ class Harness:
         self.launches = 0
         self.goto_calls = 0
         self.page = FakePage()
+        # Optional per-attempt pages, consumed one launch at a time.
+        self.pages: list[FakePage] = []
         self.launch_error: BaseException | None = None
         self.goto_errors: list[BaseException] = []
         self._monkeypatch = monkeypatch
@@ -91,7 +103,8 @@ class Harness:
         self.launches += 1
         if self.launch_error is not None:
             raise self.launch_error
-        return FakeBrowser(self.page)
+        page = self.pages.pop(0) if self.pages else self.page
+        return FakeBrowser(page)
 
     def _goto(self, _page, _url):
         self.goto_calls += 1
@@ -171,6 +184,54 @@ def test_captcha_is_not_retried(harness):
     assert harness.clock.sleeps == []
 
 
+def test_block_page_is_retried_three_times_then_unreachable_names_blocked_page(harness):
+    harness.page = FakePage(html=BLOCK_HTML, raw={"title": "", "price": None})
+
+    with pytest.raises(product.AmazonUnreachable) as excinfo:
+        product.fetch_product_offer(ASIN)
+
+    message = str(excinfo.value)
+    assert message.startswith("AMAZON_UNREACHABLE")
+    assert ASIN in message
+    assert "blocked_page" in message
+    assert "3" in message
+    assert harness.launches == 3
+    assert harness.goto_calls == 3
+    assert len(harness.clock.sleeps) == 2
+    assert all(5.0 <= seconds <= 6.0 for seconds in harness.clock.sleeps)
+
+
+def test_block_page_then_good_page_succeeds_on_second_attempt(harness):
+    harness.pages = [
+        FakePage(html=BLOCK_HTML, raw={"title": "", "price": None}),
+        FakePage(),
+    ]
+
+    offer = product.fetch_product_offer(ASIN)
+
+    assert offer.amazon_total == pytest.approx(19.99)
+    assert harness.launches == 2
+    assert harness.goto_calls == 2
+    assert len(harness.clock.sleeps) == 1
+    assert 5.0 <= harness.clock.sleeps[0] <= 6.0
+
+
+def test_full_page_without_price_is_not_retried(harness):
+    harness.page = FakePage(
+        html=NO_PRICE_HTML,
+        raw={"title": "Real but unavailable product", "price": ""},
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        product.fetch_product_offer(ASIN)
+
+    assert not isinstance(excinfo.value, product.AmazonUnreachable)
+    assert "Could not parse product price" in str(excinfo.value)
+    assert harness.launches == 1
+    assert harness.goto_calls == 1
+    assert harness.clock.sleeps == []
+
+
 def test_chrome_missing_is_distinct_from_amazon_unreachable(harness):
     harness.launch_error = RuntimeError(
         "browserType.launch: Chromium distribution 'chrome' is not found at "
@@ -186,21 +247,24 @@ def test_chrome_missing_is_distinct_from_amazon_unreachable(harness):
     assert harness.clock.sleeps == []
 
 
-def test_failure_cap_stops_before_launching_the_21st_fetch(harness):
+def test_failure_cap_default_is_20_and_stops_before_launching_the_21st_fetch(harness):
+    # Pin the real default so raising it (e.g. to 2000) fails this test.
+    assert product.MAX_CONSECUTIVE_FAILURES == 20
+
     harness.page = FakePage(html="<html>captcha</html>")
 
-    for _ in range(product.MAX_CONSECUTIVE_FAILURES):
+    for _ in range(20):
         with pytest.raises(RuntimeError) as excinfo:
             product.fetch_product_offer(ASIN)
         assert not isinstance(excinfo.value, product.AmazonUnreachable)
 
-    assert harness.launches == product.MAX_CONSECUTIVE_FAILURES
+    assert harness.launches == 20
 
     with pytest.raises(product.AmazonUnreachable) as excinfo:
         product.fetch_product_offer(ASIN)
 
     assert str(excinfo.value).startswith("AMAZON_UNREACHABLE: failure cap reached")
-    assert harness.launches == product.MAX_CONSECUTIVE_FAILURES
+    assert harness.launches == 20
 
 
 def test_success_resets_consecutive_failure_counter(harness):

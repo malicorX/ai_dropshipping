@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import re
 import time
 from typing import Any
 
@@ -25,6 +26,8 @@ MAX_CONSECUTIVE_FAILURES = 20
 MAX_FETCH_ATTEMPTS = 3
 _BACKOFF_BASE_SEC = 5.0
 _BACKOFF_JITTER_SEC = 1.0
+_BLOCK_PAGE_MAX_CHARS = 20_000
+_PRODUCT_TITLE_RE = re.compile(r"""id\s*=\s*["']productTitle["']""", re.IGNORECASE)
 
 _last_load_monotonic: float | None = None
 _consecutive_failures = 0
@@ -36,6 +39,10 @@ class AmazonUnreachable(RuntimeError):
 
 class ChromeNotFound(RuntimeError):
     """The installed Chrome channel/executable cannot be launched."""
+
+
+class _BlockedPageError(RuntimeError):
+    """Amazon served a short interstitial instead of a product detail page."""
 
 
 def reset_fetch_state() -> None:
@@ -75,7 +82,11 @@ def _is_timeout_error(exc: BaseException) -> bool:
 
 
 def _is_retryable(exc: BaseException) -> bool:
-    return _is_timeout_error(exc) or "ERR_CONNECTION_RESET" in str(exc)
+    return (
+        isinstance(exc, _BlockedPageError)
+        or _is_timeout_error(exc)
+        or "ERR_CONNECTION_RESET" in str(exc)
+    )
 
 
 def _is_chrome_missing(exc: BaseException) -> bool:
@@ -258,6 +269,11 @@ def _load_pdp_once(asin: str, url: str) -> tuple[OfferIn, str, dict[str, Any]]:
             html = page.content()
             if _looks_like_captcha(html):
                 raise RuntimeError("CAPTCHA on product page — try again later")
+            if _looks_like_blocked_page(html):
+                raise _BlockedPageError(
+                    "blocked_page: Amazon returned a short page without "
+                    f'id="productTitle" ({len(html)} chars)'
+                )
             raw: dict[str, Any] = page.evaluate(_PDP_EXTRACT_JS) or {}
         finally:
             try:
@@ -371,3 +387,12 @@ def _fetch_pdp_bundle(asin: str) -> tuple[OfferIn, list[dict[str, Any]], str]:
 def _looks_like_captcha(html: str) -> bool:
     low = html.lower()
     return "captcha" in low or "/errors/validatecaptcha" in low or "robot check" in low
+
+
+def _looks_like_blocked_page(html: str) -> bool:
+    """A tiny document without the PDP title node is an interstitial/block page.
+
+    A full-size page with a title but no buy box is a genuine no-price page and
+    must not be retried as if Amazon were unreachable.
+    """
+    return len(html) < _BLOCK_PAGE_MAX_CHARS and not _PRODUCT_TITLE_RE.search(html)
