@@ -411,6 +411,82 @@ def test_target_switch_to_production_is_409_while_upload_running(client, tmp_pat
     assert cfg.upload_sandbox_pinned() is False
 
 
+def test_oauth_callback_to_production_is_409_while_upload_running(
+    client, tmp_path, monkeypatch
+):
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_fetch(asin: str) -> OfferIn:
+        started.set()
+        assert release.wait(timeout=10)
+        return _offer(asin)
+
+    _install_stubs(monkeypatch, fetch_hook=blocking_fetch)
+    _write_upload(tmp_path, monkeypatch, "https://www.amazon.de/dp/B0LOCK0002\n")
+    monkeypatch.setattr(cfg, "ebay_target_ready", lambda env=None: True)
+    exchange_calls: list[str] = []
+
+    def fake_exchange(code: str) -> dict:
+        exchange_calls.append(code)
+        return {}
+
+    monkeypatch.setattr(upload_items.ebay_oauth, "exchange_code", fake_exchange)
+
+    try:
+        assert client.post("/api/upload-items/start").status_code == 200
+        assert started.wait(timeout=5)
+
+        switched = client.get(
+            "/api/ebay/oauth/callback?code=x&state=production"
+        )
+        assert switched.status_code == 409
+        assert switched.json()["code"] == "UPLOAD_RUNNING"
+        assert "UPLOAD_RUNNING" in switched.json()["detail"]
+        # The callback must not exchange a production code or flip the target.
+        assert exchange_calls == []
+        assert cfg._ebay_env_override is None
+    finally:
+        release.set()
+    status = _wait_done(client)
+    assert status["rows"][0]["state"] == "published"
+
+
+def test_oauth_callback_to_sandbox_is_allowed_while_upload_running(
+    client, tmp_path, monkeypatch
+):
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_fetch(asin: str) -> OfferIn:
+        started.set()
+        assert release.wait(timeout=10)
+        return _offer(asin)
+
+    _install_stubs(monkeypatch, fetch_hook=blocking_fetch)
+    _write_upload(tmp_path, monkeypatch, "https://www.amazon.de/dp/B0LOCK0003\n")
+    monkeypatch.setattr(cfg, "ebay_target_ready", lambda env=None: True)
+    exchange_calls: list[str] = []
+
+    def fake_exchange(code: str) -> dict:
+        exchange_calls.append(code)
+        return {}
+
+    monkeypatch.setattr(upload_items.ebay_oauth, "exchange_code", fake_exchange)
+
+    try:
+        assert client.post("/api/upload-items/start").status_code == 200
+        assert started.wait(timeout=5)
+
+        allowed = client.get("/api/ebay/oauth/callback?code=x&state=sandbox")
+        assert allowed.status_code == 200
+        assert exchange_calls == ["x"]
+    finally:
+        release.set()
+    status = _wait_done(client)
+    assert status["rows"][0]["state"] == "published"
+
+
 def test_pin_released_after_worker_crash(client, tmp_path, monkeypatch):
     def crashing_process(self, row):
         raise RuntimeError("worker crash")
@@ -539,6 +615,95 @@ def test_genuine_variation_child_passes(client, tmp_path, monkeypatch):
     assert status["rows"][0]["state"] == "published"
     assert calls["evaluate"] == [(child, "always")]
     assert calls["stage"] == [child]
+
+
+def test_variation_parent_with_only_one_child_is_rejected(
+    client, tmp_path, monkeypatch
+):
+    parent = "B0PARENT02"
+
+    def one_child(_asin: str) -> list[OfferIn]:
+        return [_offer("B0ONECHILD")]
+
+    calls = _install_stubs(monkeypatch, variation_hook=one_child)
+    _write_upload(tmp_path, monkeypatch, f"https://www.amazon.de/dp/{parent}\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    row = status["rows"][0]
+    assert row["state"] == "rejected"
+    assert row["reason"] == "variation_parent"
+    assert status["phase"] == "finished"
+    assert calls["evaluate"] == []
+    assert calls["draft"] == []
+    assert calls["stage"] == []
+    assert calls["publish"] == []
+
+
+def test_variation_parent_with_no_fetched_children_is_rejected(
+    client, tmp_path, monkeypatch
+):
+    parent = "B0PARENT03"
+
+    class _IncompleteScan(list):
+        # Mirrors the product helper's metadata: the PDP reported variations
+        # but every child fetch failed, so only the parent snapshot is left.
+        reported_variations = True
+        children_fetched = 0
+
+    def no_children(_asin: str) -> list[OfferIn]:
+        return _IncompleteScan([_offer(parent)])
+
+    calls = _install_stubs(monkeypatch, variation_hook=no_children)
+    _write_upload(tmp_path, monkeypatch, f"https://www.amazon.de/dp/{parent}\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    row = status["rows"][0]
+    assert row["state"] == "rejected"
+    assert row["reason"] == "variation_parent"
+    assert calls["evaluate"] == []
+    assert calls["stage"] == []
+    assert calls["publish"] == []
+
+
+def test_genuine_variation_child_with_one_offer_passes(
+    client, tmp_path, monkeypatch
+):
+    child = "B0CHILD001"
+
+    def child_only(asin: str) -> list[OfferIn]:
+        assert asin == child
+        return [
+            _offer(child).model_copy(
+                update={"parent_asin": "B0PARENT04", "variation_label": "20 kg"}
+            )
+        ]
+
+    calls = _install_stubs(monkeypatch, variation_hook=child_only)
+    _write_upload(tmp_path, monkeypatch, f"https://www.amazon.de/dp/{child}\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    assert status["rows"][0]["state"] == "published"
+    assert calls["stage"] == [child]
+
+
+def test_plain_product_with_one_matching_offer_passes(
+    client, tmp_path, monkeypatch
+):
+    product = "B0PLAIN001"
+    calls = _install_stubs(monkeypatch)
+    _write_upload(tmp_path, monkeypatch, f"https://www.amazon.de/dp/{product}\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    assert status["rows"][0]["state"] == "published"
+    assert calls["stage"] == [product]
 
 
 def test_ordinary_amazon_unreachable_is_a_row_error_and_run_continues(client, tmp_path, monkeypatch):

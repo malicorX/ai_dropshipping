@@ -331,11 +331,22 @@ class UploadJobManager:
         existing reliable-fetch policy (pacing, bounded retry, failure cap).
         """
         offers = fetch_variation_offers(asin)
+        requested = (asin or "").strip().upper()
         child_asins = {(offer.asin or "").strip().upper() for offer in offers}
-        if len(offers) > 1 and asin not in child_asins:
+        # ``fetch_variation_offers`` returns the child offers when Amazon
+        # exposes variations.  If the requested ASIN is not one of them it is
+        # the parent hub — reject it even when only a single child survived.
+        if not offers or requested not in child_asins:
+            raise VariationParentError("variation_parent")
+        # A variation page whose child fetches all failed also falls back to
+        # the parent snapshot.  The scan metadata makes that distinguishable
+        # from a plain product with one matching offer.
+        if getattr(offers, "reported_variations", False) and not getattr(
+            offers, "children_fetched", 0
+        ):
             raise VariationParentError("variation_parent")
         return next(
-            (offer for offer in offers if (offer.asin or "").strip().upper() == asin),
+            (offer for offer in offers if (offer.asin or "").strip().upper() == requested),
             offers[0],
         )
 

@@ -3,39 +3,15 @@
 from __future__ import annotations
 
 from typing import Any
-from urllib.parse import urlparse
 
 import httpx
 
 from dropship_desk import config
+from dropship_desk.config import ensure_write_target_allowed, is_sandbox_host
 from dropship_desk.ebay import oauth as ebay_oauth
 
 MARKETPLACE_ID = "EBAY_DE"
 CONTENT_LANGUAGE = "de-DE"
-
-
-def is_sandbox_host(host: str) -> bool:
-    """True for every eBay sandbox hostname (api/auth/www)."""
-    host = (host or "").strip().lower().rstrip(".")
-    return host == "sandbox.ebay.com" or host.endswith(".sandbox.ebay.com")
-
-
-def ensure_write_target_allowed(url: str) -> None:
-    """Refuse a non-sandbox eBay host while an upload run is pinned.
-
-    This is deliberately checked at the transport boundary, after the job's
-    own target checks and immediately before any HTTP client is created.  It
-    therefore still holds when ``config.ebay_env()`` flips between the job's
-    check and the actual request.
-    """
-    if not config.upload_sandbox_pinned():
-        return
-    host = urlparse(url).hostname or ""
-    if not is_sandbox_host(host):
-        raise RuntimeError(
-            "LIVE_WRITE_BLOCKED: upload run is pinned to the eBay sandbox; "
-            f"refusing to contact {host or url}"
-        )
 
 
 class EbayApiError(RuntimeError):

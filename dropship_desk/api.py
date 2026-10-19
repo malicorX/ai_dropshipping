@@ -228,6 +228,18 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="missing code")
         if state:
             callback_env = config.normalize_ebay_env(state)
+            if callback_env == "production" and UPLOAD_JOB.status().get("running"):
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "code": "UPLOAD_RUNNING",
+                        "detail": (
+                            "UPLOAD_RUNNING: an upload-from-file run is active; "
+                            "switching to production is locked until it finishes "
+                            "(sandbox is allowed)"
+                        ),
+                    },
+                )
             if config.ebay_target_ready(callback_env):
                 set_ebay_target(callback_env)
         try:
