@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -728,6 +729,187 @@ def test_ordinary_amazon_unreachable_is_a_row_error_and_run_continues(client, tm
     assert status["phase"] == "finished"
     assert calls["stage"] == ["B0AFTER001"]
     assert calls["publish"] == ["B0AFTER001"]
+
+
+def _seed_published(asin: str, listing_id: str) -> None:
+    ebay_listing.save_listing_state(
+        asin,
+        {
+            "status": "published",
+            "offer_id": f"OFF-{asin}",
+            "listing_id": listing_id,
+        },
+    )
+
+
+def test_published_rows_are_marked_before_any_fetch(client, tmp_path, monkeypatch):
+    calls = _install_stubs(monkeypatch)
+    _seed_published("B0MARK0001", "1100B0MARK0001")
+    _seed_published("B0MARK0002", "1100B0MARK0002")
+    _write_upload(
+        tmp_path,
+        monkeypatch,
+        "\n".join(
+            [
+                "https://www.amazon.de/dp/B0MARK0001",
+                "https://www.amazon.de/dp/B0MARK0002",
+                "https://www.amazon.de/dp/B0MARK0003",
+            ]
+        )
+        + "\n",
+    )
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    rows = status["rows"]
+    assert [row["state"] for row in rows] == [
+        "skipped_existing",
+        "skipped_existing",
+        "published",
+    ]
+    assert [row["reason"] for row in rows[:2]] == ["haben wir schon", "haben wir schon"]
+    assert rows[0]["offer_id"] == "OFF-B0MARK0001"
+    assert rows[0]["listing_id"] == "1100B0MARK0001"
+    assert rows[0]["item_url"] == "https://www.sandbox.ebay.com/itm/1100B0MARK0001"
+    assert rows[1]["offer_id"] == "OFF-B0MARK0002"
+    assert rows[1]["listing_id"] == "1100B0MARK0002"
+    # The known ASINs must not cost a single fetch/evaluate/draft/stage/publish.
+    assert calls["fetch"] == ["B0MARK0003"]
+    assert calls["evaluate"] == [("B0MARK0003", "always")]
+    assert calls["draft"] == ["B0MARK0003"]
+    assert calls["stage"] == ["B0MARK0003"]
+    assert calls["publish"] == ["B0MARK0003"]
+
+
+def test_unpublished_saved_state_is_not_marked_already_listed(
+    client, tmp_path, monkeypatch
+):
+    asin = "B0STAGED01"
+    calls = _install_stubs(monkeypatch)
+    # A staged but never published offer keeps status "unpublished".  It must
+    # not short-circuit the run as "haben wir schon"; the row still has to be
+    # fetched, processed and published.
+    ebay_listing.save_listing_state(
+        asin,
+        {"status": "unpublished", "offer_id": f"OFF-{asin}", "listing_id": ""},
+    )
+    _write_upload(tmp_path, monkeypatch, f"https://www.amazon.de/dp/{asin}\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    row = status["rows"][0]
+    assert row["state"] == "published"
+    assert row["reason"] == ""
+    assert calls["fetch"] == [asin]
+    assert calls["stage"] == [asin]
+    assert calls["publish"] == [asin]
+
+
+def test_state_published_between_fetch_and_stage_is_rechecked(
+    client, tmp_path, monkeypatch
+):
+    asin = "B0RECHECK1"
+
+    def publish_during_fetch(fetched_asin: str) -> OfferIn:
+        # The pre-fetch check already passed (the state was absent), then the
+        # listing becomes published while Amazon is being fetched.  The final
+        # re-check before staging must notice it and stage nothing.
+        ebay_listing.save_listing_state(
+            fetched_asin,
+            {
+                "status": "published",
+                "offer_id": f"OFF-{fetched_asin}",
+                "listing_id": f"1100{fetched_asin}",
+            },
+        )
+        return _offer(fetched_asin)
+
+    calls = _install_stubs(monkeypatch, fetch_hook=publish_during_fetch)
+    _write_upload(tmp_path, monkeypatch, f"https://www.amazon.de/dp/{asin}\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    row = status["rows"][0]
+    assert row["state"] == "skipped_existing"
+    assert row["reason"] == "haben wir schon"
+    assert row["offer_id"] == f"OFF-{asin}"
+    assert row["listing_id"] == f"1100{asin}"
+    assert calls["fetch"] == [asin]
+    assert calls["stage"] == []
+    assert calls["publish"] == []
+
+
+def test_legacy_sandbox_state_with_production_env_is_not_already_listed(
+    client, tmp_path, monkeypatch
+):
+    asin = "B0LEGACY01"
+    calls = _install_stubs(monkeypatch)
+    # Old records wrote a single state file and kept the env inside it.  The
+    # sandbox file here claims it belongs to production, so a sandbox run must
+    # ignore it and process the ASIN instead of marking it "haben wir schon".
+    path = ebay_listing.listing_state_path(asin)
+    assert path.name == "ebay_sandbox.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "status": "published",
+                "env": "production",
+                "offer_id": f"OFF-{asin}",
+                "listing_id": f"1100{asin}",
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_upload(tmp_path, monkeypatch, f"https://www.amazon.de/dp/{asin}\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    row = status["rows"][0]
+    assert row["state"] == "published"
+    assert calls["fetch"] == [asin]
+    assert calls["stage"] == [asin]
+    assert calls["publish"] == [asin]
+
+
+def test_preview_marks_published_rows_as_already_listed(client, tmp_path, monkeypatch):
+    calls = _install_stubs(monkeypatch)
+    _seed_published("B0MARK0001", "1100B0MARK0001")
+    _seed_published("B0MARK0002", "1100B0MARK0002")
+    _write_upload(
+        tmp_path,
+        monkeypatch,
+        "\n".join(
+            [
+                "https://www.amazon.de/dp/B0MARK0001",
+                "https://www.amazon.de/dp/B0MARK0002",
+                "https://www.amazon.de/dp/B0MARK0003",
+            ]
+        )
+        + "\n",
+    )
+
+    r = client.get("/api/upload-items/preview")
+
+    assert r.status_code == 200
+    rows = r.json()["rows"]
+    assert [row["state"] for row in rows] == [
+        "already_listed",
+        "already_listed",
+        "queued",
+    ]
+    assert [row["reason"] for row in rows[:2]] == ["haben wir schon", "haben wir schon"]
+    assert rows[0]["offer_id"] == "OFF-B0MARK0001"
+    assert rows[0]["listing_id"] == "1100B0MARK0001"
+    assert rows[0]["item_url"] == "https://www.sandbox.ebay.com/itm/1100B0MARK0001"
+    assert rows[2]["offer_id"] == ""
+    # Preview is file-only: it must not touch Amazon or eBay transports.
+    for name, seen in calls.items():
+        assert seen == [], f"{name} was called by preview: {seen}"
 
 
 def test_failure_cap_amazon_unreachable_aborts_the_run(client, tmp_path, monkeypatch):

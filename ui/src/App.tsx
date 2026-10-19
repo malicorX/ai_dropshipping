@@ -161,6 +161,25 @@ type UploadStatus = {
   counters: Record<string, number>;
 };
 
+const UPLOAD_STATE_LABELS: Record<string, string> = {
+  queued: "queued",
+  fetching: "fetching",
+  evaluated: "evaluated",
+  drafted: "drafted",
+  staged: "staged",
+  published: "published",
+  skipped_existing: "haben wir schon",
+  already_listed: "haben wir schon",
+  not_found: "not found",
+  rejected: "rejected",
+  error: "error",
+  duplicate_in_file: "duplicate in file",
+};
+
+function uploadStateLabel(state: string): string {
+  return UPLOAD_STATE_LABELS[state] ?? state.replace(/_/g, " ");
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...init,
@@ -1500,6 +1519,20 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
   }, [loadPreview, loadStatus]);
 
   const running = !!status?.running;
+  const wasRunning = useRef(false);
+
+  // Preview loads on mount above.  Refresh it once after a run we observed
+  // running has ended, so a later file-only preview sees the new listings.
+  useEffect(() => {
+    if (running) {
+      wasRunning.current = true;
+      return;
+    }
+    if (wasRunning.current) {
+      wasRunning.current = false;
+      void loadPreview();
+    }
+  }, [running, loadPreview]);
   const liveEnv = preview?.target_env || "sandbox";
   // When no run is active the badge must describe the current Settings
   // target, not the target_env remembered from the last run.
@@ -1571,7 +1604,7 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
           disabled={running || live || busy}
           onClick={() => void start()}
         >
-          {running ? "Uploading…" : "Upload items from file"}
+          {running ? "Uploading…" : "Start upload from file"}
         </button>
         {running ? (
           <button type="button" onClick={() => void stop()}>
@@ -1580,6 +1613,10 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
         ) : null}
         {msg ? <span className="muted">{msg}</span> : null}
       </div>
+      <p className="hint">
+        One click starts the run at once. Items already listed are marked 'haben wir schon' and
+        not uploaded again.
+      </p>
       <p className="muted">
         {running
           ? `Run ${status?.run_id || "…"} · ${status?.phase || "starting"}`
@@ -1604,13 +1641,13 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
         <tbody>
           {rows.map((row) => {
             const bad = ["error", "rejected", "not_found"].includes(row.state);
-            const good = ["published", "skipped_existing"].includes(row.state);
+            const good = ["published", "skipped_existing", "already_listed"].includes(row.state);
             return (
               <tr key={row.line_no}>
                 <td className="mono">{row.asin || "—"}</td>
                 <td>
                   <span className={bad ? "badge fail" : good ? "badge ok" : "badge"}>
-                    {row.state}
+                    {uploadStateLabel(row.state)}
                   </span>
                 </td>
                 <td>{row.reason || "—"}</td>
