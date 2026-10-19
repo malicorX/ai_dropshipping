@@ -357,3 +357,8 @@ html[data-ebay-target="production"] button.linkish {
   background: color-mix(in srgb, var(--danger) 18%, transparent);
   color: #f3c7c0;
 }
+
+.upload-duration-summary {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}

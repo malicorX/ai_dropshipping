@@ -8,7 +8,9 @@ run in production until live writes are explicitly enabled by the operator.
 from __future__ import annotations
 
 import os
+import re
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -48,6 +50,8 @@ ROW_STATES = (
 )
 _TERMINAL_STATES = frozenset(ROW_STATES) - {"queued", "fetching"}
 EXISTING_REASON = "haben wir schon"
+TITLE_LIMIT = 80
+VARIATION_SEPARATOR = " - "
 
 
 class UploadFileMissing(FileNotFoundError):
@@ -92,6 +96,12 @@ class UploadRow:
     offer_id: str = ""
     listing_id: str = ""
     item_url: str = ""
+    started_at: str = ""
+    finished_at: str = ""
+    duration_sec: float | None = None
+    _started_monotonic: float | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -103,6 +113,9 @@ class UploadRow:
             "offer_id": self.offer_id,
             "listing_id": self.listing_id,
             "item_url": self.item_url,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "duration_sec": self.duration_sec,
         }
 
 
@@ -192,6 +205,31 @@ def read_upload_file(path: str | Path | None = None) -> list[UploadRow]:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _monotonic() -> float:
+    """Indirection so tests can replace the clock behind ``time.monotonic``."""
+    return time.monotonic()
+
+
+def title_with_variation(title: str, variation_label: str) -> str:
+    """Deterministically append an Amazon variation label to a draft title.
+
+    The base is clipped so the full title stays within eBay's 80-char limit;
+    the label itself is preserved.  A title that already contains the label
+    (case-insensitive) is returned unchanged.
+    """
+    base = re.sub(r"\s+", " ", str(title or "")).strip()
+    label = str(variation_label or "").strip()
+    if not label or label.lower() in base.lower():
+        return base
+    suffix = f"{VARIATION_SEPARATOR}{label}"
+    room = TITLE_LIMIT - len(suffix)
+    if room <= 0:
+        # Pathological label: keep the label intact rather than truncating it.
+        return suffix.strip()
+    clipped = base[:room].rstrip()
+    return f"{clipped}{suffix}" if clipped else suffix.strip()
 
 
 @dataclass
@@ -322,6 +360,10 @@ class UploadJobManager:
                     if row.state != "queued":
                         continue
                     self.state.phase = "running"
+                    row.started_at = _utc_now()
+                    row.finished_at = ""
+                    row.duration_sec = None
+                    row._started_monotonic = _monotonic()
 
                 if config.ebay_env() != self.state.target_env:
                     self._abort_target_changed(row)
@@ -336,6 +378,7 @@ class UploadJobManager:
                     with self._lock:
                         row.state = "error"
                         row.reason = _reason(exc)
+                        self._stamp_finished(row)
                         self.state.error = _reason(exc)
                         self.state.phase = "aborted"
                     return
@@ -359,12 +402,26 @@ class UploadJobManager:
             if row.state not in _TERMINAL_STATES:
                 row.state = "error"
             row.reason = "aborted_target_changed: eBay target changed during the run"
+            self._stamp_finished(row)
             self.state.error = row.reason
             self.state.phase = "aborted_target_changed"
 
     def _check_target(self) -> None:
         if config.ebay_env() != self.state.target_env:
             raise _TargetChanged("eBay target changed during the run")
+
+    def _stamp_finished(self, row: UploadRow) -> None:
+        """Stamp a monotonic duration once, when the row becomes terminal.
+
+        Caller must hold ``self._lock``.  Rows that never started (parser
+        rejects, duplicates) keep ``duration_sec`` as ``None``.
+        """
+        if row.finished_at or row._started_monotonic is None:
+            return
+        row.duration_sec = max(
+            0.0, round(_monotonic() - row._started_monotonic, 3)
+        )
+        row.finished_at = _utc_now()
 
     def _fetch_offer(self, asin: str) -> OfferIn:
         """Fetch the PDP and reject variation parents exactly like generate_draft.
@@ -401,6 +458,7 @@ class UploadJobManager:
         if existing is not None:
             with self._lock:
                 mark_row_listed(row, existing, row_state="skipped_existing")
+                self._stamp_finished(row)
             return
 
         with self._lock:
@@ -450,10 +508,11 @@ class UploadJobManager:
         if existing is not None:
             with self._lock:
                 mark_row_listed(row, existing, row_state="skipped_existing")
+                self._stamp_finished(row)
             return
 
         try:
-            generate_draft(
+            generated = generate_draft(
                 asin,
                 ebay_price=float(evaluation.ebay_price),
                 amazon_total=float(offer.amazon_total),
@@ -471,12 +530,30 @@ class UploadJobManager:
             self._finish(row, "error", _reason(exc))
             return
 
+        # The LLM sometimes drops the Amazon variation label from the title.
+        # Fix that deterministically here (no second LLM call): stage_unpublished
+        # still keeps its guard, it just receives a corrected draft_patch.
+        draft_title = ""
+        if isinstance(generated, dict):
+            draft_body = generated.get("draft")
+            if isinstance(draft_body, dict):
+                draft_title = str(draft_body.get("title") or "")
+        title_patch: dict[str, Any] | None = None
+        variation_label = str(getattr(offer, "variation_label", "") or "").strip()
+        if draft_title and variation_label:
+            patched_title = title_with_variation(draft_title, variation_label)
+            if patched_title != draft_title:
+                title_patch = {"title": patched_title}
+
         with self._lock:
             row.state = "drafted"
 
         self._check_target()
         try:
-            staged = ebay_listing.stage_unpublished(asin)
+            if title_patch is not None:
+                staged = ebay_listing.stage_unpublished(asin, draft_patch=title_patch)
+            else:
+                staged = ebay_listing.stage_unpublished(asin)
         except Exception as exc:  # noqa: BLE001
             if _is_live_write_blocked(exc) or config.ebay_env() != self.state.target_env:
                 raise _TargetChanged(_reason(exc)) from exc
@@ -499,11 +576,13 @@ class UploadJobManager:
             row.listing_id = str(published.get("listing_id") or "")
             row.item_url = str(published.get("item_url") or "")
             row.state = "published"
+            self._stamp_finished(row)
 
     def _finish(self, row: UploadRow, state: str, reason: str) -> None:
         with self._lock:
             row.state = state
             row.reason = reason
+            self._stamp_finished(row)
 
 
 UPLOAD_JOB = UploadJobManager()

@@ -7,6 +7,7 @@ __pycache__/
 data/
 ui/node_modules/
 ui/dist/
+ui/.test-build/
 dist/
 build/
 *.log

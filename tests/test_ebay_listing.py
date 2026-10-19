@@ -1,6 +1,7 @@
+import pytest
 from dropship_desk.db import init_db, list_candidates, save_listing_draft, upsert_candidate
 from dropship_desk.ebay import listing as ebay_listing
-from dropship_desk.ebay.listing import _inventory_description
+from dropship_desk.ebay.listing import _candidate_ean, _inventory_description
 from dropship_desk.ebay.taxonomy import pick_aspect_value
 from dropship_desk.safety import check_ebay_sell
 
@@ -69,9 +70,11 @@ def test_production_sell_requires_flags(monkeypatch):
 class _FakeEbay:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.bodies: list[tuple[str, str, dict | None]] = []
 
     def __call__(self, method: str, path: str, **kwargs):
         self.calls.append((method, path))
+        self.bodies.append((method, path, kwargs.get("json_body")))
         if "get_opted_in_programs" in path:
             return {"programs": [{"programType": "SELLING_POLICY_MANAGEMENT"}]}
         if method == "GET" and path == "/sell/inventory/v1/location":
@@ -103,7 +106,13 @@ class _FakeEbay:
         raise AssertionError(f"unexpected eBay call {method} {path}")
 
 
-def _seed_draft(tmp_path, monkeypatch):
+def _seed_draft(
+    tmp_path,
+    monkeypatch,
+    *,
+    offer=None,
+    title="Praktisches Test Widget fuer den Alltag",
+):
     import dropship_desk.config as cfg
 
     monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
@@ -117,14 +126,14 @@ def _seed_draft(tmp_path, monkeypatch):
         ebay_price=55.0,
         max_amazon_buy=20.0,
         status="drafted",
-        offer={"asin": "B0TESTASI1"},
+        offer=offer or {"asin": "B0TESTASI1"},
         margin={"passed": True},
         hard_reject=[],
     )
     save_listing_draft(
         "B0TESTASI1",
         {
-            "title": "Praktisches Test Widget fuer den Alltag",
+            "title": title,
             "description_html": "<p>Beschreibung</p>",
             "bullet_points": ["Eins", "Zwei"],
         },
@@ -154,6 +163,138 @@ def test_stage_unpublished_then_publish(tmp_path, monkeypatch):
     assert published["listing_id"] == "1234567890"
     assert "/itm/1234567890" in published["item_url"]
     assert list_candidates(status="pipeline")[0]["status"] == "listed"
+
+
+def _inventory_put_body(fake: _FakeEbay) -> dict:
+    body = next(
+        payload
+        for method, path, payload in fake.bodies
+        if method == "PUT" and "/sell/inventory/v1/inventory_item/" in path
+    )
+    assert isinstance(body, dict)
+    return body
+
+
+def _stub_stage_io(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "dropship_desk.ebay.listing.pictures.collect_image_urls",
+        lambda asin, draft: ["https://i.ebayimg.com/00/s/fake.jpg"],
+    )
+    monkeypatch.setattr(
+        "dropship_desk.ebay.taxonomy.ebay_oauth.application_token",
+        lambda: "app-token",
+    )
+
+
+def test_stage_inventory_item_uses_ean_placeholder(tmp_path, monkeypatch):
+    _seed_draft(tmp_path, monkeypatch)
+    _stub_stage_io(monkeypatch)
+    fake = _FakeEbay()
+
+    ebay_listing.stage_unpublished("B0TESTASI1", http=fake)
+
+    product = _inventory_put_body(fake)["product"]
+    assert product["ean"] == ["Nicht zutreffend"]
+    # Brand/MPN handling is unchanged.
+    assert product["brand"] == "Markenlos"
+    assert product["mpn"] == "Nicht zutreffend"
+
+
+def test_stage_inventory_item_uses_real_candidate_gtin(tmp_path, monkeypatch):
+    _seed_draft(
+        tmp_path,
+        monkeypatch,
+        offer={"asin": "B0TESTASI1", "ean": "4006381333931"},
+    )
+    _stub_stage_io(monkeypatch)
+    fake = _FakeEbay()
+
+    ebay_listing.stage_unpublished("B0TESTASI1", http=fake)
+
+    product = _inventory_put_body(fake)["product"]
+    assert product["ean"] == ["4006381333931"]
+
+
+@pytest.mark.parametrize("key", ["ean", "EAN", "gtin", "GTIN"])
+@pytest.mark.parametrize(
+    "value",
+    ["12345678", "123456789012", "4006381333931", "12345678901234"],
+)
+def test_candidate_ean_accepts_exact_keys_and_valid_gtin_lengths(key, value):
+    row = {"offer": {"asin": "B0TESTASI1", key: value}}
+    assert _candidate_ean(row) == value
+
+
+@pytest.mark.parametrize(
+    "key", ["ean_code", "my_ean", "meaning_code", "gtin_code", "product_gtin"]
+)
+def test_candidate_ean_ignores_substring_keys(key):
+    row = {"offer": {"asin": "B0TESTASI1", "ean": "", key: "4006381333931"}}
+    assert _candidate_ean(row) == ""
+
+
+def test_candidate_ean_rejects_meaning_code_even_with_13_digits():
+    row = {"offer": {"asin": "B0TESTASI1", "meaning_code": "4006381333931"}}
+    assert _candidate_ean(row) == ""
+
+
+@pytest.mark.parametrize(
+    "value", ["1234567", "123456789", "1234567890", "12345678901", "123456789012345"]
+)
+def test_candidate_ean_rejects_gtin_values_of_any_other_length(value):
+    row = {"offer": {"asin": "B0TESTASI1", "ean": value}}
+    assert _candidate_ean(row) == ""
+
+
+def test_candidate_ean_reads_nested_aspects():
+    row = {
+        "offer": {
+            "asin": "B0TESTASI1",
+            "aspects": {"GTIN": "4006381333931"},
+        }
+    }
+    assert _candidate_ean(row) == "4006381333931"
+
+
+def test_stage_inventory_item_ignores_meaning_code_and_9_digit_value(
+    tmp_path, monkeypatch
+):
+    _seed_draft(
+        tmp_path,
+        monkeypatch,
+        offer={
+            "asin": "B0TESTASI1",
+            "meaning_code": "123456789",
+            "GTIN": "123456789",
+        },
+    )
+    _stub_stage_io(monkeypatch)
+    fake = _FakeEbay()
+
+    ebay_listing.stage_unpublished("B0TESTASI1", http=fake)
+
+    product = _inventory_put_body(fake)["product"]
+    # meaning_code is not an EAN key; the 9-digit EAN/GTIN values are invalid.
+    assert product["ean"] == ["Nicht zutreffend"]
+
+
+def test_stage_accepts_variation_label_case_insensitively(tmp_path, monkeypatch):
+    # The draft title already carries the label in a different case.  The
+    # stage guard must accept it instead of asking for a regeneration.
+    _seed_draft(
+        tmp_path,
+        monkeypatch,
+        offer={"asin": "B0TESTASI1", "variation_label": "Red / G2"},
+        title="Praktisches Test Widget fuer den Alltag - red / g2",
+    )
+    _stub_stage_io(monkeypatch)
+    fake = _FakeEbay()
+
+    staged = ebay_listing.stage_unpublished("B0TESTASI1", http=fake)
+
+    assert staged["status"] == "unpublished"
+    body = _inventory_put_body(fake)
+    assert body["product"]["title"].endswith("red / g2")
 
 
 def test_stage_api_requires_oauth(tmp_path, monkeypatch):
