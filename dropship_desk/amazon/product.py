@@ -28,6 +28,8 @@ _BACKOFF_BASE_SEC = 5.0
 _BACKOFF_JITTER_SEC = 1.0
 _BLOCK_PAGE_MAX_CHARS = 20_000
 _PRODUCT_TITLE_RE = re.compile(r"""id\s*=\s*["']productTitle["']""", re.IGNORECASE)
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_NOT_FOUND_TITLE_MARKERS = ("seite wurde nicht gefunden", "page not found")
 
 _last_load_monotonic: float | None = None
 _consecutive_failures = 0
@@ -35,6 +37,10 @@ _consecutive_failures = 0
 
 class AmazonUnreachable(RuntimeError):
     """Every allowed attempt to load one ASIN failed in a retryable way."""
+
+
+class AsinNotFound(RuntimeError):
+    """Amazon reports the ASIN does not exist or was delisted (terminal)."""
 
 
 class ChromeNotFound(RuntimeError):
@@ -212,6 +218,10 @@ def _load_pdp(asin: str) -> tuple[OfferIn, str, dict[str, Any]]:
     for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
         try:
             result = _load_pdp_once(asin, url)
+        except AsinNotFound:
+            # Terminal ASIN classification, not a network failure: one attempt,
+            # no sleep, and the consecutive-failure counter is left untouched.
+            raise
         except ChromeNotFound:
             # A missing Chrome installation is systemic, not an ASIN failure.
             raise
@@ -267,6 +277,11 @@ def _load_pdp_once(asin: str, url: str) -> tuple[OfferIn, str, dict[str, Any]]:
             page = context.new_page()
             _goto(page, url)
             html = page.content()
+            if _looks_like_not_found_page(html):
+                raise AsinNotFound(
+                    f"ASIN_NOT_FOUND: {asin} — Amazon reports the product page "
+                    "does not exist or was delisted"
+                )
             if _looks_like_captcha(html):
                 raise RuntimeError("CAPTCHA on product page — try again later")
             if _looks_like_blocked_page(html):
@@ -389,10 +404,27 @@ def _looks_like_captcha(html: str) -> bool:
     return "captcha" in low or "/errors/validatecaptcha" in low or "robot check" in low
 
 
+def _looks_like_not_found_page(html: str) -> bool:
+    """True when the document's <title> reports a missing/delisted product.
+
+    Amazon.de returns a short "Seite wurde nicht gefunden" page for an ASIN
+    that does not exist or was delisted.  That is a terminal ASIN verdict, not
+    a transient network/block failure, so it must never be retried.
+    """
+    for match in _TITLE_RE.finditer(html):
+        title = match.group(1).lower()
+        if any(marker in title for marker in _NOT_FOUND_TITLE_MARKERS):
+            return True
+    return False
+
+
 def _looks_like_blocked_page(html: str) -> bool:
     """A tiny document without the PDP title node is an interstitial/block page.
 
     A full-size page with a title but no buy box is a genuine no-price page and
-    must not be retried as if Amazon were unreachable.
+    must not be retried as if Amazon were unreachable.  A not-found page is
+    terminal and is classified before this helper, never as a block page.
     """
+    if _looks_like_not_found_page(html):
+        return False
     return len(html) < _BLOCK_PAGE_MAX_CHARS and not _PRODUCT_TITLE_RE.search(html)

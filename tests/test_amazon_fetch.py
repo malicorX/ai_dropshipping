@@ -15,8 +15,21 @@ ASIN2 = "B0TEST0002"
 PRICE_HTML = "<html><body><span id='productTitle'>Test</span></body></html>"
 RAW = {"title": "Test product", "price": "€ 19,99", "stars": "4,6 von 5", "reviews": "123"}
 
-# Clearly a block/interstitial: tiny document with no product-title node.
-BLOCK_HTML = "<html><body><title></title><p>Something went wrong.</p></body></html>"
+# Clearly a block/interstitial: tiny document with no product-title node and
+# no "not found" title, so it stays retryable.
+BLOCK_HTML = (
+    "<html><head><title>Amazon.de</title></head>"
+    "<body><p>Something went wrong.</p></body></html>"
+)
+# Amazon's terminal "this ASIN does not exist / was delisted" pages (~2 KB).
+NOT_FOUND_HTML_DE = (
+    "<html><head><title>Seite wurde nicht gefunden</title></head>"
+    "<body><h1>Seite wurde nicht gefunden</h1></body></html>"
+)
+NOT_FOUND_HTML_EN = (
+    "<html><head><title>Page Not Found</title></head>"
+    "<body><h1>Page Not Found</h1></body></html>"
+)
 # A real (large) page with a product title, but no buy box/price.
 NO_PRICE_HTML = (
     "<html><body>"
@@ -182,6 +195,59 @@ def test_captcha_is_not_retried(harness):
     assert harness.launches == 1
     assert harness.goto_calls == 1
     assert harness.clock.sleeps == []
+
+
+@pytest.mark.parametrize(
+    "html",
+    [
+        NOT_FOUND_HTML_DE,
+        NOT_FOUND_HTML_EN,
+        "<html><head><title>SEITE WURDE NICHT GEFUNDEN</title></head><body></body></html>",
+    ],
+    ids=["de", "en", "de-uppercase"],
+)
+def test_not_found_page_is_terminal_non_retryable(harness, html):
+    harness.page = FakePage(html=html, raw={"title": "", "price": None})
+
+    with pytest.raises(product.AsinNotFound) as excinfo:
+        product.fetch_product_offer(ASIN)
+
+    message = str(excinfo.value)
+    assert message.startswith(f"ASIN_NOT_FOUND: {ASIN}")
+    assert not isinstance(excinfo.value, product.AmazonUnreachable)
+    assert harness.launches == 1
+    assert harness.goto_calls == 1
+    assert harness.clock.sleeps == []
+    assert product._consecutive_failures == 0
+
+
+def test_not_found_does_not_reset_existing_consecutive_failure_counter(harness):
+    product._consecutive_failures = 7
+    harness.page = FakePage(html=NOT_FOUND_HTML_DE, raw={"title": "", "price": None})
+
+    with pytest.raises(product.AsinNotFound):
+        product.fetch_product_offer(ASIN)
+
+    assert product._consecutive_failures == 7
+    assert harness.launches == 1
+
+
+def test_25_consecutive_not_found_asins_do_not_trip_failure_cap(harness):
+    harness.page = FakePage(html=NOT_FOUND_HTML_DE, raw={"title": "", "price": None})
+
+    for _ in range(25):
+        with pytest.raises(product.AsinNotFound):
+            product.fetch_product_offer(ASIN)
+
+    assert product._consecutive_failures == 0
+    assert harness.launches == 25
+
+    # The cap is 20: if not-found had incremented (or reset then incremented)
+    # the counter, the 26th call would fail before launching.
+    with pytest.raises(product.AsinNotFound):
+        product.fetch_product_offer(ASIN)
+
+    assert harness.launches == 26
 
 
 def test_block_page_is_retried_three_times_then_unreachable_names_blocked_page(harness):
