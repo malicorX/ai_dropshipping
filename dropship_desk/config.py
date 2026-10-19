@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -85,6 +86,29 @@ def ebay_env() -> str:
     if _ebay_env_override in ("sandbox", "production"):
         return _ebay_env_override
     return normalize_ebay_env(os.environ.get("EBAY_ENV", "sandbox"))
+
+
+# Transport-level guard for upload runs.  A background job can observe the
+# target as sandbox and then the process-wide env can flip to production
+# before the first HTTP write.  The pin closes that race: every eBay transport
+# helper asks this flag before opening a connection and refuses non-sandbox
+# hosts while it is set.
+_upload_pin_lock = threading.RLock()
+_upload_sandbox_pinned = False
+
+
+def pin_sandbox_for_upload(pinned: bool) -> bool:
+    """Pin or release the process-wide upload sandbox transport guard."""
+    global _upload_sandbox_pinned
+    with _upload_pin_lock:
+        _upload_sandbox_pinned = bool(pinned)
+        return _upload_sandbox_pinned
+
+
+def upload_sandbox_pinned() -> bool:
+    """True while an upload run requires every eBay host to be the sandbox."""
+    with _upload_pin_lock:
+        return _upload_sandbox_pinned
 
 
 def _ebay_credential(env: str, sandbox_key: str, prod_key: str) -> str:

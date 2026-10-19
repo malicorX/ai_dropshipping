@@ -174,6 +174,17 @@ def create_app() -> FastAPI:
     @app.post("/api/ebay/target")
     def ebay_target_set(body: dict | None = None) -> dict:
         env = config.normalize_ebay_env(str((body or {}).get("env") or ""))
+        if env == "production" and UPLOAD_JOB.status().get("running"):
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "code": "UPLOAD_RUNNING",
+                    "detail": (
+                        "UPLOAD_RUNNING: an upload-from-file run is active; switching to "
+                        "production is locked until it finishes (sandbox is allowed)"
+                    ),
+                },
+            )
         if env == "production" and not config.ebay_target_ready("production"):
             gaps = ", ".join(config.ebay_target_gaps("production")) or "production keys"
             raise HTTPException(

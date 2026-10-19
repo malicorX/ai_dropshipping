@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -11,6 +12,30 @@ from dropship_desk.ebay import oauth as ebay_oauth
 
 MARKETPLACE_ID = "EBAY_DE"
 CONTENT_LANGUAGE = "de-DE"
+
+
+def is_sandbox_host(host: str) -> bool:
+    """True for every eBay sandbox hostname (api/auth/www)."""
+    host = (host or "").strip().lower().rstrip(".")
+    return host == "sandbox.ebay.com" or host.endswith(".sandbox.ebay.com")
+
+
+def ensure_write_target_allowed(url: str) -> None:
+    """Refuse a non-sandbox eBay host while an upload run is pinned.
+
+    This is deliberately checked at the transport boundary, after the job's
+    own target checks and immediately before any HTTP client is created.  It
+    therefore still holds when ``config.ebay_env()`` flips between the job's
+    check and the actual request.
+    """
+    if not config.upload_sandbox_pinned():
+        return
+    host = urlparse(url).hostname or ""
+    if not is_sandbox_host(host):
+        raise RuntimeError(
+            "LIVE_WRITE_BLOCKED: upload run is pinned to the eBay sandbox; "
+            f"refusing to contact {host or url}"
+        )
 
 
 class EbayApiError(RuntimeError):
@@ -51,6 +76,11 @@ def request(
     extra_headers: dict[str, str] | None = None,
 ) -> Any:
     """Call api.ebay.com / sandbox REST. Returns parsed JSON or None for empty bodies."""
+    url = f"{config.ebay_api_base()}{path}"
+    # Guard before token acquisition as well: access_token() may itself hit
+    # the auth host.  The URL is fixed at this point, so a later env flip
+    # cannot redirect this request to production.
+    ensure_write_target_allowed(url)
     headers = {
         "Authorization": f"Bearer {token or ebay_oauth.access_token()}",
         "Accept": "application/json",
@@ -60,7 +90,6 @@ def request(
     }
     if extra_headers:
         headers.update(extra_headers)
-    url = f"{config.ebay_api_base()}{path}"
     with httpx.Client(timeout=timeout) as client:
         response = client.request(
             method,
@@ -81,5 +110,8 @@ def request(
 
 def trading_endpoint() -> str:
     if config.ebay_env() == "production":
-        return "https://api.ebay.com/ws/api.dll"
-    return "https://api.sandbox.ebay.com/ws/api.dll"
+        endpoint = "https://api.ebay.com/ws/api.dll"
+    else:
+        endpoint = "https://api.sandbox.ebay.com/ws/api.dll"
+    ensure_write_target_allowed(endpoint)
+    return endpoint

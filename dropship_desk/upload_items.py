@@ -20,7 +20,7 @@ from dropship_desk.amazon.product import (
     AmazonUnreachable,
     AsinNotFound,
     ChromeNotFound,
-    fetch_product_offer,
+    fetch_variation_offers,
 )
 from dropship_desk.asin import extract_asin
 from dropship_desk.ebay import listing as ebay_listing
@@ -31,7 +31,7 @@ from dropship_desk.listing_generate import (
     VariationParentError,
     generate_draft,
 )
-from dropship_desk.models import EvaluateRequest
+from dropship_desk.models import EvaluateRequest, OfferIn
 
 ROW_STATES = (
     "queued",
@@ -193,13 +193,27 @@ def _is_not_found(exc: BaseException) -> bool:
     return isinstance(exc, AsinNotFound) or "ASIN_NOT_FOUND" in str(exc).upper()
 
 
+def _is_failure_cap(exc: BaseException) -> bool:
+    return "failure cap" in str(exc).lower()
+
+
 def _is_systemic(exc: BaseException) -> bool:
+    """Only Chrome failure or the process-wide fetch cap stops the batch.
+
+    An ordinary ``AMAZON_UNREACHABLE`` belongs to one ASIN: it is a row error
+    and the next line still runs.
+    """
     text = str(exc).upper()
     return (
-        isinstance(exc, (ChromeNotFound, AmazonUnreachable))
+        isinstance(exc, ChromeNotFound)
         or "CHROME_NOT_FOUND" in text
-        or text.startswith("AMAZON_UNREACHABLE")
+        or (isinstance(exc, AmazonUnreachable) and _is_failure_cap(exc))
+        or ("AMAZON_UNREACHABLE" in text and _is_failure_cap(exc))
     )
+
+
+def _is_live_write_blocked(exc: BaseException) -> bool:
+    return "LIVE_WRITE_BLOCKED" in str(exc).upper()
 
 
 class UploadJobManager:
@@ -253,6 +267,10 @@ class UploadJobManager:
     # ------------------------------------------------------------------ worker
 
     def _run(self) -> None:
+        # The pin covers the whole worker lifetime, including every helper
+        # called by stage/publish.  try/finally guarantees release both after
+        # a normal finish and after an unexpected crash.
+        config.pin_sandbox_for_upload(True)
         try:
             for row in self.state.rows:
                 with self._lock:
@@ -290,6 +308,7 @@ class UploadJobManager:
                 self.state.error = _reason(exc)
                 self.state.phase = "aborted"
         finally:
+            config.pin_sandbox_for_upload(False)
             with self._lock:
                 self.state.running = False
 
@@ -305,6 +324,21 @@ class UploadJobManager:
         if config.ebay_env() != self.state.target_env:
             raise _TargetChanged("eBay target changed during the run")
 
+    def _fetch_offer(self, asin: str) -> OfferIn:
+        """Fetch the PDP and reject variation parents exactly like generate_draft.
+
+        ``fetch_variation_offers`` already executes every lookup through the
+        existing reliable-fetch policy (pacing, bounded retry, failure cap).
+        """
+        offers = fetch_variation_offers(asin)
+        child_asins = {(offer.asin or "").strip().upper() for offer in offers}
+        if len(offers) > 1 and asin not in child_asins:
+            raise VariationParentError("variation_parent")
+        return next(
+            (offer for offer in offers if (offer.asin or "").strip().upper() == asin),
+            offers[0],
+        )
+
     def _process_row(self, row: UploadRow) -> None:
         asin = row.asin
         with self._lock:
@@ -312,7 +346,11 @@ class UploadJobManager:
             row.reason = ""
 
         try:
-            offer = fetch_product_offer(asin)
+            offer = self._fetch_offer(asin)
+        except VariationParentError:
+            # The PDP is a hub for sellable children; never stage/publish it.
+            self._finish(row, "rejected", "variation_parent")
+            return
         except Exception as exc:  # noqa: BLE001 - classified below
             if _is_not_found(exc):
                 self._finish(row, "not_found", _reason(exc) or "ASIN_NOT_FOUND")
@@ -322,14 +360,9 @@ class UploadJobManager:
             self._finish(row, "error", _reason(exc))
             return
 
-        if offer.parent_asin and offer.parent_asin.strip().upper() != asin:
-            self._finish(
-                row,
-                "rejected",
-                "variation parent — each size/color is stored as its own ASIN",
-            )
-            return
-
+        # Parent detection happens in _fetch_offer() from the full offer list.
+        # Do not reject a genuine child merely because it carries the parent's
+        # ASIN in ``offer.parent_asin``.
         try:
             evaluation = run_evaluate(
                 EvaluateRequest(asin_or_url=asin, offer=offer, save=True),
@@ -385,6 +418,8 @@ class UploadJobManager:
         try:
             staged = ebay_listing.stage_unpublished(asin)
         except Exception as exc:  # noqa: BLE001
+            if _is_live_write_blocked(exc) or config.ebay_env() != self.state.target_env:
+                raise _TargetChanged(_reason(exc)) from exc
             self._finish(row, "error", _reason(exc))
             return
         with self._lock:
@@ -395,6 +430,8 @@ class UploadJobManager:
         try:
             published = ebay_listing.publish_offer(asin)
         except Exception as exc:  # noqa: BLE001
+            if _is_live_write_blocked(exc) or config.ebay_env() != self.state.target_env:
+                raise _TargetChanged(_reason(exc)) from exc
             self._finish(row, "error", _reason(exc))
             return
         with self._lock:

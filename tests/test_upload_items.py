@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 import dropship_desk.api as api_mod
 import dropship_desk.upload_items as upload_items
 from dropship_desk import config as cfg
+from dropship_desk.ebay import client as ebay_http
 from dropship_desk.ebay import listing as ebay_listing
 from dropship_desk.models import EvaluateResponse, OfferIn
 
@@ -36,7 +37,7 @@ def _offer(asin: str, total: float = 20.0) -> OfferIn:
     )
 
 
-def _install_stubs(monkeypatch, *, missing=(), fetch_hook=None):
+def _install_stubs(monkeypatch, *, missing=(), fetch_hook=None, variation_hook=None):
     calls: dict[str, list] = {
         "fetch": [],
         "evaluate": [],
@@ -115,11 +116,50 @@ def _install_stubs(monkeypatch, *, missing=(), fetch_hook=None):
         )
         return ebay_listing.public_listing(asin)
 
-    monkeypatch.setattr(upload_items, "fetch_product_offer", fake_fetch)
+    def fake_variations(asin: str) -> list[OfferIn]:
+        if variation_hook is not None:
+            return variation_hook(asin)
+        return [fake_fetch(asin)]
+
+    monkeypatch.setattr(upload_items, "fetch_variation_offers", fake_variations)
     monkeypatch.setattr(upload_items, "run_evaluate", fake_evaluate)
     monkeypatch.setattr(upload_items, "generate_draft", fake_draft)
     monkeypatch.setattr(upload_items.ebay_listing, "stage_unpublished", fake_stage)
     monkeypatch.setattr(upload_items.ebay_listing, "publish_offer", fake_publish)
+    return calls
+
+
+def _install_http_stub(monkeypatch) -> list[tuple]:
+    """Replace httpx.Client so any real transport attempt is observable."""
+    calls: list[tuple] = []
+
+    class _Response:
+        status_code = 200
+        content = b"{}"
+        text = "{}"
+
+        def json(self):
+            return {}
+
+    class _Client:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info) -> bool:
+            return False
+
+        def request(self, *args, **kwargs):
+            calls.append(("request", args, kwargs))
+            return _Response()
+
+        def post(self, *args, **kwargs):
+            calls.append(("post", args, kwargs))
+            return _Response()
+
+    monkeypatch.setattr(ebay_http.httpx, "Client", _Client)
     return calls
 
 
@@ -229,6 +269,7 @@ def test_sandbox_happy_path_publishes_two_asins(client, tmp_path, monkeypatch):
     assert calls["publish"] == ["B0HAPPY001", "B0HAPPY002"]
     assert status["counters"]["published"] == 2
     assert all(row["item_url"].startswith("https://www.sandbox.ebay.com/itm/") for row in status["rows"])
+    assert cfg.upload_sandbox_pinned() is False
 
 
 def test_asin_not_found_is_skipped_and_run_continues(client, tmp_path, monkeypatch):
@@ -332,5 +373,217 @@ def test_target_change_during_run_aborts_before_stage(client, tmp_path, monkeypa
 
     assert status["running"] is False
     assert status["phase"] == "aborted_target_changed"
+    assert calls["stage"] == []
+    assert calls["publish"] == []
+    assert cfg.upload_sandbox_pinned() is False
+
+
+def test_target_switch_to_production_is_409_while_upload_running(client, tmp_path, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+    pin_seen = {"value": None}
+
+    def blocking_fetch(asin: str) -> OfferIn:
+        pin_seen["value"] = cfg.upload_sandbox_pinned()
+        started.set()
+        assert release.wait(timeout=10)
+        return _offer(asin)
+
+    _install_stubs(monkeypatch, fetch_hook=blocking_fetch)
+    _write_upload(tmp_path, monkeypatch, "https://www.amazon.de/dp/B0LOCK0001\n")
+
+    try:
+        assert client.post("/api/upload-items/start").status_code == 200
+        assert started.wait(timeout=5)
+        assert pin_seen["value"] is True
+
+        live = client.post("/api/ebay/target", json={"env": "production"})
+        assert live.status_code == 409
+        assert live.json()["code"] == "UPLOAD_RUNNING"
+        assert "UPLOAD_RUNNING" in live.json()["detail"]
+
+        sandbox = client.post("/api/ebay/target", json={"env": "sandbox"})
+        assert sandbox.status_code == 200
+    finally:
+        release.set()
+    status = _wait_done(client)
+    assert status["rows"][0]["state"] == "published"
+    assert cfg.upload_sandbox_pinned() is False
+
+
+def test_pin_released_after_worker_crash(client, tmp_path, monkeypatch):
+    def crashing_process(self, row):
+        raise RuntimeError("worker crash")
+
+    _install_stubs(monkeypatch)
+    monkeypatch.setattr(upload_items.UploadJobManager, "_process_row", crashing_process)
+    _write_upload(tmp_path, monkeypatch, "https://www.amazon.de/dp/B0CRASH001\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    assert status["running"] is False
+    assert status["phase"] == "aborted"
+    assert "worker crash" in status["error"]
+    assert cfg.upload_sandbox_pinned() is False
+
+
+def _flipping_check(monkeypatch, holder, flip_after: int):
+    real_check = upload_items.UploadJobManager._check_target
+
+    def flipping_check(self):
+        real_check(self)
+        holder["checks"] += 1
+        if holder["checks"] == flip_after:
+            holder["env"] = "production"
+
+    monkeypatch.setattr(upload_items.UploadJobManager, "_check_target", flipping_check)
+
+
+def test_env_flip_after_stage_check_is_blocked_by_transport(client, tmp_path, monkeypatch):
+    holder = {"env": "sandbox", "checks": 0}
+    monkeypatch.setattr(cfg, "ebay_env", lambda: holder["env"])
+    calls = _install_stubs(monkeypatch)
+    http_calls = _install_http_stub(monkeypatch)
+    stage_attempts: list[str] = []
+
+    def transport_stage(asin):
+        stage_attempts.append(asin)
+        return ebay_http.request(
+            "PUT", f"/sell/inventory/v1/inventory_item/DD-{asin}", json_body={}
+        )
+
+    monkeypatch.setattr(upload_items.ebay_listing, "stage_unpublished", transport_stage)
+    _flipping_check(monkeypatch, holder, flip_after=2)
+    _write_upload(tmp_path, monkeypatch, "https://www.amazon.de/dp/B0FLIP0001\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    assert status["phase"] == "aborted_target_changed"
+    assert holder["checks"] == 2
+    assert stage_attempts == ["B0FLIP0001"]
+    assert http_calls == []
+    assert calls["publish"] == []
+    assert cfg.upload_sandbox_pinned() is False
+
+
+def test_env_flip_after_publish_check_is_blocked_by_transport(client, tmp_path, monkeypatch):
+    holder = {"env": "sandbox", "checks": 0}
+    monkeypatch.setattr(cfg, "ebay_env", lambda: holder["env"])
+    calls = _install_stubs(monkeypatch)
+    http_calls = _install_http_stub(monkeypatch)
+    publish_attempts: list[str] = []
+
+    def transport_publish(asin):
+        publish_attempts.append(asin)
+        return ebay_http.request("POST", f"/sell/inventory/v1/offer/OFF-{asin}/publish")
+
+    monkeypatch.setattr(upload_items.ebay_listing, "publish_offer", transport_publish)
+    _flipping_check(monkeypatch, holder, flip_after=3)
+    _write_upload(tmp_path, monkeypatch, "https://www.amazon.de/dp/B0FLIP0002\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    assert status["phase"] == "aborted_target_changed"
+    assert holder["checks"] == 3
+    assert calls["stage"] == ["B0FLIP0002"]
+    assert publish_attempts == ["B0FLIP0002"]
+    assert http_calls == []
+    assert cfg.upload_sandbox_pinned() is False
+
+
+def test_variation_parent_is_rejected_and_never_staged(client, tmp_path, monkeypatch):
+    parent = "B0PARENT01"
+
+    def parent_offers(asin: str) -> list[OfferIn]:
+        assert asin == parent
+        return [_offer("B0CHILD001"), _offer("B0CHILD002")]
+
+    calls = _install_stubs(monkeypatch, variation_hook=parent_offers)
+    _write_upload(tmp_path, monkeypatch, f"https://www.amazon.de/dp/{parent}\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    row = status["rows"][0]
+    assert row["state"] == "rejected"
+    assert row["reason"] == "variation_parent"
+    assert status["phase"] == "finished"
+    assert calls["evaluate"] == []
+    assert calls["draft"] == []
+    assert calls["stage"] == []
+    assert calls["publish"] == []
+
+
+def test_genuine_variation_child_passes(client, tmp_path, monkeypatch):
+    child = "B0CHILD001"
+
+    def child_offers(asin: str) -> list[OfferIn]:
+        assert asin == child
+        child_offer = _offer(child).model_copy(
+            update={"parent_asin": "B0PARENT01", "variation_label": "20 kg"}
+        )
+        sibling = _offer("B0SIBL0002").model_copy(
+            update={"parent_asin": "B0PARENT01", "variation_label": "40 kg"}
+        )
+        return [child_offer, sibling]
+
+    calls = _install_stubs(monkeypatch, variation_hook=child_offers)
+    _write_upload(tmp_path, monkeypatch, f"https://www.amazon.de/dp/{child}\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    assert status["rows"][0]["state"] == "published"
+    assert calls["evaluate"] == [(child, "always")]
+    assert calls["stage"] == [child]
+
+
+def test_ordinary_amazon_unreachable_is_a_row_error_and_run_continues(client, tmp_path, monkeypatch):
+    def flaky_fetch(asin: str) -> OfferIn:
+        if asin == "B0FLAKY001":
+            raise upload_items.AmazonUnreachable(
+                "AMAZON_UNREACHABLE: ASIN B0FLAKY001 failed after 3 attempts"
+            )
+        return _offer(asin)
+
+    calls = _install_stubs(monkeypatch, fetch_hook=flaky_fetch)
+    _write_upload(
+        tmp_path,
+        monkeypatch,
+        "https://www.amazon.de/dp/B0FLAKY001\nhttps://www.amazon.de/dp/B0AFTER001\n",
+    )
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    assert [row["state"] for row in status["rows"]] == ["error", "published"]
+    assert status["phase"] == "finished"
+    assert calls["stage"] == ["B0AFTER001"]
+    assert calls["publish"] == ["B0AFTER001"]
+
+
+def test_failure_cap_amazon_unreachable_aborts_the_run(client, tmp_path, monkeypatch):
+    def capped_fetch(asin: str) -> OfferIn:
+        raise upload_items.AmazonUnreachable(
+            "AMAZON_UNREACHABLE: failure cap reached after 20 consecutive terminal failures"
+        )
+
+    calls = _install_stubs(monkeypatch, fetch_hook=capped_fetch)
+    _write_upload(
+        tmp_path,
+        monkeypatch,
+        "https://www.amazon.de/dp/B0CAP00001\nhttps://www.amazon.de/dp/B0CAP00002\n",
+    )
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    assert status["phase"] == "aborted"
+    assert "failure cap" in status["error"]
+    assert status["rows"][0]["state"] == "error"
+    assert status["rows"][1]["state"] == "queued"
     assert calls["stage"] == []
     assert calls["publish"] == []

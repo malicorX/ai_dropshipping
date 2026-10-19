@@ -1499,9 +1499,12 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
     return () => window.clearInterval(id);
   }, [loadPreview, loadStatus]);
 
-  const target = status?.target_env || preview?.target_env || "sandbox";
-  const live = target === "production" || !!preview?.live_disabled;
   const running = !!status?.running;
+  const liveEnv = preview?.target_env || "sandbox";
+  // When no run is active the badge must describe the current Settings
+  // target, not the target_env remembered from the last run.
+  const target = running ? status?.target_env || liveEnv : liveEnv;
+  const live = target === "production" || (!running && !!preview?.live_disabled);
   const rows = status?.rows?.length ? status.rows : preview?.rows ?? [];
   const counters = status?.counters ?? {};
 
