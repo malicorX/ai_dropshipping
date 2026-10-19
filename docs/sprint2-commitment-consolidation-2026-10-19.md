@@ -45,4 +45,13 @@ Applied in bar v5.
 | r5 | gpt61-sol | APPROVE-AS-IS | none |
 | r5 | gpt6-luna-max | APPROVE-AS-IS | none |
 
-Applied in bar v6. Next: r6 to all six.
+Applied in bar v6. 
+
+| r6 | codex | REQUEST-CHANGES | C1: at most one offer; exactly one if PUBLISHED |
+| r6 | deepcode | REQUEST-CHANGES | offer vs item wording in rule 1; UNKNOWN rows; p definition |
+| r6 | opus | APPROVE-AS-IS | none (snapshot gap recorded) |
+| r6 | deepseek | APPROVE-AS-IS | none (census call, receipt evidence) |
+| r6 | gpt61-sol | REQUEST-CHANGES | C1: at most one offer; exactly one if PUBLISHED |
+| r6 | gpt6-luna-max | APPROVE-AS-IS | none |
+
+Applied in bar v7. Next: r7 to all six.
