@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-type Tab = "find" | "queue" | "list" | "settings";
+type Tab = "find" | "queue" | "list" | "upload" | "settings";
 
 type Health = {
   status: string;
@@ -131,6 +131,36 @@ type ListingShopSettings = {
   photo_disclaimer_html: string;
 };
 
+type UploadRow = {
+  line_no: number;
+  line: string;
+  asin: string;
+  state: string;
+  reason: string;
+  offer_id: string;
+  listing_id: string;
+  item_url: string;
+};
+
+type UploadPreview = {
+  target_env: string;
+  live_disabled: boolean;
+  path: string;
+  rows: UploadRow[];
+};
+
+type UploadStatus = {
+  run_id: string;
+  target_env: string;
+  started_at: string;
+  running: boolean;
+  stop_requested: boolean;
+  phase: string;
+  error: string;
+  rows: UploadRow[];
+  counters: Record<string, number>;
+};
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...init,
@@ -248,6 +278,7 @@ export default function App() {
             ["find", "Find on Amazon"],
             ["queue", "Queue"],
             ["list", "List on eBay"],
+            ["upload", "Upload items"],
             ["settings", "Settings"],
           ] as const
         ).map(([id, label]) => (
@@ -288,6 +319,7 @@ export default function App() {
       {tab === "settings" && (
         <SettingsPanel onError={setError} health={health} refreshHealth={refreshHealth} />
       )}
+      {tab === "upload" && <UploadItemsPanel onError={setError} />}
     </div>
   );
 }
@@ -1432,6 +1464,169 @@ function DraftsPanel({
         </tbody>
       </table>
       {rows.length === 0 ? <p className="muted">No candidates in this filter.</p> : null}
+    </div>
+  );
+}
+
+function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
+  const [preview, setPreview] = useState<UploadPreview | null>(null);
+  const [status, setStatus] = useState<UploadStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  const loadPreview = useCallback(async () => {
+    try {
+      setPreview(await api<UploadPreview>("/api/upload-items/preview"));
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    }
+  }, [onError]);
+
+  const loadStatus = useCallback(async () => {
+    try {
+      setStatus(await api<UploadStatus>("/api/upload-items/status"));
+    } catch {
+      /* header already reports an unreachable API */
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadPreview();
+    void loadStatus();
+    const id = window.setInterval(() => {
+      void loadStatus();
+    }, 2000);
+    return () => window.clearInterval(id);
+  }, [loadPreview, loadStatus]);
+
+  const target = status?.target_env || preview?.target_env || "sandbox";
+  const live = target === "production" || !!preview?.live_disabled;
+  const running = !!status?.running;
+  const rows = status?.rows?.length ? status.rows : preview?.rows ?? [];
+  const counters = status?.counters ?? {};
+
+  async function start() {
+    onError("");
+    setMsg("Starting…");
+    setBusy(true);
+    try {
+      const next = await api<UploadStatus>("/api/upload-items/start", {
+        method: "POST",
+        body: "{}",
+      });
+      setStatus(next);
+      setMsg(`Started ${next.run_id}`);
+      await loadPreview();
+    } catch (e) {
+      const text = e instanceof Error ? e.message : String(e);
+      onError(text);
+      setMsg(text);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function stop() {
+    onError("");
+    try {
+      setStatus(
+        await api<UploadStatus>("/api/upload-items/stop", { method: "POST", body: "{}" })
+      );
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  return (
+    <div className="panel grid upload-panel">
+      <div className="upload-head">
+        <div>
+          <h2>Upload items from file</h2>
+          <p className="muted">
+            Reads <span className="mono">{preview?.path || "upload_items/upload_items.txt"}</span>{" "}
+            (one Amazon.de link per line) and runs every link through fetch → evaluate → draft →
+            stage → publish. Sequential and reattaches after a reload.
+          </p>
+        </div>
+        <span className={live ? "upload-target live" : "upload-target"}>
+          {live ? "LIVE disabled" : "-> sandbox eBay"}
+        </span>
+      </div>
+      {live ? (
+        <p className="upload-warning">
+          Production target: upload-from-file is refused with LIVE_UPLOAD_DISABLED before any
+          network call. Switch to sandbox eBay in Settings to use it.
+        </p>
+      ) : null}
+      <div className="actions">
+        <button type="button" onClick={() => void loadPreview()}>
+          Preview
+        </button>
+        <button
+          type="button"
+          className="primary"
+          disabled={running || live || busy}
+          onClick={() => void start()}
+        >
+          {running ? "Uploading…" : "Upload items from file"}
+        </button>
+        {running ? (
+          <button type="button" onClick={() => void stop()}>
+            Stop
+          </button>
+        ) : null}
+        {msg ? <span className="muted">{msg}</span> : null}
+      </div>
+      <p className="muted">
+        {running
+          ? `Run ${status?.run_id || "…"} · ${status?.phase || "starting"}`
+          : status?.run_id
+            ? `Last run ${status.run_id} · ${status.phase}`
+            : "No run yet."}
+        {counters.total
+          ? ` · ${counters.done ?? 0}/${counters.total} done · ${counters.published ?? 0} published`
+          : ""}
+        {status?.error ? ` · ${status.error}` : ""}
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>ASIN</th>
+            <th>State</th>
+            <th>Reason</th>
+            <th>Offer</th>
+            <th>Sandbox item</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => {
+            const bad = ["error", "rejected", "not_found"].includes(row.state);
+            const good = ["published", "skipped_existing"].includes(row.state);
+            return (
+              <tr key={row.line_no}>
+                <td className="mono">{row.asin || "—"}</td>
+                <td>
+                  <span className={bad ? "badge fail" : good ? "badge ok" : "badge"}>
+                    {row.state}
+                  </span>
+                </td>
+                <td>{row.reason || "—"}</td>
+                <td className="mono">{row.offer_id || "—"}</td>
+                <td>
+                  {row.item_url ? (
+                    <a href={row.item_url} target="_blank" rel="noreferrer">
+                      {row.listing_id || "open"}
+                    </a>
+                  ) : (
+                    row.listing_id || "—"
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      {rows.length === 0 ? <p className="muted">No rows in the upload file.</p> : null}
     </div>
   );
 }
