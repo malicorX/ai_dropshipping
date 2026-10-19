@@ -54,4 +54,15 @@ Applied in bar v6.
 | r6 | gpt61-sol | REQUEST-CHANGES | C1: at most one offer; exactly one if PUBLISHED |
 | r6 | gpt6-luna-max | APPROVE-AS-IS | none |
 
-Applied in bar v7. Next: r7 to all six.
+Applied in bar v7. 
+
+| r7 | codex | APPROVE-AS-IS | none |
+| r7 | deepcode | APPROVE-AS-IS | none |
+| r7 | opus | APPROVE-AS-IS | optional: p judged on census alone (applied editorially, disclosed) |
+| r7 | deepseek | APPROVE-AS-IS | none |
+| r7 | gpt61-sol | APPROVE-AS-IS | none |
+| r7 | gpt6-luna-max | APPROVE-AS-IS | none |
+
+**Unanimous 6/6 at r7.** Seven rounds; r1 0 approvals, r2 2, r3 5, r4 5, r5 5, r6 3, r7 6. nv-nemotron did not plan (tool-call text) and was not asked to vote. Roster skipped: kimi, grok (quota), mimo-* ($0), Fable (banned).
+
+**Driver's vote:** APPROVE-AS-IS. Residual risks named by the seats: sandbox is not live eBay; eventual consistency can hide an accepted publish beyond two reads; price-flip tolerance is non-additive; run C's kill window must be shown in the receipt.

@@ -1,6 +1,6 @@
 Repos in this sprint: ai_dropshipping
 
-# Sprint 2 plan (PLANNED, NOT FROZEN) - 2026-10-19
+# Sprint 2 plan (PLANNED, NOT FROZEN; commitment vote r7 UNANIMOUS 6/6) - 2026-10-19
 
 **Goal:** `upload_items/upload_items.txt` + `start.bat` + one UI button -> every Amazon link becomes at most one eBay listing on the app's current target (Sandbox -> sandbox, Production -> live). **Bar:** `docs/sprint2-bar-v7.md`. **Consolidation:** `docs/sprint2-planning-consolidation-2026-10-19.md`.
 
@@ -29,3 +29,4 @@ Planner/driver/integrator: this session (never builds). Builder: codex. Tester: 
 - 2026-10-19 (vote r4: 5 approvals codex, deepcode, deepseek, sol, luna; opus REQUEST-CHANGES): bar v5 - run B expectation depends on run A for ERROR_RETRYABLE rows (opus); run C wording uses offerId and listingId (opus); sandbox identity pin, per-segment run C clock, C5 authorized-path log, two after-kill reads >= 60 s apart (deepcode, deepseek, non-blocking).
 - 2026-10-19 (vote r5: 5 approvals codex, opus, deepseek, sol, luna; deepcode REQUEST-CHANGES): bar v6 - C1: exactly one offer per ASIN across A and B, remote read before any retry, adopt not republish (deepcode); price-flip exemption inlined in verdict rule 1 (deepcode); control listing registers SKU + offerId + listingId, run C restart uses the same SHA (opus, non-blocking).
 - 2026-10-19 (vote r6: 3 approvals opus, deepseek, luna; codex, sol, deepcode REQUEST-CHANGES): bar v7 - C1 'at most one offer per ASIN across A and B, exactly one if PUBLISHED' (codex, sol); rule 1 'more than one offer, or more than one item' (deepcode); UNKNOWN from an ambiguous pre-retry read lowers p, not NOT_MET (deepcode); p excludes price-flipped rows, counted from the run-A census (deepcode); receipt shows accepted offerId + pending count before kill and snapshot-to-run-A gap (opus, deepseek).
+- 2026-10-19 (vote r7, unanimous, editorial only after the vote): clarification from opus's optional note, no change of meaning: p is judged on the run-A census alone; a row's local state (for example UNKNOWN) is not consulted. Disclosed here; the operator may ask for a confirming round before freezing.
