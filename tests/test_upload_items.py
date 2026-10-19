@@ -730,6 +730,93 @@ def test_ordinary_amazon_unreachable_is_a_row_error_and_run_continues(client, tm
     assert calls["publish"] == ["B0AFTER001"]
 
 
+def _seed_published(asin: str, listing_id: str) -> None:
+    ebay_listing.save_listing_state(
+        asin,
+        {
+            "status": "published",
+            "offer_id": f"OFF-{asin}",
+            "listing_id": listing_id,
+        },
+    )
+
+
+def test_published_rows_are_marked_before_any_fetch(client, tmp_path, monkeypatch):
+    calls = _install_stubs(monkeypatch)
+    _seed_published("B0MARK0001", "1100B0MARK0001")
+    _seed_published("B0MARK0002", "1100B0MARK0002")
+    _write_upload(
+        tmp_path,
+        monkeypatch,
+        "\n".join(
+            [
+                "https://www.amazon.de/dp/B0MARK0001",
+                "https://www.amazon.de/dp/B0MARK0002",
+                "https://www.amazon.de/dp/B0MARK0003",
+            ]
+        )
+        + "\n",
+    )
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    rows = status["rows"]
+    assert [row["state"] for row in rows] == [
+        "skipped_existing",
+        "skipped_existing",
+        "published",
+    ]
+    assert [row["reason"] for row in rows[:2]] == ["haben wir schon", "haben wir schon"]
+    assert rows[0]["offer_id"] == "OFF-B0MARK0001"
+    assert rows[0]["listing_id"] == "1100B0MARK0001"
+    assert rows[0]["item_url"] == "https://www.sandbox.ebay.com/itm/1100B0MARK0001"
+    assert rows[1]["offer_id"] == "OFF-B0MARK0002"
+    assert rows[1]["listing_id"] == "1100B0MARK0002"
+    # The known ASINs must not cost a single fetch/evaluate/draft/stage/publish.
+    assert calls["fetch"] == ["B0MARK0003"]
+    assert calls["evaluate"] == [("B0MARK0003", "always")]
+    assert calls["draft"] == ["B0MARK0003"]
+    assert calls["stage"] == ["B0MARK0003"]
+    assert calls["publish"] == ["B0MARK0003"]
+
+
+def test_preview_marks_published_rows_as_already_listed(client, tmp_path, monkeypatch):
+    calls = _install_stubs(monkeypatch)
+    _seed_published("B0MARK0001", "1100B0MARK0001")
+    _seed_published("B0MARK0002", "1100B0MARK0002")
+    _write_upload(
+        tmp_path,
+        monkeypatch,
+        "\n".join(
+            [
+                "https://www.amazon.de/dp/B0MARK0001",
+                "https://www.amazon.de/dp/B0MARK0002",
+                "https://www.amazon.de/dp/B0MARK0003",
+            ]
+        )
+        + "\n",
+    )
+
+    r = client.get("/api/upload-items/preview")
+
+    assert r.status_code == 200
+    rows = r.json()["rows"]
+    assert [row["state"] for row in rows] == [
+        "already_listed",
+        "already_listed",
+        "queued",
+    ]
+    assert [row["reason"] for row in rows[:2]] == ["haben wir schon", "haben wir schon"]
+    assert rows[0]["offer_id"] == "OFF-B0MARK0001"
+    assert rows[0]["listing_id"] == "1100B0MARK0001"
+    assert rows[0]["item_url"] == "https://www.sandbox.ebay.com/itm/1100B0MARK0001"
+    assert rows[2]["offer_id"] == ""
+    # Preview is file-only: it must not touch Amazon or eBay transports.
+    for name, seen in calls.items():
+        assert seen == [], f"{name} was called by preview: {seen}"
+
+
 def test_failure_cap_amazon_unreachable_aborts_the_run(client, tmp_path, monkeypatch):
     def capped_fetch(asin: str) -> OfferIn:
         raise upload_items.AmazonUnreachable(

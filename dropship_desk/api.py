@@ -61,6 +61,8 @@ from dropship_desk.upload_items import (
     NotSignedIn,
     UploadAlreadyRunning,
     UploadFileMissing,
+    mark_row_listed,
+    published_listing_state,
     read_upload_file,
     upload_items_path,
 )
@@ -344,6 +346,13 @@ def create_app() -> FastAPI:
             raise HTTPException(
                 status_code=404, detail=f"UPLOAD_FILE_MISSING: {e.path}"
             ) from e
+        # Local state files only: the preview never touches Amazon or eBay.
+        for row in rows:
+            if row.state != "queued":
+                continue
+            existing = published_listing_state(row.asin, env)
+            if existing is not None:
+                mark_row_listed(row, existing, row_state="already_listed")
         return {
             "target_env": env,
             "live_disabled": env == "production",

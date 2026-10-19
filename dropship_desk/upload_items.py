@@ -47,6 +47,7 @@ ROW_STATES = (
     "duplicate_in_file",
 )
 _TERMINAL_STATES = frozenset(ROW_STATES) - {"queued", "fetching"}
+EXISTING_REASON = "haben wir schon"
 
 
 class UploadFileMissing(FileNotFoundError):
@@ -103,6 +104,47 @@ class UploadRow:
             "listing_id": self.listing_id,
             "item_url": self.item_url,
         }
+
+
+def _listing_id(state: dict[str, Any]) -> str:
+    return str(state.get("listing_id") or "")
+
+
+def _item_url(state: dict[str, Any]) -> str:
+    saved = str(state.get("item_url") or "")
+    if saved:
+        return saved
+    listing_id = _listing_id(state)
+    return ebay_listing.item_url(listing_id) if listing_id else ""
+
+
+def published_listing_state(asin: str, env: str) -> dict[str, Any] | None:
+    """Return the saved listing when ``asin`` is already published for ``env``.
+
+    This is a local, file-only read (no network).  Sandbox and production keep
+    separate state files; the stored ``env`` is checked as a second guard for
+    legacy records that predate the per-env file split.
+    """
+    target = (env or "").strip()
+    try:
+        state = ebay_listing.load_listing_state(asin)
+    except OSError:
+        return None
+    if str(state.get("status") or "") != "published":
+        return None
+    state_env = str(state.get("env") or "").strip()
+    if state_env and target and state_env != target:
+        return None
+    return state
+
+
+def mark_row_listed(row: UploadRow, state: dict[str, Any], *, row_state: str) -> None:
+    """Copy the known offer/listing identity onto a row and mark it as seen."""
+    row.state = row_state
+    row.reason = EXISTING_REASON
+    row.offer_id = str(state.get("offer_id") or "")
+    row.listing_id = _listing_id(state)
+    row.item_url = _item_url(state)
 
 
 def upload_items_path() -> Path:
@@ -352,6 +394,15 @@ class UploadJobManager:
 
     def _process_row(self, row: UploadRow) -> None:
         asin = row.asin
+
+        # Mark known ASINs before the expensive Amazon work starts.  This is a
+        # local state-file read only: no fetch/evaluate/draft/stage/publish.
+        existing = published_listing_state(asin, self.state.target_env)
+        if existing is not None:
+            with self._lock:
+                mark_row_listed(row, existing, row_state="skipped_existing")
+            return
+
         with self._lock:
             row.state = "fetching"
             row.reason = ""
@@ -393,14 +444,12 @@ class UploadJobManager:
             row.state = "evaluated"
 
         self._check_target()
-        existing = ebay_listing.load_listing_state(asin)
-        if str(existing.get("status") or "") == "published":
+        # Final re-check: a previous row in this run (or another process) may
+        # have published the same ASIN while we were fetching.
+        existing = published_listing_state(asin, self.state.target_env)
+        if existing is not None:
             with self._lock:
-                row.state = "skipped_existing"
-                row.reason = "already published for this eBay environment"
-                row.offer_id = str(existing.get("offer_id") or "")
-                row.listing_id = str(existing.get("listing_id") or "")
-                row.item_url = str(existing.get("item_url") or "")
+                mark_row_listed(row, existing, row_state="skipped_existing")
             return
 
         try:
