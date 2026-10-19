@@ -1,4 +1,43 @@
-# Sprint 2 registered bar v5 (2026-10-19, after vote round 4) - NOT frozen
+# Sprint 2 commitment vote r6 (2026-10-19) - ai_dropshipping
+
+You are a voting seat. Answer in <=120 words, plain text, no tool calls. Round 5: codex, opus, deepseek, sol, luna approved; deepcode requested two changes (C1 'exactly one offer per ASIN across A and B'; inline the price-flip exemption in verdict rule 1). Both are applied in bar v6, plus opus's two optional clarifications. Nothing executed; smoke listing is baseline.
+
+Questions: 1. `VOTE: APPROVE-AS-IS | REQUEST-CHANGES | REJECT` 2. at most 2 exact checkable changes 3. one risk left 4. anything executed a problem for freezing? (one sentence)
+
+---- PLAN ----
+Repos in this sprint: ai_dropshipping
+
+# Sprint 2 plan (PLANNED, NOT FROZEN) - 2026-10-19
+
+**Goal:** `upload_items/upload_items.txt` + `start.bat` + one UI button -> every Amazon link becomes at most one eBay listing on the app's current target (Sandbox -> sandbox, Production -> live). **Bar:** `docs/sprint2-bar-v6.md`. **Consolidation:** `docs/sprint2-planning-consolidation-2026-10-19.md`.
+
+## Roles
+Planner/driver/integrator: this session (never builds). Builder: codex. Tester: deepcode. Reviewer: opus. Critic: deepseek.
+
+## Cards
+| card | what | size | dep |
+|---|---|---|---|
+| T0 | register: fixture (20 lines, E=12), expected states per run, price snapshot, baseline census (incl. DD-SMOKE-TEST-1), control listing IDs, SKU->ASIN rule, receipt contract, `sprint2-freeze.json` | M | - |
+| T1 | reader + durable run/row ledger, alias dedupe, resumable | S | T0 |
+| T2 | pipeline worker: analyse -> margin -> draft -> stage -> publish, sequential background job, continue on error, single-flight lock | M | T1 |
+| T3 | duplicate reconciliation: remote check across SKUs, adopt/resume existing offers, unknown outcome blocks resend | M | T2 |
+| T4 | target pin + live gate: snapshot env, abort on switch, server-side `LIVE <n>` bound to file hash, cap, interception tests | M | T2 |
+| T5 | UI + start.bat: one button, progress table, reattach after reload, env banner, actionable errors | M | T2 |
+| T6 | measurement: runs A/B on the 20-line fixture, run C on the C-set, controls C1-C6, one receipt | M | T3-T5 |
+| T7 | independent review (opus) and critic (deepseek) of receipt, dedupe, gate | S | T6 |
+| REVIEW | sprint review | S | T7 |
+
+**Not in this sprint:** first real live listing, variation groups, near-duplicate product detection, scale beyond 20 rows, profitability.
+
+## Plan changes (append-only)
+- 2026-10-19 (vote r1, 0 of 5 approvals; deepseek returned tool-call text only, no vote): bar v2 - commitment freeze vs measurement freeze + source SHA pin (codex, deepcode, sol, +); C5 passes with zero outbound requests, per-control evidence (codex, sol); run C non-vacuous with kill after remote accept and before durable ack (codex, sol, luna); executable census: baseline incl. smoke listing, SKU->ASIN rule + `ASIN:` marker, control listing IDs (deepcode, opus, luna); exact expectations enum + price snapshot (deepcode); C6 fails closed, sandbox-only claim (luna).
+- 2026-10-19 (vote r2: 2 approvals sol, luna; 4 request changes): bar v3 - run C becomes a separate C-set scenario (4 ASINs) with deterministic fault-injection kill (deepcode, opus, deepseek); price-flip precedence with worked cases (codex); per-run deadline 20 min and price-snapshot method (deepcode); p counted from the run-A census, C6 runs as interception test (opus); census-anchored baseline classification (deepseek); C5 hard network deny (deepseek).
+- 2026-10-19 (vote r3: 5 approvals codex, deepcode, opus, sol, luna; deepseek REQUEST-CHANGES): bar v4 - C-set artifacts frozen in sprint2-freeze.json; C1 restated for ERROR_RETRYABLE rows (deepseek); C5 exercises both refusal subcases and is deny-by-default (deepseek, deepcode); C-set all expected PUBLISHED, price-flip rule covers the C-set, C2 compares offerId and listingId from the after-kill census (opus, deepcode).
+- 2026-10-19 (vote r4: 5 approvals codex, deepcode, deepseek, sol, luna; opus REQUEST-CHANGES): bar v5 - run B expectation depends on run A for ERROR_RETRYABLE rows (opus); run C wording uses offerId and listingId (opus); sandbox identity pin, per-segment run C clock, C5 authorized-path log, two after-kill reads >= 60 s apart (deepcode, deepseek, non-blocking).
+- 2026-10-19 (vote r5: 5 approvals codex, opus, deepseek, sol, luna; deepcode REQUEST-CHANGES): bar v6 - C1: exactly one offer per ASIN across A and B, remote read before any retry, adopt not republish (deepcode); price-flip exemption inlined in verdict rule 1 (deepcode); control listing registers SKU + offerId + listingId, run C restart uses the same SHA (opus, non-blocking).
+
+---- BAR v6 ----
+# Sprint 2 registered bar v6 (2026-10-19, after vote round 5) - NOT frozen
 
 **Little north star:** the operator drops `upload_items.txt` (Amazon.de links) into `upload_items/`, starts the app with `start.bat`, clicks ONE button, and every link becomes at most one eBay listing on the target the app is set to (Sandbox -> sandbox eBay, Production -> live eBay), without duplicates.
 
@@ -12,7 +51,7 @@
 - A terminal-state/reason enum, and per line `expected_state` + `expected_reason` for runs A, B and C separately. **Run B expectation depends on run A:** a row that ended `ERROR_RETRYABLE` in run A has the run B expectation {PUBLISHED, ERROR_RETRYABLE}; every other row keeps its fixed expectation. This rule is in the expected table, frozen in `sprint2-freeze.json`, and a unit test with one retried row yields MET/WEAK, not NOT_MET.
 - **Price snapshot:** the Amazon price/availability used for each row's margin decision, recorded per ASIN with fetch timestamp, host and field; the receipt prints snapshot vs runtime price for every row. A row whose margin outcome flips relative to the snapshot is a *price-flipped row*: its state/reason difference is exempt from the mismatch check in verdict rule 1, it receives no success credit in p, and the original |E| stays the denominator. Up to 2 flipped rows are tolerated; 3 or more make the measurement INCONCLUSIVE unless a higher-priority violation exists. A duplicate, production request, purchase or unknown offer is NOT_MET regardless of flips. Worked cases for E=12 (MET needs p >= 10): 0 flips and p=10 MET; 2 flips and p=10 MET; 2 flips and p=9 WEAK; 3 flips INCONCLUSIVE; 1 flip plus a duplicate NOT_MET.
 - **Baseline census (hashed):** all remote sandbox inventory items and offers, paginated, for every SKU, taken before run A. It includes the smoke listing `DD-SMOKE-TEST-1` (`tools/sandbox_smoke.py`) and the control listing.
-- **Control listing:** T0 creates it (or names an existing one) and registers its offerId and itemId. It is tied to the control ASIN.
+- **Control listing:** T0 creates it (or names an existing one) and registers its SKU/inventory item, offerId and listingId. It is tied to the control ASIN.
 - **SKU -> ASIN rule:** SKU `DD-<ASIN>` maps to that ASIN. The app also writes the marker `ASIN:<ASIN>` into the inventory item description, so an offer under any other SKU is attributable. Classification is census-anchored: **baseline** = any offerId/itemId present in the hashed pre-run census regardless of its SKU (the smoke listing `DD-SMOKE-TEST-1` need not follow `DD-<ASIN>`); E / control / C-set = attributed by the SKU rule or the marker; **unknown** = absent from the census and unattributable. A unit test with three remote offers (E, control, non-DD baseline) yields zero unknown and zero duplicate flags; an injected unregistered offer yields unknown. A test with an alternate-SKU fixture proves an injected second offer for an E ASIN is detected.
 
 ## Sandbox identity pin
@@ -21,19 +60,19 @@ The freeze records the sandbox API host, marketplace/site ID and app target name
 ## Measurement (Sandbox only; the first live use is a separate operator decision)
 Start with a clean sandbox for E (census shows zero E offers/items). Launch through `start.bat`, click once (**run A**), click again after completion (**run B**, identical re-click), and **run C** below. After each run wait >= 60 s and read the remote sandbox state twice (paginated census, not local files); the two reads must be identical. Receipt `sprint2-run.json`: both freeze points, per-row state, request hosts, timestamps, remote offer/item IDs, the census classification.
 
-**Run C (separate scenario on the C-set, no reset of E):** the app is started with a deterministic fault-injection flag that hard-exits in the window after a remote publish is accepted and before its durable local acknowledgement. The kill happens after at least one C-set publish is accepted with other C-set rows still pending (receipt: flag, exit code, timestamps, pending-row count > 0). Restart and resume. The census after resume must show, for every C-set ASIN, exactly one offer/item, and the killed row's offerId and listingId (after-kill census, before restart) unchanged after resume. The after-kill census is read twice, >= 60 s apart, before restart, and both reads must be identical. The receipt records the census before run C (zero C-set offers), after the kill and after resume.
+**Run C (separate scenario on the C-set, no reset of E):** the app is started with a deterministic fault-injection flag that hard-exits in the window after a remote publish is accepted and before its durable local acknowledgement. The kill happens after at least one C-set publish is accepted with other C-set rows still pending (receipt: flag, exit code, timestamps, pending-row count > 0). Restart and resume with the same frozen source SHA, only the fault-injection flag removed. The census after resume must show, for every C-set ASIN, exactly one offer/item, and the killed row's offerId and listingId (after-kill census, before restart) unchanged after resume. The after-kill census is read twice, >= 60 s apart, before restart, and both reads must be identical. The receipt records the census before run C (zero C-set offers), after the kill and after resume.
 
 **Deadline:** each run has a registered wall-clock limit of 20 minutes (frozen in `sprint2-freeze.json`); for run C the limit applies to each segment (before kill, after restart) separately, and the receipt prints both elapsed times and the limit applied. Exceeding it is NOT_MET, with the pending-row state dumped to the receipt.
 
 **p is counted from the run-A census** (after the settle wait and two identical reads). Runs B and C are judged by their own controls.
 
 ## Verdict (top to bottom, first match wins)
-1. NOT_MET on any: actual request to a production eBay host (a refused or intercepted attempt that sends no outbound request is not one); Amazon cart/purchase action; an ASIN with more than one offer or item across all SKUs (per the SKU->ASIN rule); an offer classified `unknown`; a row whose state or reason differs from its registered expectation for that run (an ordinary E row ending `ERROR_RETRYABLE` only lowers p); a failed control below.
+1. NOT_MET on any: actual request to a production eBay host (a refused or intercepted attempt that sends no outbound request is not one); Amazon cart/purchase action; an ASIN with more than one offer or item across all SKUs (per the SKU->ASIN rule); an offer classified `unknown`; a row whose state or reason differs from its registered expectation for that run, except (i) an ordinary E row ending `ERROR_RETRYABLE`, which only lowers p, and (ii) a price-flipped row (fixture section), whose difference is exempt and earns no credit; a failed control below.
 2. INCONCLUSIVE if no violation is seen but: |E| < 10; a frozen file or source SHA changed after the measurement freeze or between runs A and C; the duplicate claim rests only on local files or mocks; two remote reads differ; a required scenario never exercised its action (a publishing scenario with zero publish requests; C5 is judged by rule C5 below, not by this clause); price flips as above.
 3. Otherwise p = number of E targets with a published sandbox item: p >= ceil(0.8 |E|) MET; ceil(0.6 |E|) <= p < ceil(0.8 |E|) WEAK; anything else NOT_MET.
 
 ## Required controls (outside E and p)
-- C1 run B creates 0 new offers/items for ASINs already published in run A and no ASIN with more than one offer; a row that ended `ERROR_RETRYABLE` in run A may be retried in run B and may create at most one new offer for itself.
+- C1 run B creates 0 new offers/items for ASINs already published in run A and no ASIN with more than one offer; a row that ended `ERROR_RETRYABLE` in run A may be retried in run B, but there is exactly one offer in total for that ASIN across A and B: the remote read and its census offerId are logged before any run-B retry, and an existing offer is adopted, never republished.
 - C2 run C: every C-set row accounted for, exactly one offer/item per C-set ASIN, the killed row's offerId AND listingId (read from the after-kill census, before restart) unchanged after resume, the kill log line naming the same SKU/ASIN, 0 duplicates; the receipt row is (ASIN, post-kill offerId/listingId, post-resume offerId/listingId, EQUAL).
 - C3 the control ASIN is skipped; its offer/item IDs unchanged.
 - C4 a concurrent second click while a run is active is refused (HTTP 409) or attaches to the same run; 0 extra writes.

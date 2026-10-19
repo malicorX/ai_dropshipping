@@ -36,4 +36,13 @@ All applied in bar v4.
 | r4 | gpt61-sol | APPROVE-AS-IS | none |
 | r4 | gpt6-luna-max | APPROVE-AS-IS | none |
 
-Applied in bar v5. Next: r5 to all six.
+Applied in bar v5. 
+
+| r5 | codex | APPROVE-AS-IS | none |
+| r5 | deepcode | REQUEST-CHANGES | C1 exactly one offer per ASIN across A and B; inline price-flip exemption in rule 1 |
+| r5 | opus | APPROVE-AS-IS | 2 optional clarifications (applied) |
+| r5 | deepseek | APPROVE-AS-IS | none |
+| r5 | gpt61-sol | APPROVE-AS-IS | none |
+| r5 | gpt6-luna-max | APPROVE-AS-IS | none |
+
+Applied in bar v6. Next: r6 to all six.
