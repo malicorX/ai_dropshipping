@@ -1,0 +1,13 @@
+# Sprint 2 DELTA vote d3 (deepseek)
+
+Answer in <=60 words, plain text, no tools. Your d2 change is applied: failure cap default 20 (above the 15-ASIN batch, attempted vs unattempted logged) and, from deepcode, the card is not Done if fewer than 10 of the 15 re-run ASINs succeed. Vote `APPROVE-AS-IS | REQUEST-CHANGES | REJECT`.
+
+# Sprint 2 delta d1 (2026-10-19): card S2-T2a, reliable Amazon.de fetch
+
+**Card S2-T2a** (size S, builder codex, reviewer opus, tester deepcode, critic deepseek; parent task group #20), runs FIRST, before T0's snapshot step. Bar v7 is unchanged.
+
+Definition: `fetch_product_offer` / `fetch_variation_offers` (`dropship_desk/amazon/product.py`) launch the installed Chrome (`channel="chrome"`) with a fresh, logged-out context (no cookies, no profile). Retry only on `ERR_CONNECTION_RESET` or a timeout, max 3 attempts, 5 s backoff with jitter, and at least 5 s between ASINs; fetches stay sequential; a per-run failure cap (default 20 consecutive failures stops the run; the re-run batch of 15 can therefore never be cut short by it, and a stopped run logs attempted vs unattempted ASINs). Errors: `AMAZON_UNREACHABLE` (all attempts failed, per-ASIN log with attempt count and error class) and `CHROME_NOT_FOUND` (the Chrome channel cannot launch; never logged as AMAZON_UNREACHABLE). A non-retryable failure (captcha, parse) stops early.
+
+Done: unit tests with a stubbed launcher (retry count, early stop, both errors); the 15 ASINs that reset in T0's first snapshot are re-run through the new fetch and the success count is recorded in the card (three known-good ASINs alone are not enough); if fewer than 10 of the 15 succeed the card is NOT Done: it goes to Blocked with the exact errors and a problem card is filed; no cart, no purchase, no login, no eBay request.
+
+A row ending `AMAZON_UNREACHABLE` is an ordinary E row that lowers p (bar rule 1 (i)). The fixture/bar/controls are untouched.
