@@ -5,11 +5,12 @@ Repos in this sprint: ai_dropshipping
 **Goal:** `upload_items/upload_items.txt` + `start.bat` + one UI button -> every Amazon link becomes at most one eBay listing on the app's current target (Sandbox -> sandbox, Production -> live). **Bar:** `docs/sprint2-bar-v7.md`. **Consolidation:** `docs/sprint2-planning-consolidation-2026-10-19.md`.
 
 ## Roles
-Planner/driver/integrator: this session (never builds). Builder: codex. Tester: deepcode. Reviewer: opus. Critic: deepseek.
+Planner/driver/integrator: this session (never builds). Builder: gpt6-luna-max (operator change 2026-10-19; deepcode is the same family as the critic deepseek, so it tests but does not build). Tester: deepcode. Reviewer: opus. Critic: deepseek.
 
 ## Cards
 | card | what | size | dep |
 |---|---|---|---|
+| T2a | reliable Amazon.de fetch via installed Chrome (delta d1, card #31), runs FIRST | S | - |
 | T0 | register: fixture (20 lines, E=12), expected states per run, price snapshot, baseline census (incl. DD-SMOKE-TEST-1), control listing IDs, SKU->ASIN rule, receipt contract, `sprint2-freeze.json` | M | - |
 | T1 | reader + durable run/row ledger, alias dedupe, resumable | S | T0 |
 | T2 | pipeline worker: analyse -> margin -> draft -> stage -> publish, sequential background job, continue on error, single-flight lock | M | T1 |
@@ -30,3 +31,4 @@ Planner/driver/integrator: this session (never builds). Builder: codex. Tester: 
 - 2026-10-19 (vote r5: 5 approvals codex, opus, deepseek, sol, luna; deepcode REQUEST-CHANGES): bar v6 - C1: exactly one offer per ASIN across A and B, remote read before any retry, adopt not republish (deepcode); price-flip exemption inlined in verdict rule 1 (deepcode); control listing registers SKU + offerId + listingId, run C restart uses the same SHA (opus, non-blocking).
 - 2026-10-19 (vote r6: 3 approvals opus, deepseek, luna; codex, sol, deepcode REQUEST-CHANGES): bar v7 - C1 'at most one offer per ASIN across A and B, exactly one if PUBLISHED' (codex, sol); rule 1 'more than one offer, or more than one item' (deepcode); UNKNOWN from an ambiguous pre-retry read lowers p, not NOT_MET (deepcode); p excludes price-flipped rows, counted from the run-A census (deepcode); receipt shows accepted offerId + pending count before kill and snapshot-to-run-A gap (opus, deepseek).
 - 2026-10-19 (vote r7, unanimous, editorial only after the vote): clarification from opus's optional note, no change of meaning: p is judged on the run-A census alone; a row's local state (for example UNKNOWN) is not consulted. Disclosed here; the operator may ask for a confirming round before freezing.
+- 2026-10-19 (delta d1, unanimous 6/6; operator re-froze): new card S2-T2a (#31) runs before T0's completion; details docs/sprint2-delta-d1.md. Operator changed the builder from codex to gpt6-luna-max (fallback deepcode only for cards where the critic is not deepseek).
