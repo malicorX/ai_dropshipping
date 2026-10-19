@@ -27,4 +27,13 @@ r2 changes all applied in bar v3 (docs/sprint2-bar-v3.md). No conflict between s
 | r3 | gpt61-sol | APPROVE-AS-IS | none |
 | r3 | gpt6-luna-max | APPROVE-AS-IS | none |
 
-All applied in bar v4. Next: r4 to all six.
+All applied in bar v4. 
+
+| r4 | codex | APPROVE-AS-IS | none |
+| r4 | deepcode | APPROVE-AS-IS | 3 non-blocking (applied) |
+| r4 | opus | REQUEST-CHANGES | run B expectation conditional on run A; run C wording offerId+listingId |
+| r4 | deepseek | APPROVE-AS-IS | 3 non-blocking (applied) |
+| r4 | gpt61-sol | APPROVE-AS-IS | none |
+| r4 | gpt6-luna-max | APPROVE-AS-IS | none |
+
+Applied in bar v5. Next: r5 to all six.
