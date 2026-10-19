@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": false,
+    "declaration": false,
+    "noEmit": false,
+    "outDir": ".test-build",
+    "rootDir": "src",
+    "sourceMap": false
+  },
+  "include": ["src/uploadDuration.ts"]
+}

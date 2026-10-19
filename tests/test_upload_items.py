@@ -347,7 +347,11 @@ def test_second_run_after_completion_skips_published_rows(client, tmp_path, monk
 
 
 def test_chrome_not_found_aborts_the_run(client, tmp_path, monkeypatch):
+    clock = {"t": 20.0}
+    monkeypatch.setattr(upload_items, "_monotonic", lambda: clock["t"])
+
     def broken_fetch(asin: str) -> OfferIn:
+        clock["t"] = 24.0
         raise upload_items.ChromeNotFound("CHROME_NOT_FOUND: cannot launch installed Chrome")
 
     calls = _install_stubs(monkeypatch, fetch_hook=broken_fetch)
@@ -365,6 +369,12 @@ def test_chrome_not_found_aborts_the_run(client, tmp_path, monkeypatch):
     assert "CHROME_NOT_FOUND" in status["error"]
     assert status["rows"][0]["state"] == "error"
     assert status["rows"][1]["state"] == "queued"
+    # The aborted row must still record how long it ran before the systemic
+    # Chrome failure stopped the batch.
+    assert status["rows"][0]["started_at"]
+    assert status["rows"][0]["finished_at"]
+    assert status["rows"][0]["duration_sec"] == 4.0
+    assert status["rows"][1]["duration_sec"] is None
     assert calls["stage"] == []
     assert calls["publish"] == []
 
@@ -388,6 +398,34 @@ def test_target_change_during_run_aborts_before_stage(client, tmp_path, monkeypa
     assert calls["stage"] == []
     assert calls["publish"] == []
     assert cfg.upload_sandbox_pinned() is False
+
+
+def test_target_changed_abort_stamps_row_duration(client, tmp_path, monkeypatch):
+    holder = {"env": "sandbox"}
+    clock = {"t": 10.0}
+    monkeypatch.setattr(cfg, "ebay_env", lambda: holder["env"])
+    monkeypatch.setattr(upload_items, "_monotonic", lambda: clock["t"])
+
+    def flipping_fetch(asin: str) -> OfferIn:
+        holder["env"] = "production"
+        clock["t"] = 13.0
+        return _offer(asin)
+
+    _install_stubs(monkeypatch, fetch_hook=flipping_fetch)
+    _write_upload(tmp_path, monkeypatch, "https://www.amazon.de/dp/B0TARGET02\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    row = status["rows"][0]
+    assert status["phase"] == "aborted_target_changed"
+    # The row had already reached "evaluated" before the target check; the
+    # abort path keeps that state but must stamp the elapsed duration/reason.
+    assert row["state"] in {"evaluated", "error"}
+    assert row["reason"].startswith("aborted_target_changed")
+    assert row["started_at"]
+    assert row["finished_at"]
+    assert row["duration_sec"] == 3.0
 
 
 def test_target_switch_to_production_is_409_while_upload_running(client, tmp_path, monkeypatch):
@@ -680,6 +718,38 @@ def test_present_variation_label_leaves_title_unchanged(client, tmp_path, monkey
     assert status["rows"][0]["state"] == "published"
     assert calls["stage"] == [child]
     assert calls["stage_patch"] == [(child, None)]
+
+
+def test_present_variation_label_is_case_insensitive(client, tmp_path, monkeypatch):
+    child = "B0VAR00004"
+    draft_title = f"eBay title {child} – red / g2"
+
+    def child_offers(_asin: str) -> list[OfferIn]:
+        return [
+            _offer(child).model_copy(
+                update={"parent_asin": "B0PARENT08", "variation_label": "Red / G2"}
+            )
+        ]
+
+    calls = _install_stubs(
+        monkeypatch,
+        variation_hook=child_offers,
+        draft_title=draft_title,
+    )
+    _write_upload(tmp_path, monkeypatch, f"https://www.amazon.de/dp/{child}\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    assert status["rows"][0]["state"] == "published"
+    # The label is already present with different casing, so no title patch
+    # may be added (a case-sensitive check would append it a second time).
+    assert calls["stage_patch"] == [(child, None)]
+
+
+def test_title_with_variation_matches_label_case_insensitively():
+    title = "eBay title B0VAR00005 – red / g2"
+    assert upload_items.title_with_variation(title, "Red / G2") == title
 
 
 def test_long_title_is_clipped_around_variation_label(client, tmp_path, monkeypatch):
@@ -1062,7 +1132,11 @@ def test_preview_marks_published_rows_as_already_listed(client, tmp_path, monkey
 
 
 def test_failure_cap_amazon_unreachable_aborts_the_run(client, tmp_path, monkeypatch):
+    clock = {"t": 30.0}
+    monkeypatch.setattr(upload_items, "_monotonic", lambda: clock["t"])
+
     def capped_fetch(asin: str) -> OfferIn:
+        clock["t"] = 35.0
         raise upload_items.AmazonUnreachable(
             "AMAZON_UNREACHABLE: failure cap reached after 20 consecutive terminal failures"
         )
@@ -1081,5 +1155,9 @@ def test_failure_cap_amazon_unreachable_aborts_the_run(client, tmp_path, monkeyp
     assert "failure cap" in status["error"]
     assert status["rows"][0]["state"] == "error"
     assert status["rows"][1]["state"] == "queued"
+    assert status["rows"][0]["started_at"]
+    assert status["rows"][0]["finished_at"]
+    assert status["rows"][0]["duration_sec"] == 5.0
+    assert status["rows"][1]["duration_sec"] is None
     assert calls["stage"] == []
     assert calls["publish"] == []

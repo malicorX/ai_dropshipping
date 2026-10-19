@@ -17,8 +17,8 @@ HttpFn = Callable[..., Any]
 SKU_PREFIX = "DD-"
 DEFAULT_QUANTITY = 5
 EAN_NOT_APPLICABLE = "Nicht zutreffend"
-_EAN_HINTS = ("ean", "gtin")
-_GTIN_RE = re.compile(r"\d{8,14}")
+_EAN_KEYS = frozenset({"ean", "EAN", "gtin", "GTIN"})
+_GTIN_RE = re.compile(r"(?:[0-9]{8}|[0-9]{12}|[0-9]{13}|[0-9]{14})")
 
 
 def sku_for_asin(asin: str) -> str:
@@ -255,8 +255,11 @@ def _candidate_ean(row: dict[str, Any]) -> str:
     """Return a real GTIN/EAN from the candidate offer or draft, if present.
 
     Amazon PDPs do not always expose one.  When they do, callers usually keep
-    it next to the offer (``ean``/``gtin``); accepting only 8-14 digits keeps
-    placeholders such as ``Nicht zutreffend`` out of the inventory item.
+    it next to the offer (``ean``/``gtin``).  Only the exact keys ``ean``,
+    ``EAN``, ``gtin`` and ``GTIN`` are trusted, and only values with exactly
+    8, 12, 13 or 14 digits are accepted.  That keeps placeholders such as
+    ``Nicht zutreffend`` and unrelated keys such as ``meaning_code`` out of
+    the inventory item.
     """
     offer = row.get("offer") or {}
     draft = row.get("listing_draft") or {}
@@ -273,7 +276,7 @@ def _candidate_ean(row: dict[str, Any]) -> str:
             if not isinstance(container, dict):
                 continue
             for key, value in container.items():
-                if not any(hint in str(key).lower() for hint in _EAN_HINTS):
+                if str(key) not in _EAN_KEYS:
                     continue
                 ean = _normalize_ean(value)
                 if ean:

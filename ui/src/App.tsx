@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { rowDurationSeconds, uploadDurationStats } from "./uploadDuration";
+
 type Tab = "find" | "queue" | "list" | "upload" | "settings";
 
 type Health = {
@@ -191,21 +193,6 @@ function formatDuration(seconds: number | null | undefined): string {
   const minutes = Math.floor(total / 60);
   const rest = total % 60;
   return `${minutes}:${String(rest).padStart(2, "0")}`;
-}
-
-/** Finished rows use the recorded monotonic duration; the running row ticks. */
-function rowDurationSeconds(row: UploadRow, nowMs: number, live: boolean): number | null {
-  if (typeof row.duration_sec === "number" && Number.isFinite(row.duration_sec)) {
-    return row.duration_sec;
-  }
-  if (!live || !row.started_at) {
-    return null;
-  }
-  const started = Date.parse(row.started_at);
-  if (Number.isNaN(started)) {
-    return null;
-  }
-  return Math.max(0, (nowMs - started) / 1000);
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -1579,13 +1566,7 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
   const live = target === "production" || (!running && !!preview?.live_disabled);
   const rows = status?.rows?.length ? status.rows : preview?.rows ?? [];
   const counters = status?.counters ?? {};
-  const rowDurations = rows
-    .map((row) => rowDurationSeconds(row, nowMs, running))
-    .filter((value): value is number => value !== null);
-  const totalDurationSec = rowDurations.reduce((sum, value) => sum + value, 0);
-  const averageDurationSec = rowDurations.length
-    ? totalDurationSec / rowDurations.length
-    : null;
+  const durationStats = uploadDurationStats(rows, nowMs, running);
 
   async function start() {
     onError("");
@@ -1674,10 +1655,10 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
           : ""}
         {status?.error ? ` · ${status.error}` : ""}
       </p>
-      {rowDurations.length > 0 ? (
+      {durationStats.processed > 0 ? (
         <p className="muted upload-duration-summary">
-          total {formatDuration(totalDurationSec)}, average per processed item{" "}
-          {formatDuration(averageDurationSec)}
+          total {formatDuration(durationStats.totalSec)}, average per processed item{" "}
+          {formatDuration(durationStats.averageSec)}
         </p>
       ) : null}
       <table>
