@@ -18,4 +18,13 @@ All requested changes converge and none conflict; all applied in bar v2 (see pla
 | r2 | gpt61-sol | APPROVE-AS-IS | none |
 | r2 | gpt6-luna-max | APPROVE-AS-IS | none |
 
-r2 changes all applied in bar v3 (docs/sprint2-bar-v3.md). No conflict between seats. Next: r3 to all six.
+r2 changes all applied in bar v3 (docs/sprint2-bar-v3.md). No conflict between seats. 
+
+| r3 | codex | APPROVE-AS-IS | none |
+| r3 | deepcode | APPROVE-AS-IS | 3 non-blocking T0 clarifications (applied) |
+| r3 | opus | APPROVE-AS-IS | 3 non-blocking clarifications (applied) |
+| r3 | deepseek | REQUEST-CHANGES | freeze C-set artifacts; C1 vs ERROR_RETRYABLE; C5 both refusal subcases |
+| r3 | gpt61-sol | APPROVE-AS-IS | none |
+| r3 | gpt6-luna-max | APPROVE-AS-IS | none |
+
+All applied in bar v4. Next: r4 to all six.
