@@ -1521,8 +1521,8 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
   const running = !!status?.running;
   const wasRunning = useRef(false);
 
-  // Preview loaded on mount above; refresh it again once a run ends so the
-  // rows switch to already_listed without a manual click.
+  // Preview loads on mount above.  Refresh it once after a run we observed
+  // running has ended, so a later file-only preview sees the new listings.
   useEffect(() => {
     if (running) {
       wasRunning.current = true;
