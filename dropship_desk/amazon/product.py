@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 import re
+import threading
 import time
 from typing import Any
 
@@ -23,16 +24,24 @@ _CHILD_PAUSE_SEC = 1.2
 # failures (not individual retry attempts).
 MIN_GAP_SEC = 5.0
 MAX_CONSECUTIVE_FAILURES = 20
+CAP_COOLDOWN_SEC = 600.0
 MAX_FETCH_ATTEMPTS = 3
 _BACKOFF_BASE_SEC = 5.0
 _BACKOFF_JITTER_SEC = 1.0
 _BLOCK_PAGE_MAX_CHARS = 20_000
+_FAILURE_CAP_PREFIX = "AMAZON_UNREACHABLE: failure cap reached"
 _PRODUCT_TITLE_RE = re.compile(r"""id\s*=\s*["']productTitle["']""", re.IGNORECASE)
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 _NOT_FOUND_TITLE_MARKERS = ("seite wurde nicht gefunden", "page not found")
 
+# One process-wide fetch at a time: pacing, the failure cap and its counter
+# must be read/modified atomically.  RLock keeps a nested child fetch (should
+# one ever be issued from inside _load_pdp) from deadlocking.
+_FETCH_LOCK = threading.RLock()
+
 _last_load_monotonic: float | None = None
 _consecutive_failures = 0
+_last_terminal_failure_monotonic: float | None = None
 
 
 class AmazonUnreachable(RuntimeError):
@@ -54,8 +63,10 @@ class _BlockedPageError(RuntimeError):
 def reset_fetch_state() -> None:
     """Reset pacing and consecutive-failure state (used by tests)."""
     global _last_load_monotonic, _consecutive_failures
+    global _last_terminal_failure_monotonic
     _last_load_monotonic = None
     _consecutive_failures = 0
+    _last_terminal_failure_monotonic = None
 
 
 def _playwright():
@@ -123,22 +134,41 @@ def _pace_asin_load() -> None:
 
 
 def _check_failure_cap(asin: str) -> None:
-    if _consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-        raise AmazonUnreachable(
-            "AMAZON_UNREACHABLE: failure cap reached after "
-            f"{_consecutive_failures} consecutive terminal failures; "
-            f"refusing ASIN {asin}"
-        )
+    """Refuse fetches while the cap is open; half-open after the cooldown.
+
+    The cap is not a permanent lockout: once CAP_COOLDOWN_SEC has elapsed since
+    the last terminal failure, the counter is reset and a probe attempt is
+    allowed.  A successful probe keeps the breaker closed; a failed one opens
+    it again for another cooldown.
+    """
+    global _consecutive_failures, _last_terminal_failure_monotonic
+    if _consecutive_failures < MAX_CONSECUTIVE_FAILURES:
+        return
+
+    now = time.monotonic()
+    last_failure = _last_terminal_failure_monotonic
+    if last_failure is None or now - last_failure >= CAP_COOLDOWN_SEC:
+        _consecutive_failures = 0
+        _last_terminal_failure_monotonic = None
+        return
+
+    raise AmazonUnreachable(
+        f"{_FAILURE_CAP_PREFIX} after "
+        f"{_consecutive_failures} consecutive terminal failures; "
+        f"refusing ASIN {asin}"
+    )
 
 
 def _record_terminal_failure() -> None:
-    global _consecutive_failures
+    global _consecutive_failures, _last_terminal_failure_monotonic
     _consecutive_failures += 1
+    _last_terminal_failure_monotonic = time.monotonic()
 
 
 def _record_success() -> None:
-    global _consecutive_failures
+    global _consecutive_failures, _last_terminal_failure_monotonic
     _consecutive_failures = 0
+    _last_terminal_failure_monotonic = None
 
 _PDP_EXTRACT_JS = """
 () => {
@@ -210,46 +240,49 @@ def _load_pdp(asin: str) -> tuple[OfferIn, str, dict[str, Any]]:
     if len(asin) != 10:
         raise ValueError("ASIN must be 10 characters")
 
-    _check_failure_cap(asin)
-    _pace_asin_load()
-
     url = f"https://www.amazon.de/dp/{asin}"
-    last_exc: BaseException | None = None
-    for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
-        try:
-            result = _load_pdp_once(asin, url)
-        except AsinNotFound:
-            # Terminal ASIN classification, not a network failure: one attempt,
-            # no sleep, and the consecutive-failure counter is left untouched.
-            raise
-        except ChromeNotFound:
-            # A missing Chrome installation is systemic, not an ASIN failure.
-            raise
-        except Exception as exc:  # noqa: BLE001 - classified below
-            retryable = _is_retryable(exc)
-            if retryable and attempt < MAX_FETCH_ATTEMPTS:
-                last_exc = exc
-                time.sleep(_BACKOFF_BASE_SEC + random.uniform(0.0, _BACKOFF_JITTER_SEC))
-                continue
+    # Hold the lock across cap check, pacing and every retry: launches from
+    # concurrent threads must never overlap or observe a half-updated counter.
+    with _FETCH_LOCK:
+        _check_failure_cap(asin)
+        _pace_asin_load()
 
-            _record_terminal_failure()
-            if retryable:
-                raise AmazonUnreachable(
-                    f"AMAZON_UNREACHABLE: ASIN {asin} failed after {attempt} attempts; "
-                    f"last error {type(exc).__name__}: {exc}"
-                ) from exc
-            raise
-        else:
-            _record_success()
-            return result
+        last_exc: BaseException | None = None
+        for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
+            try:
+                result = _load_pdp_once(asin, url)
+            except AsinNotFound:
+                # Terminal ASIN classification, not a network failure: one attempt,
+                # no sleep, and the consecutive-failure counter is left untouched.
+                raise
+            except ChromeNotFound:
+                # A missing Chrome installation is systemic, not an ASIN failure.
+                raise
+            except Exception as exc:  # noqa: BLE001 - classified below
+                retryable = _is_retryable(exc)
+                if retryable and attempt < MAX_FETCH_ATTEMPTS:
+                    last_exc = exc
+                    time.sleep(_BACKOFF_BASE_SEC + random.uniform(0.0, _BACKOFF_JITTER_SEC))
+                    continue
 
-    # Defensive fallback: the loop normally returns or raises above.
-    _record_terminal_failure()
-    raise AmazonUnreachable(
-        f"AMAZON_UNREACHABLE: ASIN {asin} failed after {MAX_FETCH_ATTEMPTS} attempts; "
-        f"last error {type(last_exc).__name__ if last_exc is not None else 'UnknownError'}: "
-        f"{last_exc}"
-    )
+                _record_terminal_failure()
+                if retryable:
+                    raise AmazonUnreachable(
+                        f"AMAZON_UNREACHABLE: ASIN {asin} failed after {attempt} attempts; "
+                        f"last error {type(exc).__name__}: {exc}"
+                    ) from exc
+                raise
+            else:
+                _record_success()
+                return result
+
+        # Defensive fallback: the loop normally returns or raises above.
+        _record_terminal_failure()
+        raise AmazonUnreachable(
+            f"AMAZON_UNREACHABLE: ASIN {asin} failed after {MAX_FETCH_ATTEMPTS} attempts; "
+            f"last error {type(last_exc).__name__ if last_exc is not None else 'UnknownError'}: "
+            f"{last_exc}"
+        )
 
 
 def _load_pdp_once(asin: str, url: str) -> tuple[OfferIn, str, dict[str, Any]]:
@@ -362,7 +395,17 @@ def fetch_variation_offers(
             time.sleep(max(0.0, pause_sec))
             try:
                 offer = fetch_product_offer(kid.asin)
-            except Exception:  # noqa: BLE001
+            except ChromeNotFound:
+                # A missing browser is systemic: surface it instead of silently
+                # returning a partial variation list.
+                raise
+            except AmazonUnreachable as exc:
+                if str(exc).startswith(_FAILURE_CAP_PREFIX):
+                    # The process-wide cap tripped; do not keep hammering Amazon.
+                    raise
+                # An unreachable child is a per-ASIN failure: skip just it.
+                continue
+            except Exception:  # noqa: BLE001 - not-found/parse errors are per-child
                 continue
             offer = offer.model_copy(
                 update={

@@ -6,12 +6,18 @@ against fake browser objects; no Chrome process is started.
 
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
 import dropship_desk.amazon.product as product
 
 ASIN = "B0TEST0001"
 ASIN2 = "B0TEST0002"
+CHILD1 = "B0CHILD001"
+CHILD2 = "B0CHILD002"
+CHILD3 = "B0CHILD003"
 PRICE_HTML = "<html><body><span id='productTitle'>Test</span></body></html>"
 RAW = {"title": "Test product", "price": "€ 19,99", "stars": "4,6 von 5", "reviews": "123"}
 
@@ -383,3 +389,212 @@ def test_launch_browser_uses_installed_chrome_channel():
     assert p.chromium.kwargs is not None
     assert p.chromium.kwargs["channel"] == "chrome"
     assert p.chromium.kwargs["headless"] is True
+
+
+# ---------------------------------------------------------------------------
+# Round 4: thread safety, half-open failure cap, variation child failures.
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_lock_serialises_two_threads_and_enforces_min_gap(monkeypatch):
+    """Two concurrent fetches must not launch together or violate MIN_GAP.
+
+    Uses real sleeps (the fake Clock is not thread-aware). The first fake
+    browser is held open for 400 ms while the second thread is started; with no
+    lock the second launch overlaps it, while the lock forces a full wait.
+    """
+    monkeypatch.setattr(product, "MIN_GAP_SEC", 0.15)
+
+    state = {"in_flight": 0, "max_in_flight": 0}
+    state_lock = threading.Lock()
+    launch_times: list[float] = []
+    first_launched = threading.Event()
+
+    class _Page:
+        def content(self):
+            return PRICE_HTML
+
+        def evaluate(self, _script):
+            return RAW
+
+    class _Context:
+        def new_page(self):
+            return _Page()
+
+    class _Browser:
+        def new_context(self, **_kwargs):
+            return _Context()
+
+        def close(self):
+            with state_lock:
+                state["in_flight"] -= 1
+
+    class _Playwright:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_exc):
+            return False
+
+    def launch(_pw):
+        with state_lock:
+            state["in_flight"] += 1
+            state["max_in_flight"] = max(
+                state["max_in_flight"], state["in_flight"]
+            )
+            launch_times.append(time.monotonic())
+        first_launched.set()
+        time.sleep(0.4)
+        return _Browser()
+
+    monkeypatch.setattr(product, "_playwright", lambda: _Playwright())
+    monkeypatch.setattr(product, "_launch_browser", launch)
+    monkeypatch.setattr(product, "_goto", lambda _page, _url: None)
+
+    errors: list[BaseException] = []
+
+    def worker():
+        try:
+            product.fetch_product_offer(ASIN)
+        except BaseException as exc:  # noqa: BLE001 - re-asserted below
+            errors.append(exc)
+
+    first = threading.Thread(target=worker)
+    second = threading.Thread(target=worker)
+    first.start()
+    assert first_launched.wait(timeout=5)
+    second.start()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
+    assert len(launch_times) == 2
+    gap = abs(launch_times[1] - launch_times[0])
+    assert gap >= product.MIN_GAP_SEC - 0.02
+    assert state["max_in_flight"] == 1
+
+
+def test_failure_cap_default_cooldown_is_600_seconds():
+    assert product.CAP_COOLDOWN_SEC == 600
+
+
+def test_failure_cap_half_opens_after_cooldown(harness):
+    harness.page = FakePage(html="<html>captcha</html>")
+
+    for _ in range(product.MAX_CONSECUTIVE_FAILURES):
+        with pytest.raises(RuntimeError) as excinfo:
+            product.fetch_product_offer(ASIN)
+        assert not isinstance(excinfo.value, product.AmazonUnreachable)
+
+    assert harness.launches == 20
+    assert product._consecutive_failures == 20
+
+    # 599 s after the last terminal failure the breaker is still open.
+    harness.clock.now += product.CAP_COOLDOWN_SEC - 1
+    with pytest.raises(product.AmazonUnreachable) as excinfo:
+        product.fetch_product_offer(ASIN)
+    assert str(excinfo.value).startswith("AMAZON_UNREACHABLE: failure cap reached")
+    assert harness.launches == 20
+
+    # 601 s after it half-opens: the counter resets and a healthy fetch runs.
+    harness.clock.now += 2
+    harness.page = FakePage()
+    offer = product.fetch_product_offer(ASIN)
+
+    assert offer.amazon_total == pytest.approx(19.99)
+    assert product._consecutive_failures == 0
+    assert harness.launches == 21
+
+
+def _variation_parent_page() -> FakePage:
+    raw = dict(RAW)
+    raw["children"] = [
+        {"asin": CHILD1, "label": "Small"},
+        {"asin": CHILD2, "label": "Medium"},
+        {"asin": CHILD3, "label": "Large"},
+    ]
+    return FakePage(html=PRICE_HTML, raw=raw)
+
+
+def _offer_for(asin: str):
+    return product._offer_from_raw(asin, f"https://www.amazon.de/dp/{asin}", RAW)
+
+
+def test_variation_child_failure_cap_error_is_re_raised(harness, monkeypatch):
+    harness.page = _variation_parent_page()
+    calls: list[str] = []
+
+    def fake_fetch(asin: str):
+        calls.append(asin)
+        if asin == CHILD2:
+            raise product.AmazonUnreachable(
+                "AMAZON_UNREACHABLE: failure cap reached after 20 consecutive "
+                f"terminal failures; refusing ASIN {asin}"
+            )
+        return _offer_for(asin)
+
+    monkeypatch.setattr(product, "fetch_product_offer", fake_fetch)
+
+    with pytest.raises(product.AmazonUnreachable) as excinfo:
+        product.fetch_variation_offers(ASIN)
+
+    assert str(excinfo.value).startswith("AMAZON_UNREACHABLE: failure cap reached")
+    # Child 3 is never attempted once the cap aborts the list.
+    assert calls == [CHILD1, CHILD2]
+
+
+def test_variation_child_chrome_not_found_is_re_raised(harness, monkeypatch):
+    harness.page = _variation_parent_page()
+
+    def fake_fetch(_asin: str):
+        raise product.ChromeNotFound("CHROME_NOT_FOUND: chrome executable missing")
+
+    monkeypatch.setattr(product, "fetch_product_offer", fake_fetch)
+
+    with pytest.raises(product.ChromeNotFound):
+        product.fetch_variation_offers(ASIN)
+
+
+def test_variation_child_asin_not_found_is_skipped(harness, monkeypatch):
+    harness.page = _variation_parent_page()
+    calls: list[str] = []
+
+    def fake_fetch(asin: str):
+        calls.append(asin)
+        if asin == CHILD2:
+            raise product.AsinNotFound(f"ASIN_NOT_FOUND: {asin}")
+        return _offer_for(asin)
+
+    monkeypatch.setattr(product, "fetch_product_offer", fake_fetch)
+
+    offers = product.fetch_variation_offers(ASIN)
+
+    assert [offer.asin for offer in offers] == [CHILD1, CHILD3]
+    assert calls == [CHILD1, CHILD2, CHILD3]
+
+
+def test_variation_child_fetches_are_paced_through_fetch_product_offer(harness):
+    harness.pages = [
+        _variation_parent_page(),
+        FakePage(),
+        FakePage(),
+        FakePage(),
+    ]
+
+    offers = product.fetch_variation_offers(ASIN)
+
+    assert [offer.asin for offer in offers] == [CHILD1, CHILD2, CHILD3]
+    assert harness.launches == 4
+
+    # Each child first pays the explicit child pause, then fetch_product_offer
+    # -> _load_pdp -> _pace_asin_load must sleep the MIN_GAP remainder. A child
+    # call straight to _load_pdp_once would never produce this sleep.
+    remainder = product.MIN_GAP_SEC - product._CHILD_PAUSE_SEC
+    assert remainder > 0
+    paced_sleeps = [
+        seconds
+        for seconds in harness.clock.sleeps
+        if seconds == pytest.approx(remainder)
+    ]
+    assert len(paced_sleeps) >= 2
