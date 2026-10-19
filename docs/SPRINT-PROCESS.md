@@ -27,5 +27,5 @@ No Amazon purchase, ever. No live eBay write during a sprint measurement or a te
 Container #2, goal #3, plan #13, tasks #4 (cards #5-#11), REVIEW #12. Goal: bulk URLs -> sandbox-published items, bar 20/25, 0 live writes.
 Pending: planning round, rating round, commitment vote, operator freeze.
 
-## Sprint 2 (2026-10-19): PLANNED, not frozen
-Goal: `upload_items/upload_items.txt` + start.bat + one UI button -> one eBay listing per Amazon link on the app's current target. Plan `docs/sprint2-plan.md`, bar `docs/sprint2-bar-v1.md`. Session ids `sprint2-dropshipping-<card>`.
+## Sprint 2 (2026-10-19): FROZEN (vote r7 unanimous 6/6, operator froze)
+Goal: `upload_items/upload_items.txt` + start.bat + one UI button -> one eBay listing per Amazon link on the app's current target. Plan `docs/sprint2-plan.md`, bar `docs/sprint2-bar-v7.md`. Session ids `sprint2-dropshipping-<card>`.
