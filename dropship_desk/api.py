@@ -14,11 +14,12 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from dropship_desk import __version__, config
-from dropship_desk.amazon.product import fetch_product_offer
+from dropship_desk.amazon.product import fetch_variation_offers
 from dropship_desk.ebay import listing as ebay_listing
 from dropship_desk.ebay import oauth as ebay_oauth
 from dropship_desk.ebay.client import EbayApiError
 from dropship_desk.db import (
+    apply_stored_ebay_target,
     ensure_margin_policy,
     get_candidate_by_asin,
     get_listing_draft,
@@ -28,6 +29,7 @@ from dropship_desk.db import (
     patch_candidate_offer,
     prune_rejected,
     save_listing_draft,
+    set_ebay_target,
     set_margin_settings,
 )
 from dropship_desk.enrich import ENRICH_JOB, enrich_missing
@@ -41,6 +43,7 @@ from dropship_desk.product_media import (
 )
 from dropship_desk.reprice import reprice_candidates
 from dropship_desk.evaluate_service import run_evaluate
+from dropship_desk.variation_expand import persist_variation_offers
 from dropship_desk.find_job import FIND_JOB
 from dropship_desk.listing_template import (
     get_listing_shop_settings,
@@ -103,6 +106,7 @@ def _loop_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> N
 def create_app() -> FastAPI:
     init_db()
     ensure_margin_policy()
+    apply_stored_ebay_target()
     app = FastAPI(title="Dropship Desk", version=__version__)
     app.add_middleware(
         CORSMiddleware,
@@ -162,6 +166,23 @@ def create_app() -> FastAPI:
             ollama_model=config.OLLAMA_MODEL,
         )
 
+    @app.post("/api/ebay/target")
+    def ebay_target_set(body: dict | None = None) -> dict:
+        env = config.normalize_ebay_env(str((body or {}).get("env") or ""))
+        if env == "production" and not config.ebay_target_ready("production"):
+            gaps = ", ".join(config.ebay_target_gaps("production")) or "production keys"
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Live eBay is missing {gaps} in .env. Create a Production RuName at "
+                    "developer.ebay.com (Auth accepted URL "
+                    f"https://127.0.0.1:{config.DEFAULT_API_PORT}/api/ebay/oauth/callback), "
+                    "then restart."
+                ),
+            )
+        set_ebay_target(env)
+        return _ebay_health()
+
     @app.get("/api/ebay/status")
     def ebay_status() -> dict:
         return ebay_oauth.public_status()
@@ -176,7 +197,11 @@ def create_app() -> FastAPI:
         return {"ok": True, "authorize_url": url, "env": config.ebay_env()}
 
     @app.get("/api/ebay/oauth/callback")
-    def ebay_oauth_callback(code: str | None = None, error: str | None = None) -> HTMLResponse:
+    def ebay_oauth_callback(
+        code: str | None = None,
+        error: str | None = None,
+        state: str | None = None,
+    ) -> HTMLResponse:
         if error:
             return HTMLResponse(
                 f"<html><body><h1>eBay OAuth failed</h1><p>{error}</p>"
@@ -185,6 +210,10 @@ def create_app() -> FastAPI:
             )
         if not code:
             raise HTTPException(status_code=400, detail="missing code")
+        if state:
+            callback_env = config.normalize_ebay_env(state)
+            if config.ebay_target_ready(callback_env):
+                set_ebay_target(callback_env)
         try:
             ebay_oauth.exchange_code(code)
         except Exception as e:  # noqa: BLE001
@@ -200,15 +229,21 @@ def create_app() -> FastAPI:
             "</body></html>"
         )
 
-    def _require_ebay_sell() -> None:
+    def _require_ebay_sell(body: dict | None = None) -> None:
         if not ebay_oauth.load_tokens().get("refresh_token"):
+            label = "live eBay" if config.ebay_env() == "production" else "sandbox eBay"
             raise HTTPException(
                 status_code=400,
-                detail="eBay is not connected — Settings → Connect eBay",
+                detail=f"eBay is not connected — Settings → Connect {label}",
             )
         decision = check_ebay_sell()
         if not decision.ok:
             raise HTTPException(status_code=403, detail=decision.reason)
+        if config.ebay_env() == "production" and not (body or {}).get("confirm_live"):
+            raise HTTPException(
+                status_code=400,
+                detail="Live eBay Send/Publish needs an explicit confirm in the app",
+            )
 
     @app.get("/api/ebay/listings/{asin}")
     def ebay_listing_get(asin: str) -> dict:
@@ -216,7 +251,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/ebay/listings/{asin}/stage")
     def ebay_listing_stage(asin: str, body: dict | None = None) -> dict:
-        _require_ebay_sell()
+        _require_ebay_sell(body)
         try:
             return ebay_listing.stage_unpublished(asin, body or None)
         except EbayApiError as e:
@@ -227,8 +262,8 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
     @app.post("/api/ebay/listings/{asin}/publish")
-    def ebay_listing_publish(asin: str) -> dict:
-        _require_ebay_sell()
+    def ebay_listing_publish(asin: str, body: dict | None = None) -> dict:
+        _require_ebay_sell(body)
         try:
             return ebay_listing.publish_offer(asin)
         except EbayApiError as e:
@@ -282,27 +317,46 @@ def create_app() -> FastAPI:
 
     @app.post("/api/amazon/refresh")
     def amazon_refresh(body: dict) -> dict:
-        """Fetch live PDP price/stars for one ASIN and upsert candidate."""
+        """Fetch live PDP price; explode size/color children into their own ASINs."""
         asin = str(body.get("asin") or "").strip().upper()
         if len(asin) != 10:
             raise HTTPException(status_code=400, detail="asin required (10 chars)")
         ebay_price = body.get("ebay_price")
         try:
-            offer = fetch_product_offer(asin)
+            offers = fetch_variation_offers(asin)
         except Exception as e:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=str(e)) from e
-        result = run_evaluate(
-            EvaluateRequest(
-                asin_or_url=asin,
-                offer=offer,
-                ebay_price=float(ebay_price) if ebay_price is not None else None,
-                save=True,
-            ),
-            persist="always",
-        )
+        persist = "always"
+        expanded = persist_variation_offers(asin, offers, persist=persist)
+        results = expanded.results
+        if not results:
+            offer = offers[0]
+            result = run_evaluate(
+                EvaluateRequest(
+                    asin_or_url=offer.asin,
+                    offer=offer,
+                    ebay_price=float(ebay_price) if ebay_price is not None else None,
+                    save=True,
+                ),
+                persist="always",
+            )
+            results = [result]
+        primary = next((r for r in results if r.passed), results[0])
         return {
-            "offer": offer.model_dump(),
-            "evaluate": result.model_dump(),
+            "offer": primary.offer.model_dump(),
+            "evaluate": primary.model_dump(),
+            "expanded": expanded.expanded,
+            "children": [
+                {
+                    "asin": r.asin,
+                    "title": r.offer.title,
+                    "variation_label": r.offer.variation_label,
+                    "amazon_total": r.offer.amazon_total,
+                    "passed": r.passed,
+                    "ebay_price": r.ebay_price,
+                }
+                for r in results
+            ],
         }
 
     @app.post("/api/listing/generate")
@@ -331,25 +385,48 @@ def create_app() -> FastAPI:
         image_urls: list[str] = []
         offer_data = (row or {}).get("offer") or {}
         image_urls = list(offer_data.get("image_urls") or [])
-        refresh = bool(body.get("refresh_images", True))
-        if refresh or not image_urls:
-            try:
-                offer = fetch_product_offer(asin)
-                image_urls = offer.image_urls or image_urls
-                amazon_title = offer.title or amazon_title
-                amazon_total = offer.amazon_total
-                run_evaluate(
-                    EvaluateRequest(
-                        asin_or_url=asin,
-                        offer=offer,
-                        ebay_price=float(ebay_price),
-                        save=True,
-                    ),
-                    persist="always",
+        variation_label = str(offer_data.get("variation_label") or "")
+        try:
+            offers = fetch_variation_offers(asin)
+            child_asins = {o.asin.strip().upper() for o in offers}
+            if len(offers) > 1 and asin not in child_asins:
+                persist_variation_offers(asin, offers, persist="pass_only")
+                labels = ", ".join(
+                    f"{(o.variation_label or o.asin)} ({o.asin})" for o in offers
                 )
-            except Exception:  # noqa: BLE001
-                # Keep going with whatever title/images we already have.
-                pass
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "This Amazon page is a variation parent (e.g. 20 kg vs 40 kg). "
+                        f"Split into: {labels}. Generate the listing from a child in Queue — "
+                        "do not publish the parent ASIN."
+                    ),
+                )
+            picked = next((o for o in offers if o.asin.strip().upper() == asin), offers[0])
+            amazon_title = picked.title or amazon_title
+            amazon_total = picked.amazon_total
+            image_urls = picked.image_urls or image_urls
+            variation_label = picked.variation_label or variation_label
+            if variation_label and variation_label.lower() not in amazon_title.lower():
+                amazon_title = f"{amazon_title} — {variation_label}"
+            run_evaluate(
+                EvaluateRequest(
+                    asin_or_url=asin,
+                    offer=picked.model_copy(
+                        update={
+                            "title": amazon_title,
+                            "variation_label": variation_label,
+                        }
+                    ),
+                    ebay_price=float(ebay_price),
+                    save=True,
+                ),
+                persist="always",
+            )
+        except HTTPException:
+            raise
+        except Exception:  # noqa: BLE001
+            pass
 
         force_imgs = bool(body.get("force_refresh_images", False))
         media = download_product_images(
@@ -372,6 +449,12 @@ def create_app() -> FastAPI:
                 amazon_price=float(amazon_total),
                 ebay_price=float(ebay_price),
                 image_urls=image_urls,
+                bullets_hint=(
+                    f"Variante/Größe/Farbe: {variation_label}. "
+                    "Nur DIESE Variante beschreiben; Geschwistergrößen nicht erwähnen."
+                    if variation_label
+                    else ""
+                ),
             )
         except Exception as e:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"LLM generate failed: {e}") from e

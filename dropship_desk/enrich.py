@@ -7,21 +7,30 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from dropship_desk.amazon.product import fetch_product_offer
-from dropship_desk.db import get_margin_settings, list_candidates, upsert_candidate
-from dropship_desk.margin import MarginInputs, evaluate_margin, suggest_ebay_price
+from dropship_desk.amazon.product import fetch_variation_offers
+from dropship_desk.db import list_candidates
+from dropship_desk.variation_expand import persist_variation_offers
 
 ProgressCb = Callable[[dict[str, Any]], None]
 
 
+def _needs_amazon_refresh(row: dict[str, Any]) -> bool:
+    if row.get("status") in ("listed", "ebay_unpublished"):
+        return False
+    offer = row.get("offer") or {}
+    if offer.get("stars") is None or offer.get("reviews") is None:
+        return True
+    if offer.get("variation_label"):
+        return False
+    if offer.get("price_source") == "serp":
+        return True
+    note = str(offer.get("note") or "").lower()
+    return "variation" in note
+
+
 def _missing_rows(*, status: str | None, limit: int) -> list[dict[str, Any]]:
     rows = list_candidates(limit=200, status=status)
-    missing = [
-        r
-        for r in rows
-        if (r.get("offer") or {}).get("stars") is None
-        or (r.get("offer") or {}).get("reviews") is None
-    ]
+    missing = [r for r in rows if _needs_amazon_refresh(r)]
     return missing[:limit]
 
 
@@ -33,7 +42,6 @@ def enrich_missing(
     on_progress: ProgressCb | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
-    settings = get_margin_settings()
     missing = _missing_rows(status=status, limit=limit)
     targeted = len(missing)
 
@@ -64,54 +72,26 @@ def enrich_missing(
         asin = row["asin"]
         emit(current_asin=asin, phase="fetch", index=i + 1)
         try:
-            offer = fetch_product_offer(asin)
-            suggested = suggest_ebay_price(
-                offer.amazon_total,
-                fee_pct=settings.ebay_fee_pct,
-                fee_fixed=settings.ebay_fee_fixed,
-                buffer_eur=settings.buffer_eur,
-                min_margin_eur=settings.min_margin_eur,
-                min_margin_pct=settings.min_margin_pct,
-            )
-            margin = evaluate_margin(
-                MarginInputs(
-                    amazon_total=offer.amazon_total,
-                    ebay_price=suggested,
-                    ebay_fee_pct=settings.ebay_fee_pct,
-                    ebay_fee_fixed=settings.ebay_fee_fixed,
-                    buffer_eur=settings.buffer_eur,
-                    min_margin_eur=settings.min_margin_eur,
-                    min_margin_pct=settings.min_margin_pct,
+            offers = fetch_variation_offers(asin)
+            expanded = persist_variation_offers(asin, offers, persist="always")
+            primary = offers[0]
+            if expanded.results:
+                primary_eval = next(
+                    (r for r in expanded.results if r.asin == asin), expanded.results[0]
                 )
-            )
-            hard = list(row.get("hard_reject_reasons") or [])
-            new_status = "ready" if margin.passed and not hard else "rejected"
-            upsert_candidate(
-                asin=asin,
-                title=offer.title or row["title"],
-                amazon_total=offer.amazon_total,
-                ebay_price=suggested,
-                max_amazon_buy=offer.amazon_total,
-                status=new_status,
-                offer=offer.model_dump(),
-                margin={
-                    "ebay_fees": margin.ebay_fees,
-                    "net_proceeds": margin.net_proceeds,
-                    "net_profit": margin.net_profit,
-                    "margin_pct": margin.margin_pct,
-                    "passed": margin.passed,
-                    "fail_reasons": list(margin.fail_reasons),
-                },
-                hard_reject=hard,
-            )
+                primary = primary_eval.offer
             updated += 1
             details.append(
                 {
-                    "asin": asin,
-                    "stars": offer.stars,
-                    "reviews": offer.reviews,
-                    "amazon_total": offer.amazon_total,
-                    "ebay_price": suggested,
+                    "asin": primary.asin,
+                    "stars": primary.stars,
+                    "reviews": primary.reviews,
+                    "amazon_total": primary.amazon_total,
+                    "ebay_price": (
+                        expanded.results[0].ebay_price if expanded.results else None
+                    ),
+                    "expanded": expanded.expanded,
+                    "children": expanded.child_asins,
                 }
             )
         except Exception as e:  # noqa: BLE001

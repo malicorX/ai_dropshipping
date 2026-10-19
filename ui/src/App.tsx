@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-type Tab = "find" | "evaluate" | "drafts" | "orders" | "settings";
+type Tab = "find" | "queue" | "list" | "settings";
 
 type Health = {
   status: string;
@@ -20,6 +20,11 @@ type Health = {
     auto_publish: boolean;
     sell_allowed?: boolean;
     sell_block_reason?: string;
+    production_ready?: boolean;
+    sandbox_oauth_connected?: boolean;
+    production_oauth_connected?: boolean;
+    sandbox_gaps?: string[];
+    production_gaps?: string[];
   };
 };
 
@@ -96,6 +101,8 @@ type Candidate = {
     reviews?: number | null;
     price_source?: string;
     note?: string;
+    variation_label?: string;
+    parent_asin?: string;
   };
   listing_draft?: ListingDraft | null;
   ebay_listing?: EbayListing | null;
@@ -183,7 +190,7 @@ export default function App() {
 
   const prepareListing = useCallback((seed: ListingSeed) => {
     setListingSeed(seed);
-    setTab("evaluate");
+    setTab("list");
     setError("");
   }, []);
 
@@ -192,9 +199,8 @@ export default function App() {
       const h = await api<Health>("/api/health");
       setHealth(h);
       return h;
-    } catch (e) {
+    } catch {
       setHealth(null);
-      setError(e instanceof Error ? e.message : String(e));
       return null;
     }
   }, []);
@@ -207,24 +213,41 @@ export default function App() {
     return () => window.clearInterval(id);
   }, [refreshHealth]);
 
+  const ebayLive = health?.ebay?.env === "production";
+
+  useEffect(() => {
+    document.documentElement.dataset.ebayTarget = ebayLive ? "production" : "sandbox";
+  }, [ebayLive]);
+
   return (
-    <div className="app">
+    <div className={ebayLive ? "app ebay-live" : "app ebay-sandbox"}>
       <header className="top">
         <h1>Dropship Desk</h1>
         <div className="health">
-          {health
-            ? `v${health.version} · API ok · Amazon auto ${health.automation.amazon_enabled ? "ON" : "off"} · eBay auto ${health.automation.ebay_enabled ? "ON" : "off"}`
-            : "API unreachable"}
+          {health ? (
+            <>
+              {`v${health.version} · API ok · `}
+              <span
+                className={
+                  health.ebay?.env === "production" ? "ebay-target-pill live" : "ebay-target-pill"
+                }
+              >
+                {health.ebay?.env === "production" ? "eBay LIVE" : "eBay sandbox"}
+              </span>
+              {health.ebay?.oauth_connected ? " · signed in" : " · not signed in"}
+            </>
+          ) : (
+            "API unreachable"
+          )}
         </div>
       </header>
 
       <nav className="tabs">
         {(
           [
-            ["find", "Find"],
-            ["evaluate", "Evaluate"],
-            ["drafts", "Drafts"],
-            ["orders", "Order desk"],
+            ["find", "Find on Amazon"],
+            ["queue", "Queue"],
+            ["list", "List on eBay"],
             ["settings", "Settings"],
           ] as const
         ).map(([id, label]) => (
@@ -232,37 +255,39 @@ export default function App() {
             key={id}
             type="button"
             className={tab === id ? "active" : ""}
-            onClick={() => setTab(id)}
+            onClick={() => {
+              setError("");
+              setTab(id);
+            }}
           >
             {label}
           </button>
         ))}
       </nav>
 
+      {error ? <p className="error">{error}</p> : null}
+
       {tab === "find" && (
         <FindPanel onError={setError} onPrepareListing={prepareListing} />
       )}
-      {tab === "evaluate" && (
+      {tab === "queue" && (
+        <DraftsPanel
+          onError={setError}
+          onPrepareListing={prepareListing}
+          ebayEnv={health?.ebay?.env === "production" ? "production" : "sandbox"}
+        />
+      )}
+      {tab === "list" && (
         <EvaluatePanel
           onError={setError}
           seed={listingSeed}
           onSeedConsumed={() => setListingSeed(null)}
+          ebayEnv={health?.ebay?.env === "production" ? "production" : "sandbox"}
         />
-      )}
-      {tab === "drafts" && (
-        <DraftsPanel onError={setError} onPrepareListing={prepareListing} />
-      )}
-      {tab === "orders" && (
-        <div className="panel muted">
-          Order desk lands next. Flow: Find → Drafts → Prepare listing → Evaluate → Send unpublished
-          offer to eBay → Publish (manual).
-        </div>
       )}
       {tab === "settings" && (
         <SettingsPanel onError={setError} health={health} refreshHealth={refreshHealth} />
       )}
-
-      {error ? <p className="error">{error}</p> : null}
     </div>
   );
 }
@@ -311,10 +336,10 @@ function FindPanel({
     try {
       const s = await api<FindStatus>("/api/find/status");
       setStatus(s);
-    } catch (e) {
-      onError(e instanceof Error ? e.message : String(e));
+    } catch {
+      /* idle poll — header already shows API unreachable */
     }
-  }, [onError]);
+  }, []);
 
   const running = !!status?.running;
   const canStart = running ? false : autoMode || keyword.trim().length > 0;
@@ -368,9 +393,9 @@ function FindPanel({
   return (
     <div className="panel grid">
       <p className="muted">
-        Searches amazon.de with your criteria, then runs margin Evaluate on each hit. Read-only scrape
-        (not purchase automation). Goes slow on purpose (several seconds between pages) to reduce ban
-        risk. CAPTCHA or empty filters stop the job early.
+        Search amazon.de. Hits that cover fees + your min margin go to Queue. Sizes/colors
+        (20 kg vs 40 kg) become separate rows. Then open a row to list it on eBay. Slow on
+        purpose; a CAPTCHA stops the job.
       </p>
       <div className="grid two">
         <label>
@@ -503,7 +528,7 @@ function FindPanel({
                         })
                       }
                     >
-                      Prepare listing
+                      List on eBay
                     </button>
                   </td>
                 </tr>
@@ -533,10 +558,12 @@ function EvaluatePanel({
   onError,
   seed,
   onSeedConsumed,
+  ebayEnv,
 }: {
   onError: (msg: string) => void;
   seed: ListingSeed | null;
   onSeedConsumed: () => void;
+  ebayEnv: "sandbox" | "production";
 }) {
   const [asinOrUrl, setAsinOrUrl] = useState("");
   const [title, setTitle] = useState("");
@@ -583,7 +610,7 @@ function EvaluatePanel({
         /* no draft yet */
       }
     })();
-  }, [asinOnly]);
+  }, [asinOnly, ebayEnv]);
 
   useEffect(() => {
     if (!copied) return;
@@ -671,6 +698,12 @@ function EvaluatePanel({
   async function sendUnpublished() {
     if (!asinOnly || !draft) return;
     onError("");
+    if (ebayEnv === "production") {
+      const ok = window.confirm(
+        `Send this unpublished offer to LIVE eBay?\n\n${draft.title || asinOnly}\n\nThis is not the sandbox.`
+      );
+      if (!ok) return;
+    }
     setEbayBusy("stage");
     try {
       const res = await api<EbayListing>(`/api/ebay/listings/${asinOnly}/stage`, {
@@ -680,6 +713,7 @@ function EvaluatePanel({
           subtitle: draft.subtitle,
           description_html: draft.description_html,
           bullet_points: draft.bullet_points,
+          confirm_live: ebayEnv === "production",
         }),
       });
       setEbayListing(res);
@@ -693,11 +727,19 @@ function EvaluatePanel({
   async function publishListing() {
     if (!asinOnly) return;
     onError("");
+    if (ebayEnv === "production") {
+      const ok = window.confirm(
+        `Publish this offer on LIVE eBay? Buyers will see it.\n\n${
+          draft?.title || asinOnly
+        }\n\nThis is not the sandbox.`
+      );
+      if (!ok) return;
+    }
     setEbayBusy("publish");
     try {
       const res = await api<EbayListing>(`/api/ebay/listings/${asinOnly}/publish`, {
         method: "POST",
-        body: "{}",
+        body: JSON.stringify({ confirm_live: ebayEnv === "production" }),
       });
       setEbayListing(res);
     } catch (e) {
@@ -710,10 +752,16 @@ function EvaluatePanel({
   return (
     <div className="panel grid">
       <p className="muted">
-        1) Set eBay price & analyze margin. 2) Generate listing draft. 3) Send unpublished offer to
-        eBay (sandbox while EBAY_ENV=sandbox). 4) Publish only when you click Publish — never
-        automatic.
+        Open an item from Queue, or paste an ASIN. Generate unique eBay copy, send an unpublished
+        offer, then Publish — never automatic. Margin was already checked in Find; this page is for
+        listing, not hunting.
       </p>
+      {ebayEnv === "production" ? (
+        <p className="error">
+          Target is live eBay. Send and Publish hit your real seller account (Settings → Sandbox to
+          switch back).
+        </p>
+      ) : null}
       <div className="grid two">
         <label>
           Amazon URL / ASIN
@@ -737,8 +785,8 @@ function EvaluatePanel({
         </label>
       </div>
       <div className="actions">
-        <button type="button" className="primary" disabled={busy} onClick={() => void runEvaluate()}>
-          {busy ? "Working…" : "Analyze / refresh margin"}
+        <button type="button" disabled={busy} onClick={() => void runEvaluate()}>
+          {busy ? "Working…" : "Recheck margin"}
         </button>
         {asinOnly ? (
           <button
@@ -761,18 +809,32 @@ function EvaluatePanel({
                     offer: {
                       title: string;
                       amazon_total: number;
+                      asin?: string;
                       stars?: number | null;
                       note?: string;
+                      variation_label?: string;
                     };
-                    evaluate: { suggested_ebay_price: number };
+                    evaluate: { suggested_ebay_price: number; asin?: string };
+                    expanded?: boolean;
+                    children?: { asin: string; variation_label: string; amazon_total: number }[];
                   }>("/api/amazon/refresh", {
                     method: "POST",
                     body: JSON.stringify({ asin: asinOnly }),
                   });
+                  const nextAsin = refreshed.offer.asin || refreshed.evaluate.asin;
+                  if (nextAsin) {
+                    setAsinOrUrl(nextAsin);
+                  }
                   setTitle(refreshed.offer.title || title);
                   setAmazonTotal(String(refreshed.offer.amazon_total));
                   setEbayPrice(String(refreshed.evaluate.suggested_ebay_price));
-                  if (refreshed.offer.note) {
+                  if (refreshed.expanded && (refreshed.children || []).length > 1) {
+                    onError(
+                      `Split into ${(refreshed.children || []).length} variations (e.g. ${
+                        refreshed.offer.variation_label || "child ASIN"
+                      }). Each size/color is its own row in Queue.`
+                    );
+                  } else if (refreshed.offer.note) {
                     onError(refreshed.offer.note);
                   }
                 } catch (e) {
@@ -862,14 +924,24 @@ function EvaluatePanel({
               disabled={ebayBusy !== null || !asinOnly}
               onClick={() => void sendUnpublished()}
             >
-              {ebayBusy === "stage" ? "Sending to eBay…" : "Send unpublished offer to eBay"}
+              {ebayBusy === "stage"
+                ? ebayEnv === "production"
+                  ? "Sending to live eBay…"
+                  : "Sending to sandbox…"
+                : ebayEnv === "production"
+                  ? "Send unpublished offer to live eBay"
+                  : "Send unpublished offer to sandbox"}
             </button>
             <button
               type="button"
               disabled={ebayBusy !== null || ebayListing?.status !== "unpublished"}
               onClick={() => void publishListing()}
             >
-              {ebayBusy === "publish" ? "Publishing…" : "Publish on eBay"}
+              {ebayBusy === "publish"
+                ? "Publishing…"
+                : ebayEnv === "production"
+                  ? "Publish on live eBay"
+                  : "Publish on sandbox"}
             </button>
             {ebayListing?.seller_hub_url ? (
               <button
@@ -880,7 +952,7 @@ function EvaluatePanel({
                   )
                 }
               >
-                {ebayListing.env === "sandbox" ? "Open sandbox My eBay" : "Open Seller Hub"}
+                {ebayListing.env === "sandbox" ? "Open sandbox My eBay" : "Open My eBay"}
               </button>
             ) : null}
             {ebayListing?.item_url ? (
@@ -901,12 +973,15 @@ function EvaluatePanel({
               {ebayListing.offer_id ? ` · offer ${ebayListing.offer_id}` : ""}
               {ebayListing.listing_id ? ` · item ${ebayListing.listing_id}` : ""}
               {ebayListing.status === "unpublished"
-                ? ". Not visible on eBay yet — click Publish on eBay. Sandbox My eBay → Active is unreliable; after publish use Open live item."
+                ? ebayEnv === "production"
+                  ? ". Not visible on eBay yet — click Publish on live eBay. Seller Hub has no draft for this offer."
+                  : ". Not visible on eBay yet — click Publish on sandbox. After publish use Open live item."
                 : ""}
             </p>
           ) : (
             <p className="muted">
-              Send creates an unpublished offer on the connected eBay account (sandbox by default).
+              Send creates an unpublished offer on the connected{" "}
+              {ebayEnv === "production" ? "live" : "sandbox"} eBay account (Settings → eBay target).
               Publish is a second click — it does not run by itself.
             </p>
           )}
@@ -1053,9 +1128,11 @@ function formatTs(iso: string): string {
 function DraftsPanel({
   onError,
   onPrepareListing,
+  ebayEnv,
 }: {
   onError: (msg: string) => void;
   onPrepareListing: (seed: ListingSeed) => void;
+  ebayEnv: "sandbox" | "production";
 }) {
   const [rows, setRows] = useState<Candidate[]>([]);
   const [filter, setFilter] = useState<"ready" | "rejected" | "all">("ready");
@@ -1067,7 +1144,7 @@ function DraftsPanel({
   const [enrichMsg, setEnrichMsg] = useState("");
   const enrichPollRef = useRef<number | null>(null);
 
-    const load = useCallback(async () => {
+  const load = useCallback(async () => {
     const q = filter === "all" ? "" : filter === "ready" ? "?status=pipeline" : `?status=${filter}`;
     setRows(await api<Candidate[]>(`/api/candidates${q}`));
   }, [filter]);
@@ -1080,7 +1157,7 @@ function DraftsPanel({
         onError(e instanceof Error ? e.message : String(e));
       }
     })();
-  }, [load, onError]);
+  }, [load, onError, ebayEnv]);
 
   useEffect(() => {
     return () => {
@@ -1224,17 +1301,18 @@ function DraftsPanel({
         offer: {
           title: string;
           amazon_total: number;
+          asin?: string;
           stars?: number | null;
           reviews?: number | null;
           note?: string;
         };
-        evaluate: { ebay_price: number; suggested_ebay_price: number };
+        evaluate: { ebay_price: number; suggested_ebay_price: number; asin?: string };
       }>("/api/amazon/refresh", {
         method: "POST",
         body: JSON.stringify({ asin: r.asin }),
       });
       onPrepareListing({
-        asin: r.asin,
+        asin: refreshed.offer.asin || refreshed.evaluate.asin || r.asin,
         title: refreshed.offer.title || r.title,
         amazonTotal: refreshed.offer.amazon_total,
         ebayPrice: refreshed.evaluate.suggested_ebay_price,
@@ -1243,7 +1321,7 @@ function DraftsPanel({
     } catch (e) {
       onError(
         (e instanceof Error ? e.message : String(e)) +
-          " — opening Evaluate with stored SERP price instead."
+          " — opening List on eBay with the stored search price instead."
       );
       onPrepareListing({
         asin: r.asin,
@@ -1259,13 +1337,13 @@ function DraftsPanel({
   return (
     <div className="panel grid">
       <p className="muted">
-        Find stores search-page prices (can be wrong for multi-variant ASINs). Stars/reviews often
-        missing until you “Fill missing stars” or “Prepare listing” (both hit the product page).
+        Items that passed Find (margin + in-stock). Click List on eBay to write copy and send it.
+        Refresh Amazon if a row is still a generic parent (no size/color).
       </p>
       <div className="actions">
         {(
           [
-            ["ready", "Ready"],
+            ["ready", "Ready to list"],
             ["rejected", "Rejected"],
             ["all", "All"],
           ] as const
@@ -1279,18 +1357,20 @@ function DraftsPanel({
             {label}
           </button>
         ))}
-        <button type="button" onClick={() => void prune()}>
-          Prune old rejected
-        </button>
+        {filter === "rejected" ? (
+          <button type="button" onClick={() => void prune()}>
+            Delete rejected older than 7 days
+          </button>
+        ) : null}
         <button type="button" className="primary" disabled={repriceBusy} onClick={() => void reprice()}>
           {repriceBusy ? "Repricing…" : "Recalculate eBay prices"}
         </button>
         <button type="button" disabled={enrichBusy} onClick={() => void enrichMissing()}>
-          {enrichBusy ? "Enriching…" : "Fill missing stars"}
+          {enrichBusy ? "Refreshing…" : "Refresh Amazon / split sizes"}
         </button>
         {enrichBusy ? (
           <button type="button" onClick={() => void stopEnrich()}>
-            Stop enrich
+            Stop refresh
           </button>
         ) : null}
         {pruneMsg ? <span className="muted">{pruneMsg}</span> : null}
@@ -1308,7 +1388,7 @@ function DraftsPanel({
             <th>eBay</th>
             <th>Src</th>
             <th>Updated</th>
-            <th>eBay offer</th>
+            <th>{ebayEnv === "production" ? "Live offer" : "Sandbox offer"}</th>
             <th>Actions</th>
           </tr>
         </thead>
@@ -1324,7 +1404,12 @@ function DraftsPanel({
                   {r.asin}
                 </button>
               </td>
-              <td>{r.title || "—"}</td>
+              <td>
+                {r.title || "—"}
+                {r.offer?.variation_label ? (
+                  <div className="muted">{r.offer.variation_label}</div>
+                ) : null}
+              </td>
               <td>{r.offer?.stars ?? "—"}</td>
               <td>{r.offer?.reviews ?? "—"}</td>
               <td>€{r.amazon_total.toFixed(2)}</td>
@@ -1339,7 +1424,7 @@ function DraftsPanel({
                   disabled={busyAsin === r.asin}
                   onClick={() => void prepareWithRefresh(r)}
                 >
-                  {busyAsin === r.asin ? "Refreshing…" : "Prepare listing"}
+                  {busyAsin === r.asin ? "Refreshing…" : "List on eBay"}
                 </button>
               </td>
             </tr>
@@ -1364,6 +1449,7 @@ function SettingsPanel({
   const [shop, setShop] = useState<ListingShopSettings | null>(null);
   const [saved, setSaved] = useState(false);
   const [waitingOauth, setWaitingOauth] = useState(false);
+  const [targetBusy, setTargetBusy] = useState(false);
 
   useEffect(() => {
     void (async () => {
@@ -1399,15 +1485,60 @@ function SettingsPanel({
     }
   }
 
+  async function switchEbayTarget(env: "sandbox" | "production") {
+    if (health?.ebay?.env === env) return;
+    onError("");
+    if (env === "production") {
+      const ok = window.confirm(
+        "Switch Dropship Desk to live eBay? Send and Publish will use your real seller account, not the sandbox."
+      );
+      if (!ok) return;
+    }
+    setTargetBusy(true);
+    try {
+      await api("/api/ebay/target", {
+        method: "POST",
+        body: JSON.stringify({ env }),
+      });
+      await refreshHealth();
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setTargetBusy(false);
+    }
+  }
+
   if (!margin || !shop) {
     return <div className="panel muted">Loading settings…</div>;
   }
 
-  let oauthStatus = "not connected";
-  if (health?.ebay?.oauth_connected) {
-    oauthStatus = "connected";
-  } else if (waitingOauth) {
-    oauthStatus = "waiting for browser…";
+  const live = health?.ebay?.env === "production";
+  const connected = !!health?.ebay?.oauth_connected;
+  const connectLabel = live
+    ? connected
+      ? "Reconnect live eBay"
+      : "Connect live eBay"
+    : connected
+      ? "Reconnect sandbox eBay"
+      : "Connect sandbox eBay";
+
+  async function startOauth() {
+    try {
+      await api("/api/ebay/oauth/start", { method: "POST", body: "{}" });
+      setWaitingOauth(true);
+      const deadline = Date.now() + 180_000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => window.setTimeout(r, 1500));
+        const h = await refreshHealth();
+        if (h?.ebay?.oauth_connected) {
+          break;
+        }
+      }
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setWaitingOauth(false);
+    }
   }
 
   return (
@@ -1419,57 +1550,100 @@ function SettingsPanel({
       </p>
       <h3 style={{ margin: "0.5rem 0 0" }}>eBay API</h3>
       <p className="muted">
-        Environment: <span className="mono">{health?.ebay?.env ?? "—"}</span>
-        {" · "}
-        keys {health?.ebay?.app_id_set && health?.ebay?.cert_id_set ? "present" : "missing"}
-        {health?.ebay?.app_id_hint ? ` (${health.ebay.app_id_hint})` : ""}
-        {" · "}
-        RuName {health?.ebay?.runame_set ? "set" : "not set"}
-        {" · "}
-        OAuth {oauthStatus}
-        {" · "}
-        auto-publish {health?.ebay?.auto_publish ? "ON" : "off"}
-        {" · "}
-        send-to-eBay {health?.ebay?.sell_allowed ? "allowed" : health?.ebay?.sell_block_reason || "blocked"}
+        Target is per-app, not per listing. Sandbox and live keep separate OAuth tokens and offers.
+        Live Send/Publish still needs <span className="mono">EBAY_AUTOMATION_ENABLED</span> and{" "}
+        <span className="mono">EBAY_ALLOW_LIST</span> in <span className="mono">.env</span>, plus a
+        confirm in this window.
       </p>
-      <div className="actions">
+      <div className="ebay-target" role="group" aria-label="eBay target">
         <button
           type="button"
-          className="primary"
-          disabled={waitingOauth}
-          onClick={() => {
-            void (async () => {
-              try {
-                await api("/api/ebay/oauth/start", { method: "POST", body: "{}" });
-                setWaitingOauth(true);
-                const deadline = Date.now() + 180_000;
-                while (Date.now() < deadline) {
-                  await new Promise((r) => window.setTimeout(r, 1500));
-                  const h = await refreshHealth();
-                  if (h?.ebay?.oauth_connected) {
-                    break;
-                  }
-                }
-              } catch (e) {
-                onError(e instanceof Error ? e.message : String(e));
-              } finally {
-                setWaitingOauth(false);
-              }
-            })();
-          }}
+          className={health?.ebay?.env !== "production" ? "active" : ""}
+          disabled={targetBusy}
+          onClick={() => void switchEbayTarget("sandbox")}
         >
-          {health?.ebay?.oauth_connected ? "Reconnect eBay (Sandbox)" : "Connect eBay (Sandbox)"}
+          Sandbox
+        </button>
+        <button
+          type="button"
+          className={health?.ebay?.env === "production" ? "active live" : ""}
+          disabled={targetBusy}
+          onClick={() => void switchEbayTarget("production")}
+        >
+          Live eBay
         </button>
       </div>
-      <p className="muted">
-        Auth accepted URL:{" "}
-        <span className="mono">https://127.0.0.1:8770/api/ebay/oauth/callback</span>
-        . After eBay redirects, Chrome will warn about the local self-signed certificate — Advanced →
-        Proceed (the <span className="mono">code=</span> in the URL must stay).
-      </p>
+      {(health?.ebay?.production_gaps || []).length > 0 ? (
+        <p className="error">
+          Live is locked: missing {(health?.ebay?.production_gaps || []).join(", ")} in{" "}
+          <span className="mono">.env</span>. Create a <strong>Production</strong> RuName at
+          developer.ebay.com (not the sandbox one) with Auth accepted URL{" "}
+          <span className="mono">https://127.0.0.1:8770/api/ebay/oauth/callback</span>
+          , paste it as <span className="mono">EBAY_PROD_RUNAME</span>, then restart.
+        </p>
+      ) : null}
+      <div className="oauth-card">
+        <div>
+          <span className={`badge ${connected ? "ok" : "fail"}`}>
+            {waitingOauth
+              ? "Waiting for browser…"
+              : connected
+                ? live
+                  ? "Live eBay signed in"
+                  : "Sandbox signed in"
+                : live
+                  ? "Live eBay not signed in"
+                  : "Sandbox not signed in"}
+          </span>
+        </div>
+        <ul className="oauth-facts">
+          <li>
+            Keys:{" "}
+            {health?.ebay?.app_id_set && health?.ebay?.cert_id_set
+              ? `present${health.ebay.app_id_hint ? ` (${health.ebay.app_id_hint})` : ""}`
+              : "missing"}
+          </li>
+          <li>RuName: {health?.ebay?.runame_set ? "set" : "not set"}</li>
+          <li>
+            Send listings:{" "}
+            {health?.ebay?.sell_allowed
+              ? "allowed"
+              : health?.ebay?.sell_block_reason || "blocked"}
+          </li>
+          <li>
+            Other token: sandbox{" "}
+            {health?.ebay?.sandbox_oauth_connected ? "saved" : "none"} · live{" "}
+            {health?.ebay?.production_oauth_connected ? "saved" : "none"}
+          </li>
+        </ul>
+        <div className="actions" style={{ marginTop: 0 }}>
+          <button
+            type="button"
+            className={connected ? "" : "primary"}
+            disabled={waitingOauth}
+            onClick={() => void startOauth()}
+          >
+            {waitingOauth ? "Waiting for eBay…" : connectLabel}
+          </button>
+        </div>
+        {connected ? (
+          <p className="hint">
+            You are already signed in. Reconnect only if tokens expire or you switched eBay users.
+          </p>
+        ) : (
+          <p className="hint">
+            Opens the eBay consent page. Chrome will warn about the local self-signed certificate —
+            Advanced → Proceed (keep the <span className="mono">code=</span> in the URL).
+          </p>
+        )}
+      </div>
       {!health?.ebay?.runame_set ? (
         <p className="muted">
-          Put the RuName in <span className="mono">EBAY_SANDBOX_RUNAME</span>, then restart.
+          Put the RuName in{" "}
+          <span className="mono">
+            {health?.ebay?.env === "production" ? "EBAY_PROD_RUNAME" : "EBAY_SANDBOX_RUNAME"}
+          </span>
+          , then restart.
         </p>
       ) : null}
       <h3 style={{ margin: "0.5rem 0 0" }}>Margin</h3>

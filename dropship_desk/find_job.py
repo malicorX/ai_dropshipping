@@ -17,8 +17,10 @@ from dropship_desk.amazon.serp import (
     parse_serp_html,
     summarize_hits,
 )
+from dropship_desk.amazon.product import fetch_variation_offers
 from dropship_desk.evaluate_service import offer_from_serp, run_evaluate
 from dropship_desk.models import DiscoverySettings, EvaluateRequest
+from dropship_desk.variation_expand import persist_variation_offers
 
 _AUTO_TERMS = [
     "usb c hub",
@@ -236,7 +238,9 @@ class FindJobManager:
                                 continue
                             seen.add(hit.asin)
 
-                        self._process_hit(hit)
+                        extra = self._process_hit(hit)
+                        if extra:
+                            seen.update(extra)
                         time.sleep(
                             max(1.2, settings.pause_ms / 1000.0)
                             + random.uniform(0.0, 1.0)
@@ -265,8 +269,9 @@ class FindJobManager:
                 self._log(f"DOM extract failed ({e}), falling back to HTML parse")
         return parse_serp_html(html)
 
-    def _process_hit(self, hit: SerpHit) -> None:
+    def _process_hit(self, hit: SerpHit) -> set[str]:
         assert hit.price_eur is not None
+        extra: set[str] = set()
         offer = offer_from_serp(
             asin=hit.asin,
             title=hit.title,
@@ -275,34 +280,83 @@ class FindJobManager:
             stars=hit.stars,
             reviews=hit.reviews,
         )
-        result = run_evaluate(
-            EvaluateRequest(asin_or_url=hit.asin, offer=offer, save=True),
-            persist="pass_only",
+        probe = run_evaluate(
+            EvaluateRequest(asin_or_url=hit.asin, offer=offer, save=False),
+            persist="never",
         )
-        row = {
-            "asin": result.asin,
-            "title": hit.title,
-            "price": hit.price_eur,
-            "stars": hit.stars,
-            "reviews": hit.reviews,
-            "passed": result.passed,
-            "status": result.status,
-            "candidate_id": result.candidate_id,
-            "net_profit": result.margin.get("net_profit"),
-        }
-        with self._lock:
-            self.state.examined += 1
-            if result.passed:
-                self.state.pass_count += 1
-                self._log(
-                    f"PASS {hit.asin} €{hit.price_eur:.2f} ★{hit.stars} ({hit.reviews}) → candidate #{result.candidate_id}"
-                )
-            else:
+        if not probe.passed:
+            row = {
+                "asin": probe.asin,
+                "title": hit.title,
+                "price": hit.price_eur,
+                "stars": hit.stars,
+                "reviews": hit.reviews,
+                "passed": False,
+                "status": probe.status,
+                "candidate_id": probe.candidate_id,
+                "net_profit": probe.margin.get("net_profit"),
+            }
+            with self._lock:
+                self.state.examined += 1
                 self.state.reject_count += 1
                 self._log(
                     f"FAIL {hit.asin} €{hit.price_eur:.2f} ★{hit.stars} ({hit.reviews})"
                 )
-            self.state.hits.append(row)
+                self.state.hits.append(row)
+            return extra
+
+        offers = [offer]
+        try:
+            offers = fetch_variation_offers(hit.asin)
+        except Exception as e:  # noqa: BLE001
+            with self._lock:
+                self._log(f"PDP/variations failed for {hit.asin} ({e}); keeping SERP snapshot")
+
+        expanded = persist_variation_offers(hit.asin, offers, persist="pass_only")
+        extra.update(expanded.child_asins)
+        if expanded.expanded:
+            with self._lock:
+                self._log(
+                    f"Split {hit.asin} into {len(expanded.results)} variation ASINs"
+                )
+
+        results = expanded.results or [
+            run_evaluate(
+                EvaluateRequest(asin_or_url=hit.asin, offer=offers[0], save=True),
+                persist="pass_only",
+            )
+        ]
+        with self._lock:
+            self.state.examined += 1
+            for result in results:
+                row = {
+                    "asin": result.asin,
+                    "title": result.offer.title or hit.title,
+                    "price": result.offer.amazon_total,
+                    "stars": result.offer.stars if result.offer.stars is not None else hit.stars,
+                    "reviews": result.offer.reviews
+                    if result.offer.reviews is not None
+                    else hit.reviews,
+                    "passed": result.passed,
+                    "status": result.status,
+                    "candidate_id": result.candidate_id,
+                    "net_profit": result.margin.get("net_profit"),
+                }
+                self.state.hits.append(row)
+                if result.passed:
+                    self.state.pass_count += 1
+                    label = result.offer.variation_label or ""
+                    self._log(
+                        f"PASS {result.asin} {label} €{result.offer.amazon_total:.2f} "
+                        f"★{row['stars']} ({row['reviews']}) → candidate #{result.candidate_id}"
+                    )
+                else:
+                    self.state.reject_count += 1
+                    self._log(
+                        f"FAIL {result.asin} €{result.offer.amazon_total:.2f} "
+                        f"★{row['stars']} ({row['reviews']})"
+                    )
+        return extra
 
 
 def _looks_like_captcha(html: str) -> bool:

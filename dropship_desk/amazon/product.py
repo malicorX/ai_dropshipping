@@ -6,7 +6,15 @@ import time
 from typing import Any
 
 from dropship_desk.amazon.serp import parse_price_text, parse_reviews_text, parse_stars_text
+from dropship_desk.amazon.variations import (
+    VariationChild,
+    apply_variation_label,
+    parse_variation_children,
+)
 from dropship_desk.models import OfferIn
+
+MAX_VARIATION_CHILDREN = 8
+_CHILD_PAUSE_SEC = 1.2
 
 _PDP_EXTRACT_JS = """
 () => {
@@ -40,15 +48,28 @@ _PDP_EXTRACT_JS = """
     imgs.push(src);
     if (imgs.length >= 8) break;
   }
+  const children = [];
+  const seenKids = new Set();
+  const twisterRoot = document.querySelector('#twister, #inline-twister-row, #twister_feature_div, #twister-plus-inline-twister, #variation_size_name');
+  if (twisterRoot) {
+    for (const el of twisterRoot.querySelectorAll('[data-defaultasin], [data-asin]')) {
+      const kid = (el.getAttribute('data-defaultasin') || el.getAttribute('data-asin') || '').toUpperCase();
+      if (!/^[A-Z0-9]{10}$/.test(kid) || seenKids.has(kid)) continue;
+      seenKids.add(kid);
+      const label = (el.getAttribute('title') || el.textContent || '').replace(/\\s+/g, ' ').trim();
+      children.push({ asin: kid, label });
+    }
+  }
   return {
     title,
     price: priceEl ? priceEl.textContent.trim() : null,
     stars: starsEl ? starsEl.textContent.trim() : null,
     reviews: reviewsEl ? reviewsEl.textContent.trim() : null,
     availability: avail,
-    has_variations: !!variationHint,
+    has_variations: !!variationHint || children.length > 1,
     variation_labels: dimLabels,
     image_urls: imgs,
+    children,
   };
 }
 """
@@ -56,6 +77,11 @@ _PDP_EXTRACT_JS = """
 
 def fetch_product_offer(asin: str) -> OfferIn:
     """Load https://www.amazon.de/dp/{asin} and parse offer fields."""
+    offer, _html, _raw = _load_pdp(asin)
+    return offer
+
+
+def _load_pdp(asin: str) -> tuple[OfferIn, str, dict[str, Any]]:
     asin = asin.strip().upper()
     if len(asin) != 10:
         raise ValueError("ASIN must be 10 characters")
@@ -80,9 +106,13 @@ def fetch_product_offer(asin: str) -> OfferIn:
         if _looks_like_captcha(html):
             browser.close()
             raise RuntimeError("CAPTCHA on product page — try again later")
-        raw: dict[str, Any] = page.evaluate(_PDP_EXTRACT_JS)
+        raw: dict[str, Any] = page.evaluate(_PDP_EXTRACT_JS) or {}
         browser.close()
 
+    return _offer_from_raw(asin, url, raw), html, raw
+
+
+def _offer_from_raw(asin: str, url: str, raw: dict[str, Any]) -> OfferIn:
     price = parse_price_text(str(raw.get("price") or ""))
     if price is None:
         raise RuntimeError("Could not parse product price from Amazon page")
@@ -97,7 +127,7 @@ def fetch_product_offer(asin: str) -> OfferIn:
         labels = raw.get("variation_labels") or []
         note = (
             "This ASIN has variations (size/color). Price is for the selected/default child only. "
-            + ("Options seen: " + "; ".join(labels[:6]) if labels else "")
+            + ("Options seen: " + "; ".join(str(x) for x in labels[:6]) if labels else "")
         )
 
     return OfferIn(
@@ -113,7 +143,73 @@ def fetch_product_offer(asin: str) -> OfferIn:
         sold_by_amazon=False,
         seller_country=None,
         image_urls=[str(u) for u in (raw.get("image_urls") or []) if u],
+        parent_asin="",
+        variation_label="",
     )
+
+
+def fetch_variation_offers(
+    asin: str,
+    *,
+    max_children: int = MAX_VARIATION_CHILDREN,
+    pause_sec: float = _CHILD_PAUSE_SEC,
+) -> list[OfferIn]:
+    """Load the PDP; if Amazon has size/color children, fetch each child's price."""
+    asin = asin.strip().upper()
+    parent, children, html = _fetch_pdp_bundle(asin)
+    kids = _children_from_pdp(html, asin, children)
+    if not kids:
+        return [parent]
+
+    offers: list[OfferIn] = []
+    for kid in kids[: max(1, max_children)]:
+        if kid.asin == asin:
+            offer = parent.model_copy(
+                update={
+                    "parent_asin": asin,
+                    "variation_label": kid.label,
+                    "title": apply_variation_label(parent.title, kid.label),
+                }
+            )
+        else:
+            time.sleep(max(0.0, pause_sec))
+            try:
+                offer = fetch_product_offer(kid.asin)
+            except Exception:  # noqa: BLE001
+                continue
+            offer = offer.model_copy(
+                update={
+                    "parent_asin": asin,
+                    "variation_label": kid.label,
+                    "title": apply_variation_label(offer.title, kid.label),
+                    "stars": offer.stars if offer.stars is not None else parent.stars,
+                    "reviews": offer.reviews if offer.reviews is not None else parent.reviews,
+                }
+            )
+        offers.append(offer)
+    return offers or [parent]
+
+
+def _children_from_pdp(
+    html: str, current_asin: str, js_children: list[dict[str, Any]]
+) -> list[VariationChild]:
+    parsed = parse_variation_children(html, current_asin=current_asin)
+    if parsed:
+        return parsed
+    found: dict[str, str] = {}
+    for row in js_children:
+        child_asin = str(row.get("asin") or "").strip().upper()
+        if len(child_asin) != 10:
+            continue
+        found[child_asin] = str(row.get("label") or "").strip()
+    kids = [VariationChild(asin=a, label=found[a]) for a in found]
+    return kids if len(kids) > 1 else []
+
+
+def _fetch_pdp_bundle(asin: str) -> tuple[OfferIn, list[dict[str, Any]], str]:
+    offer, html, raw = _load_pdp(asin)
+    kids = raw.get("children") if isinstance(raw.get("children"), list) else []
+    return offer, [x for x in kids if isinstance(x, dict)], html
 
 
 def _looks_like_captcha(html: str) -> bool:

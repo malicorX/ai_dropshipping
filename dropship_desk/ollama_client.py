@@ -55,6 +55,9 @@ Produktfakten:
 - Extra-Hinweise: {bullets_hint or "—"}
 - Produktbild-URLs ({len(images)}): {json.dumps(images[:8], ensure_ascii=False)}
 
+Pflicht: Wenn Extra-Hinweise eine Variante/Größe/Farbe nennen, MUSS diese wörtlich im title stehen
+(z.B. „20 kg“, nicht die Geschwistervariante). Titel, Text und Lieferumfang nur für DIESE Variante.
+
 Gib genau ein JSON-Objekt mit diesen Keys zurück:
 {{
   "title": "eBay-Titel max 80 Zeichen, deutsch, verkaufsstark",

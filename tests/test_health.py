@@ -5,6 +5,8 @@ from dropship_desk.api import create_app
 
 def test_health_ok(tmp_path, monkeypatch):
     monkeypatch.setenv("DROPSHIP_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("EBAY_AUTOMATION_ENABLED", raising=False)
+    monkeypatch.delenv("AMAZON_AUTOMATION_ENABLED", raising=False)
     # Reload config paths used by db — set before create_app
     import dropship_desk.config as cfg
 

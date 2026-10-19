@@ -61,33 +61,73 @@ def ebay_auto_publish() -> bool:
     return _env_bool("EBAY_AUTO_PUBLISH", False)
 
 
+_ebay_env_override: str | None = None
+
+
+def normalize_ebay_env(raw: str | None) -> str:
+    value = (raw or "").strip().lower()
+    if value in ("production", "prod", "prd", "live"):
+        return "production"
+    return "sandbox"
+
+
+def set_ebay_env_override(env: str | None) -> str:
+    """Runtime target from Settings. None clears the override (fall back to EBAY_ENV)."""
+    global _ebay_env_override
+    if env is None or str(env).strip() == "":
+        _ebay_env_override = None
+    else:
+        _ebay_env_override = normalize_ebay_env(env)
+    return ebay_env()
+
+
 def ebay_env() -> str:
-    raw = os.environ.get("EBAY_ENV", "sandbox").strip().lower()
-    return "production" if raw in ("production", "prod", "prd") else "sandbox"
+    if _ebay_env_override in ("sandbox", "production"):
+        return _ebay_env_override
+    return normalize_ebay_env(os.environ.get("EBAY_ENV", "sandbox"))
 
 
-def ebay_app_id() -> str:
-    if ebay_env() == "production":
-        return os.environ.get("EBAY_PROD_APP_ID", "").strip()
-    return os.environ.get("EBAY_SANDBOX_APP_ID", "").strip()
+def _ebay_credential(env: str, sandbox_key: str, prod_key: str) -> str:
+    if normalize_ebay_env(env) == "production":
+        return os.environ.get(prod_key, "").strip()
+    return os.environ.get(sandbox_key, "").strip()
 
 
-def ebay_cert_id() -> str:
-    if ebay_env() == "production":
-        return os.environ.get("EBAY_PROD_CERT_ID", "").strip()
-    return os.environ.get("EBAY_SANDBOX_CERT_ID", "").strip()
+def ebay_app_id(env: str | None = None) -> str:
+    return _ebay_credential(env or ebay_env(), "EBAY_SANDBOX_APP_ID", "EBAY_PROD_APP_ID")
 
 
-def ebay_dev_id() -> str:
-    if ebay_env() == "production":
-        return os.environ.get("EBAY_PROD_DEV_ID", "").strip()
-    return os.environ.get("EBAY_SANDBOX_DEV_ID", "").strip()
+def ebay_cert_id(env: str | None = None) -> str:
+    return _ebay_credential(env or ebay_env(), "EBAY_SANDBOX_CERT_ID", "EBAY_PROD_CERT_ID")
 
 
-def ebay_runame() -> str:
-    if ebay_env() == "production":
-        return os.environ.get("EBAY_PROD_RUNAME", "").strip()
-    return os.environ.get("EBAY_SANDBOX_RUNAME", "").strip()
+def ebay_dev_id(env: str | None = None) -> str:
+    return _ebay_credential(env or ebay_env(), "EBAY_SANDBOX_DEV_ID", "EBAY_PROD_DEV_ID")
+
+
+def ebay_runame(env: str | None = None) -> str:
+    return _ebay_credential(env or ebay_env(), "EBAY_SANDBOX_RUNAME", "EBAY_PROD_RUNAME")
+
+
+def ebay_target_gaps(env: str | None = None) -> list[str]:
+    target = normalize_ebay_env(env) if env is not None else ebay_env()
+    if target == "production":
+        pairs = (
+            ("EBAY_PROD_APP_ID", ebay_app_id(target)),
+            ("EBAY_PROD_CERT_ID", ebay_cert_id(target)),
+            ("EBAY_PROD_RUNAME", ebay_runame(target)),
+        )
+    else:
+        pairs = (
+            ("EBAY_SANDBOX_APP_ID", ebay_app_id(target)),
+            ("EBAY_SANDBOX_CERT_ID", ebay_cert_id(target)),
+            ("EBAY_SANDBOX_RUNAME", ebay_runame(target)),
+        )
+    return [name for name, value in pairs if not value]
+
+
+def ebay_target_ready(env: str | None = None) -> bool:
+    return not ebay_target_gaps(env)
 
 
 def ebay_api_base() -> str:

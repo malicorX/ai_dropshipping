@@ -38,6 +38,16 @@ def test_ensure_brand_mpn_adds_pair():
     assert out["Herstellernummer"] == ["Nicht zutreffend"]
 
 
+def test_seller_hub_hidden_until_published(monkeypatch):
+    from dropship_desk.ebay.listing import seller_hub_url
+
+    monkeypatch.setenv("EBAY_ENV", "production")
+    assert seller_hub_url("unpublished") == ""
+    assert seller_hub_url("published") == "https://www.ebay.de/mys/active"
+    monkeypatch.setenv("EBAY_ENV", "sandbox")
+    assert seller_hub_url("published") == ""
+
+
 def test_sandbox_sell_allowed_without_flags(monkeypatch):
     monkeypatch.setenv("EBAY_ENV", "sandbox")
     monkeypatch.delenv("EBAY_AUTOMATION_ENABLED", raising=False)
@@ -179,6 +189,92 @@ def test_production_stage_forbidden_without_flags(tmp_path, monkeypatch):
     client = TestClient(create_app())
     r = client.post("/api/ebay/listings/B0TESTASI1/stage", json={})
     assert r.status_code == 403
+
+
+def test_production_stage_requires_confirm_live(tmp_path, monkeypatch):
+    import json
+
+    from fastapi.testclient import TestClient
+
+    import dropship_desk.config as cfg
+    from dropship_desk.api import create_app
+
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(cfg, "DB_PATH", tmp_path / "dropship.sqlite3")
+    monkeypatch.setenv("EBAY_ENV", "production")
+    monkeypatch.setenv("EBAY_AUTOMATION_ENABLED", "true")
+    monkeypatch.setenv("EBAY_ALLOW_LIST", "true")
+    (tmp_path / "ebay_oauth_production.json").write_text(
+        json.dumps({"refresh_token": "r", "access_token": "a"}),
+        encoding="utf-8",
+    )
+    client = TestClient(create_app())
+    r = client.post("/api/ebay/listings/B0TESTASI1/stage", json={})
+    assert r.status_code == 400
+    assert "confirm" in r.json()["detail"].lower()
+
+
+def test_target_switch_blocked_without_prod_keys(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import dropship_desk.config as cfg
+    from dropship_desk.api import create_app
+
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(cfg, "DB_PATH", tmp_path / "dropship.sqlite3")
+    monkeypatch.delenv("EBAY_PROD_APP_ID", raising=False)
+    monkeypatch.delenv("EBAY_PROD_CERT_ID", raising=False)
+    monkeypatch.delenv("EBAY_PROD_RUNAME", raising=False)
+    client = TestClient(create_app())
+    r = client.post("/api/ebay/target", json={"env": "production"})
+    assert r.status_code == 400
+    assert client.get("/api/health").json()["ebay"]["env"] == "sandbox"
+
+
+def test_target_switch_persists(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import dropship_desk.config as cfg
+    from dropship_desk.api import create_app
+
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(cfg, "DB_PATH", tmp_path / "dropship.sqlite3")
+    monkeypatch.setenv("EBAY_PROD_APP_ID", "prd-app")
+    monkeypatch.setenv("EBAY_PROD_CERT_ID", "prd-cert")
+    monkeypatch.setenv("EBAY_PROD_RUNAME", "prd-runame")
+    monkeypatch.setenv("EBAY_ENV", "sandbox")
+    client = TestClient(create_app())
+    r = client.post("/api/ebay/target", json={"env": "live"})
+    assert r.status_code == 200
+    assert r.json()["env"] == "production"
+    cfg.set_ebay_env_override(None)
+    client2 = TestClient(create_app())
+    assert client2.get("/api/health").json()["ebay"]["env"] == "production"
+
+
+def test_sandbox_and_production_listings_stay_separate(tmp_path, monkeypatch):
+    import dropship_desk.config as cfg
+    from dropship_desk.db import get_candidate_by_asin, save_ebay_listing
+
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(cfg, "DB_PATH", tmp_path / "dropship.sqlite3")
+    _seed_draft(tmp_path, monkeypatch)
+    save_ebay_listing(
+        "B0TESTASI1",
+        {"status": "published", "env": "sandbox", "offer_id": "sbx", "listing_id": "1"},
+    )
+    cfg.set_ebay_env_override("production")
+    save_ebay_listing(
+        "B0TESTASI1",
+        {"status": "unpublished", "env": "production", "offer_id": "prd", "listing_id": ""},
+    )
+    row = get_candidate_by_asin("B0TESTASI1")
+    assert row is not None
+    assert row["ebay_listing"]["offer_id"] == "prd"
+    cfg.set_ebay_env_override("sandbox")
+    row = get_candidate_by_asin("B0TESTASI1")
+    assert row is not None
+    assert row["ebay_listing"]["offer_id"] == "sbx"
 
 
 def test_inventory_description_stays_under_4000():

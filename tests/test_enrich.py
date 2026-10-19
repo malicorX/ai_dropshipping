@@ -28,19 +28,21 @@ def test_enrich_fills_missing_stars(tmp_path, monkeypatch):
         hard_reject=[],
     )
 
-    def fake_fetch(asin: str) -> OfferIn:
-        return OfferIn(
-            title="Enriched title",
-            amazon_total=38.0,
-            asin=asin,
-            url=f"https://www.amazon.de/dp/{asin}",
-            stars=4.7,
-            reviews=120,
-            price_source="pdp",
-            in_stock=True,
-        )
+    def fake_variations(asin: str) -> list[OfferIn]:
+        return [
+            OfferIn(
+                title="Enriched title",
+                amazon_total=38.0,
+                asin=asin,
+                url=f"https://www.amazon.de/dp/{asin}",
+                stars=4.7,
+                reviews=120,
+                price_source="pdp",
+                in_stock=True,
+            )
+        ]
 
-    monkeypatch.setattr("dropship_desk.enrich.fetch_product_offer", fake_fetch)
+    monkeypatch.setattr("dropship_desk.enrich.fetch_variation_offers", fake_variations)
     monkeypatch.setattr("dropship_desk.enrich.time.sleep", lambda _s: None)
 
     out = enrich_missing(limit=5, status="ready", pause_sec=0)

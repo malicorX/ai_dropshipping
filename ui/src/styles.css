@@ -1,15 +1,36 @@
 :root {
-  --bg: #1a1f1c;
-  --panel: #242b27;
+  --bg: #14241c;
+  --page-glow: #3d8b6e;
+  --panel: #1e3228;
   --text: #e8eee9;
   --muted: #9aab9f;
   --accent: #3d8b6e;
   --accent-dim: #2a5f4b;
   --danger: #c45c4a;
   --ok: #5fad7a;
-  --border: #354038;
+  --border: #3a5548;
   --font: "IBM Plex Sans", "Segoe UI", sans-serif;
   --mono: "IBM Plex Mono", Consolas, monospace;
+}
+
+html[data-ebay-target="sandbox"] {
+  --bg: #14241c;
+  --page-glow: #3d8b6e;
+  --panel: #1e3228;
+  --accent: #3d8b6e;
+  --accent-dim: #2a5f4b;
+  --border: #3a5548;
+}
+
+html[data-ebay-target="production"] {
+  --bg: #2a1412;
+  --page-glow: #8b3d38;
+  --panel: #3a221f;
+  --accent: #c45c4a;
+  --accent-dim: #6a322c;
+  --border: #5a3834;
+  --muted: #d4c4c0;
+  --text: #f6eeec;
 }
 
 * {
@@ -21,7 +42,7 @@ body,
 #root {
   margin: 0;
   min-height: 100%;
-  background: radial-gradient(1200px 600px at 10% -10%, #2a3a32 0%, var(--bg) 55%);
+  background: radial-gradient(1200px 600px at 10% -10%, var(--page-glow) 0%, var(--bg) 55%);
   color: var(--text);
   font-family: var(--font);
   /* Override pywebview's default user-select:none if injected */
@@ -77,6 +98,46 @@ header.top h1 {
 .health {
   font-size: 0.85rem;
   color: var(--muted);
+}
+
+.ebay-target-pill {
+  display: inline-block;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.ebay-target-pill.live {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 28%, transparent);
+  color: #f3c7c0;
+}
+
+.ebay-target {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.ebay-target button {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  padding: 0.45rem 0.9rem;
+}
+
+.ebay-target button.active {
+  background: var(--accent-dim);
+  color: var(--text);
+}
+
+.ebay-target button.active.live {
+  background: color-mix(in srgb, var(--danger) 40%, transparent);
+  color: #f3c7c0;
 }
 
 nav.tabs {
@@ -228,5 +289,32 @@ td {
 
 .error {
   color: #f0a89c;
-  margin-top: 0.75rem;
+  margin: 0 0 0.75rem;
+}
+
+.oauth-card {
+  background: color-mix(in srgb, var(--panel) 70%, black);
+  border: 1px solid var(--border);
+  padding: 0.85rem 1rem;
+  display: grid;
+  gap: 0.65rem;
+}
+
+.oauth-facts {
+  margin: 0;
+  padding-left: 1.1rem;
+  color: var(--text);
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+
+.hint {
+  margin: 0;
+  color: var(--text);
+  font-size: 0.85rem;
+  opacity: 0.9;
+}
+
+html[data-ebay-target="production"] button.linkish {
+  color: #f0b4aa;
 }

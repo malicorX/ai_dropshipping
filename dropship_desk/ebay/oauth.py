@@ -22,10 +22,29 @@ OAUTH_SCOPES = (
 )
 
 
-def token_path() -> Any:
+def token_path_for(env: str) -> Any:
     config.ensure_data_dir()
-    env = config.ebay_env()
-    return config.DATA_DIR / f"ebay_oauth_{env}.json"
+    return config.DATA_DIR / f"ebay_oauth_{config.normalize_ebay_env(env)}.json"
+
+
+def token_path() -> Any:
+    return token_path_for(config.ebay_env())
+
+
+def load_tokens_for(env: str) -> dict[str, Any]:
+    path = token_path_for(env)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def oauth_connected(env: str | None = None) -> bool:
+    tokens = load_tokens_for(env or config.ebay_env())
+    return bool(tokens.get("refresh_token"))
 
 
 def _mask(value: str, keep: int = 6) -> str:
@@ -53,6 +72,12 @@ def public_status() -> dict[str, Any]:
         "auto_publish": config.ebay_auto_publish(),
         "automation_enabled": config.ebay_automation_enabled(),
         "allow_list": config.ebay_allow_list(),
+        "sandbox_ready": config.ebay_target_ready("sandbox"),
+        "production_ready": config.ebay_target_ready("production"),
+        "sandbox_gaps": config.ebay_target_gaps("sandbox"),
+        "production_gaps": config.ebay_target_gaps("production"),
+        "sandbox_oauth_connected": oauth_connected("sandbox"),
+        "production_oauth_connected": oauth_connected("production"),
     }
 
 
@@ -74,18 +99,13 @@ def authorize_url() -> str:
         "redirect_uri": runame,
         "scope": OAUTH_SCOPES,
         "prompt": "login",
+        "state": config.ebay_env(),
     }
     return f"{config.ebay_auth_base()}/oauth2/authorize?{urlencode(params)}"
 
 
 def load_tokens() -> dict[str, Any]:
-    path = token_path()
-    if not path.is_file():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
+    return load_tokens_for(config.ebay_env())
 
 
 def save_tokens(payload: dict[str, Any]) -> None:
@@ -187,15 +207,22 @@ def _refresh_access_token(refresh_token: str) -> str:
     return token
 
 
-_app_token_cache: dict[str, Any] = {"token": "", "expires_at": 0.0}
+_app_token_cache: dict[str, Any] = {"token": "", "expires_at": 0.0, "env": ""}
+
+
+def clear_application_token_cache() -> None:
+    _app_token_cache["token"] = ""
+    _app_token_cache["expires_at"] = 0.0
+    _app_token_cache["env"] = ""
 
 
 def application_token() -> str:
     """Client-credentials token for Taxonomy (category suggestions)."""
     now = time.time()
+    env = config.ebay_env()
     cached = str(_app_token_cache.get("token") or "")
     expires_at = float(_app_token_cache.get("expires_at") or 0)
-    if cached and now < expires_at - 60:
+    if cached and _app_token_cache.get("env") == env and now < expires_at - 60:
         return cached
     with httpx.Client(timeout=30.0) as client:
         r = client.post(
@@ -217,4 +244,5 @@ def application_token() -> str:
         raise RuntimeError("eBay application token missing")
     _app_token_cache["token"] = token
     _app_token_cache["expires_at"] = now + float(payload.get("expires_in") or 7200)
+    _app_token_cache["env"] = env
     return token

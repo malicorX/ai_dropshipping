@@ -166,8 +166,9 @@ def upsert_candidate(
     offer: dict[str, Any],
     margin: dict[str, Any],
     hard_reject: list[str],
+    protect_workflow: bool = True,
 ) -> int:
-    """Insert or refresh by ASIN. Protects listed/drafted workflow status."""
+    """Insert or refresh by ASIN. Protects listed/drafted workflow status unless overridden."""
     init_db()
     now = _utc_now()
     asin = asin.strip().upper()
@@ -177,11 +178,11 @@ def upsert_candidate(
             (asin,),
         ).fetchone()
         if existing:
-            final_status = (
-                existing["status"]
-                if existing["status"] in _PROTECTED_STATUSES
-                else status
-            )
+            locked = existing["status"] in ("listed", "ebay_unpublished")
+            if locked or (protect_workflow and existing["status"] in _PROTECTED_STATUSES):
+                final_status = existing["status"]
+            else:
+                final_status = status
             conn.execute(
                 """
                 UPDATE candidates SET
@@ -328,23 +329,64 @@ def patch_candidate_offer(asin: str, offer_patch: dict[str, Any]) -> bool:
     return True
 
 
+def get_ebay_target() -> str | None:
+    init_db()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", ("ebay_target",)
+        ).fetchone()
+    if not row:
+        return None
+    raw = str(row["value"] or "").strip()
+    return config.normalize_ebay_env(raw) if raw else None
+
+
+def set_ebay_target(env: str) -> str:
+    """Persist Settings switch and apply it for this process (no restart)."""
+    from dropship_desk.ebay import oauth as ebay_oauth
+
+    normalized = config.normalize_ebay_env(env)
+    init_db()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO settings(key, value) VALUES(?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            ("ebay_target", normalized),
+        )
+    config.set_ebay_env_override(normalized)
+    ebay_oauth.clear_application_token_cache()
+    return normalized
+
+
+def apply_stored_ebay_target() -> str:
+    stored = get_ebay_target()
+    return config.set_ebay_env_override(stored)
+
+
 def save_ebay_listing(asin: str, listing: dict[str, Any]) -> None:
     init_db()
     now = _utc_now()
     asin = asin.strip().upper()
     status = str(listing.get("status") or "")
     workflow = "listed" if status == "published" else "ebay_unpublished"
+    env = str(listing.get("env") or config.ebay_env())
+    env = config.normalize_ebay_env(env)
     with connect() as conn:
+        row = conn.execute(
+            "SELECT ebay_listing_json FROM candidates WHERE asin = ?",
+            (asin,),
+        ).fetchone()
+        blob = _parse_ebay_listings(row["ebay_listing_json"] if row else "")
+        blob[env] = listing
         conn.execute(
             """
             UPDATE candidates
-            SET ebay_listing_json = ?, status = CASE
-                WHEN status = 'listed' AND ? != 'listed' THEN status
-                ELSE ?
-            END, updated_at = ?
+            SET ebay_listing_json = ?, status = ?, updated_at = ?
             WHERE asin = ?
             """,
-            (json.dumps(listing, ensure_ascii=False), workflow, workflow, now, asin),
+            (json.dumps(blob, ensure_ascii=False), workflow, now, asin),
         )
 
 
@@ -363,6 +405,28 @@ def get_listing_draft(asin: str) -> dict[str, Any] | None:
     return json.loads(raw)
 
 
+def _parse_ebay_listings(raw: str) -> dict[str, Any | None]:
+    empty: dict[str, Any | None] = {"sandbox": None, "production": None}
+    if not raw:
+        return empty
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    if "sandbox" in data or "production" in data:
+        sandbox = data.get("sandbox")
+        production = data.get("production")
+        return {
+            "sandbox": sandbox if isinstance(sandbox, dict) else None,
+            "production": production if isinstance(production, dict) else None,
+        }
+    env = config.normalize_ebay_env(str(data.get("env") or "sandbox"))
+    empty[env] = data
+    return empty
+
+
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     keys = set(row.keys())
     draft_raw = row["listing_draft_json"] if "listing_draft_json" in keys else ""
@@ -373,12 +437,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         except json.JSONDecodeError:
             draft = None
     ebay_raw = row["ebay_listing_json"] if "ebay_listing_json" in keys else ""
-    ebay_listing = None
-    if ebay_raw:
-        try:
-            ebay_listing = json.loads(ebay_raw)
-        except json.JSONDecodeError:
-            ebay_listing = None
+    ebay_listing = _parse_ebay_listings(ebay_raw).get(config.ebay_env())
     return {
         "id": row["id"],
         "asin": row["asin"],

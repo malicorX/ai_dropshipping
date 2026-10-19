@@ -15,3 +15,6 @@ playwright-browsers/
 
 # Local notes / proprietary seed — do not publish
 init/
+
+# Local credential notes - never commit
+INFO.txt

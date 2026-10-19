@@ -49,11 +49,11 @@ def save_listing_state(asin: str, state: dict[str, Any]) -> dict[str, Any]:
 
 
 def seller_hub_url(status: str) -> str:
-    """Browser page worth opening. Sandbox My eBay selling lists are broken; use the item URL after publish."""
-    if config.ebay_env() == "production":
-        if status == "published":
-            return "https://www.ebay.de/sh/lst/active"
-        return "https://www.ebay.de/sh/lst/draft"
+    """Unpublished Inventory offers are not Seller Hub drafts; that page 500s. After publish, My eBay."""
+    if config.ebay_env() != "production":
+        return ""
+    if status == "published":
+        return "https://www.ebay.de/mys/active"
     return ""
 
 
@@ -106,11 +106,21 @@ def stage_unpublished(
                 draft[key] = draft_patch[key]
     if not str(draft.get("title") or "").strip():
         raise RuntimeError("Generate a listing draft first")
+    rejects = [str(x) for x in (row.get("hard_reject_reasons") or [])]
+    if any("variation parent" in r.lower() for r in rejects):
+        raise RuntimeError(
+            "This ASIN is a variation parent. Send a child size/color row, not this one."
+        )
     price = float(row["ebay_price"])
     if price <= 0:
         raise RuntimeError("eBay price must be > 0")
 
     title = _clip(str(draft.get("title") or ""), 80)
+    variation_label = str((row.get("offer") or {}).get("variation_label") or "").strip()
+    if variation_label and variation_label.lower() not in title.lower():
+        raise RuntimeError(
+            f"Draft title is missing variation {variation_label!r} — regenerate the listing draft"
+        )
     description = str(draft.get("description_html") or "").strip()
     if not description:
         bullets = draft.get("bullet_points") or []

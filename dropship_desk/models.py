@@ -23,6 +23,8 @@ class OfferIn(BaseModel):
     note: str = ""
     image_urls: list[str] = Field(default_factory=list)
     local_images: list[dict[str, Any]] = Field(default_factory=list)
+    parent_asin: str = ""
+    variation_label: str = ""
 
 
 class EvaluateRequest(BaseModel):
