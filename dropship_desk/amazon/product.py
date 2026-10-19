@@ -137,9 +137,11 @@ def _check_failure_cap(asin: str) -> None:
     """Refuse fetches while the cap is open; half-open after the cooldown.
 
     The cap is not a permanent lockout: once CAP_COOLDOWN_SEC has elapsed since
-    the last terminal failure, the counter is reset and a probe attempt is
-    allowed.  A successful probe keeps the breaker closed; a failed one opens
-    it again for another cooldown.
+    the last terminal failure, the counter is lowered to
+    MAX_CONSECUTIVE_FAILURES - 1 and one probe attempt is allowed.  A successful
+    probe resets the counter; a failed probe increments it straight back to the
+    cap and stamps a fresh failure time, re-opening the breaker for another full
+    cooldown.
     """
     global _consecutive_failures, _last_terminal_failure_monotonic
     if _consecutive_failures < MAX_CONSECUTIVE_FAILURES:
@@ -148,7 +150,10 @@ def _check_failure_cap(asin: str) -> None:
     now = time.monotonic()
     last_failure = _last_terminal_failure_monotonic
     if last_failure is None or now - last_failure >= CAP_COOLDOWN_SEC:
-        _consecutive_failures = 0
+        # Half-open: leave exactly one failure's worth of headroom.  A probe
+        # success resets this to 0; a terminal probe failure takes it back to
+        # MAX_CONSECUTIVE_FAILURES and re-arms a fresh cooldown timestamp.
+        _consecutive_failures = MAX_CONSECUTIVE_FAILURES - 1
         _last_terminal_failure_monotonic = None
         return
 

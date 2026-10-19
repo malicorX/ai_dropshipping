@@ -507,6 +507,41 @@ def test_failure_cap_half_opens_after_cooldown(harness):
     assert harness.launches == 21
 
 
+def test_failed_half_open_probe_reopens_the_breaker(harness):
+    """One failed probe after the cooldown must reopen the breaker at once.
+
+    The half-open state leaves room for exactly one launch.  If that probe
+    fails terminally the counter must return to MAX_CONSECUTIVE_FAILURES and
+    stamp a fresh failure time, so the next call is refused without launching
+    instead of getting another full run of attempts.
+    """
+    harness.page = FakePage(html="<html>captcha</html>")
+
+    for _ in range(product.MAX_CONSECUTIVE_FAILURES):
+        with pytest.raises(RuntimeError) as excinfo:
+            product.fetch_product_offer(ASIN)
+        assert not isinstance(excinfo.value, product.AmazonUnreachable)
+
+    assert harness.launches == 20
+    assert product._consecutive_failures == product.MAX_CONSECUTIVE_FAILURES
+
+    # Cooldown elapsed: exactly one probe launch is allowed, and it fails.
+    harness.clock.now += product.CAP_COOLDOWN_SEC + 1
+    with pytest.raises(RuntimeError) as excinfo:
+        product.fetch_product_offer(ASIN)
+    assert not isinstance(excinfo.value, product.AmazonUnreachable)
+    assert "CAPTCHA" in str(excinfo.value)
+    assert harness.launches == 21
+    assert product._consecutive_failures == product.MAX_CONSECUTIVE_FAILURES
+
+    # The failed probe re-opened the breaker: no 22nd launch, even though the
+    # original cooldown is long past.
+    with pytest.raises(product.AmazonUnreachable) as excinfo:
+        product.fetch_product_offer(ASIN)
+    assert str(excinfo.value).startswith("AMAZON_UNREACHABLE: failure cap reached")
+    assert harness.launches == 21
+
+
 def _variation_parent_page() -> FakePage:
     raw = dict(RAW)
     raw["children"] = [
