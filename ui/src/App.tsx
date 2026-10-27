@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { rowDurationSeconds, uploadDurationStats } from "./uploadDuration";
 
-type Tab = "find" | "queue" | "list" | "upload" | "settings";
+type Tab = "find" | "queue" | "list" | "upload" | "prepared" | "settings";
 
 type Health = {
   status: string;
@@ -161,9 +161,32 @@ type UploadStatus = {
   running: boolean;
   stop_requested: boolean;
   phase: string;
+  mode: string;
   error: string;
   rows: UploadRow[];
   counters: Record<string, number>;
+};
+
+type PreparedItem = {
+  asin: string;
+  title: string;
+  ebay_price: number;
+  amazon_total: number;
+  margin: {
+    margin_pct?: number;
+    passed?: boolean;
+    fail_reasons?: string[];
+  };
+  prepared_at: string;
+  ebay_status: string;
+  offer_id: string;
+  age_days: number;
+};
+
+type PreparedOverview = {
+  target_env: string;
+  live_disabled: boolean;
+  items: PreparedItem[];
 };
 
 const UPLOAD_STATE_LABELS: Record<string, string> = {
@@ -171,10 +194,12 @@ const UPLOAD_STATE_LABELS: Record<string, string> = {
   fetching: "fetching",
   evaluated: "evaluated",
   drafted: "drafted",
+  prepared: "prepared",
   staged: "staged",
   published: "published",
   skipped_existing: "haben wir schon",
   already_listed: "haben wir schon",
+  not_prepared: "not prepared",
   not_found: "not found",
   rejected: "rejected",
   error: "error",
@@ -313,6 +338,7 @@ export default function App() {
             ["queue", "Queue"],
             ["list", "List on eBay"],
             ["upload", "Upload items"],
+            ["prepared", "Prepared"],
             ["settings", "Settings"],
           ] as const
         ).map(([id, label]) => (
@@ -354,6 +380,7 @@ export default function App() {
         <SettingsPanel onError={setError} health={health} refreshHealth={refreshHealth} />
       )}
       {tab === "upload" && <UploadItemsPanel onError={setError} />}
+      {tab === "prepared" && <PreparedPanel onError={setError} live={ebayLive} />}
     </div>
   );
 }
@@ -1502,6 +1529,63 @@ function DraftsPanel({
   );
 }
 
+function RunProgressTable({
+  rows,
+  running,
+  nowMs,
+}: {
+  rows: UploadRow[];
+  running: boolean;
+  nowMs: number;
+}) {
+  return (
+    <table>
+      <thead>
+        <tr>
+          <th>ASIN</th>
+          <th>State</th>
+          <th>Reason</th>
+          <th>Time</th>
+          <th>Offer</th>
+          <th>Sandbox item</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((row) => {
+          const bad = ["error", "rejected", "not_found"].includes(row.state);
+          const good = ["published", "prepared", "skipped_existing", "already_listed"].includes(
+            row.state,
+          );
+          return (
+            <tr key={row.line_no}>
+              <td className="mono">{row.asin || "—"}</td>
+              <td>
+                <span className={bad ? "badge fail" : good ? "badge ok" : "badge"}>
+                  {uploadStateLabel(row.state)}
+                </span>
+              </td>
+              <td>{row.reason || "—"}</td>
+              <td className="mono">
+                {formatDuration(rowDurationSeconds(row, nowMs, running))}
+              </td>
+              <td className="mono">{row.offer_id || "—"}</td>
+              <td>
+                {row.item_url ? (
+                  <a href={row.item_url} target="_blank" rel="noreferrer">
+                    {row.listing_id || "open"}
+                  </a>
+                ) : (
+                  row.listing_id || "—"
+                )}
+              </td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  );
+}
+
 function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
   const [preview, setPreview] = useState<UploadPreview | null>(null);
   const [status, setStatus] = useState<UploadStatus | null>(null);
@@ -1534,7 +1618,12 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
     return () => window.clearInterval(id);
   }, [loadPreview, loadStatus]);
 
-  const running = !!status?.running;
+  const anyRunning = !!status?.running;
+  // A publish run belongs to the Prepared tab; this panel renders progress and
+  // previews only for full and prepare runs.
+  const publishRunning = anyRunning && status?.mode === "publish";
+  const running = anyRunning && !publishRunning;
+  const hasUploadStatus = status?.mode === "full" || status?.mode === "prepare";
   const wasRunning = useRef(false);
 
   // Tick once a second so the running row's Time cell advances.
@@ -1563,22 +1652,23 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
   // When no run is active the badge must describe the current Settings
   // target, not the target_env remembered from the last run.
   const target = running ? status?.target_env || liveEnv : liveEnv;
-  const live = target === "production" || (!running && !!preview?.live_disabled);
-  const rows = status?.rows?.length ? status.rows : preview?.rows ?? [];
-  const counters = status?.counters ?? {};
+  const live = target === "production" || (!anyRunning && !!preview?.live_disabled);
+  const rows =
+    hasUploadStatus && status?.rows?.length ? status.rows : preview?.rows ?? [];
+  const counters = hasUploadStatus ? status?.counters ?? {} : {};
   const durationStats = uploadDurationStats(rows, nowMs, running);
 
-  async function start() {
+  async function start(mode: "full" | "prepare") {
     onError("");
-    setMsg("Starting…");
+    setMsg(mode === "prepare" ? "Preparing…" : "Starting…");
     setBusy(true);
     try {
       const next = await api<UploadStatus>("/api/upload-items/start", {
         method: "POST",
-        body: "{}",
+        body: JSON.stringify({ mode }),
       });
       setStatus(next);
-      setMsg(`Started ${next.run_id}`);
+      setMsg(`Started ${next.run_id} (${next.mode})`);
       await loadPreview();
     } catch (e) {
       const text = e instanceof Error ? e.message : String(e);
@@ -1617,8 +1707,8 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
       </div>
       {live ? (
         <p className="upload-warning">
-          Production target: upload-from-file is refused with LIVE_UPLOAD_DISABLED before any
-          network call. Switch to sandbox eBay in Settings to use it.
+          Production target: upload and prepare are refused with LIVE_UPLOAD_DISABLED before
+          any network call. Switch to sandbox eBay in Settings to use them.
         </p>
       ) : null}
       <div className="actions">
@@ -1628,12 +1718,19 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
         <button
           type="button"
           className="primary"
-          disabled={running || live || busy}
-          onClick={() => void start()}
+          disabled={anyRunning || live || busy}
+          onClick={() => void start("full")}
         >
-          {running ? "Uploading…" : "Start upload from file"}
+          {running && status?.mode !== "prepare" ? "Uploading…" : "Start upload from file"}
         </button>
-        {running ? (
+        <button
+          type="button"
+          disabled={anyRunning || live || busy}
+          onClick={() => void start("prepare")}
+        >
+          {running && status?.mode === "prepare" ? "Preparing…" : "Only prepare (no eBay)"}
+        </button>
+        {anyRunning ? (
           <button type="button" onClick={() => void stop()}>
             Stop
           </button>
@@ -1642,18 +1739,23 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
       </div>
       <p className="hint">
         One click starts the run at once. Items already listed are marked 'haben wir schon' and
-        not uploaded again.
+        not uploaded again. "Only prepare" fetches, evaluates and drafts without any eBay call —
+        publish later from the Prepared tab.
       </p>
       <p className="muted">
-        {running
-          ? `Run ${status?.run_id || "…"} · ${status?.phase || "starting"}`
-          : status?.run_id
-            ? `Last run ${status.run_id} · ${status.phase}`
-            : "No run yet."}
+        {publishRunning
+          ? "Publish run in progress, see the Prepared tab."
+          : running
+            ? `Run ${status?.run_id || "…"} · ${status?.phase || "starting"}`
+            : hasUploadStatus && status?.run_id
+              ? `Last run ${status.run_id} · ${status.phase}`
+              : status?.mode === "publish"
+                ? "Last run was a publish run, see the Prepared tab."
+                : "No run yet."}
         {counters.total
           ? ` · ${counters.done ?? 0}/${counters.total} done · ${counters.published ?? 0} published`
           : ""}
-        {status?.error ? ` · ${status.error}` : ""}
+        {hasUploadStatus && status?.error ? ` · ${status.error}` : ""}
       </p>
       {durationStats.processed > 0 ? (
         <p className="muted upload-duration-summary">
@@ -1661,49 +1763,265 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
           {formatDuration(durationStats.averageSec)}
         </p>
       ) : null}
+      <RunProgressTable rows={rows} running={running} nowMs={nowMs} />
+      {rows.length === 0 ? <p className="muted">No rows in the upload file.</p> : null}
+    </div>
+  );
+}
+
+function formatAgeDays(days: number): string {
+  if (!Number.isFinite(days)) {
+    return "—";
+  }
+  if (days < 1) {
+    return "<1 d";
+  }
+  return `${Math.floor(days)} d`;
+}
+
+function formatMarginPct(value: number | undefined): string {
+  if (value === undefined || !Number.isFinite(value)) {
+    return "—";
+  }
+  return `${(value * 100).toFixed(0)}%`;
+}
+
+function preparedStatusLabel(status: string): string {
+  if (status === "unpublished") {
+    return "staged (offer ready)";
+  }
+  if (status === "none") {
+    return "not on eBay";
+  }
+  return status || "—";
+}
+
+function PreparedPanel({
+  onError,
+  live,
+}: {
+  onError: (msg: string) => void;
+  live: boolean;
+}) {
+  const [overview, setOverview] = useState<PreparedOverview | null>(null);
+  const [status, setStatus] = useState<UploadStatus | null>(null);
+  const [selected, setSelected] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  const load = useCallback(async () => {
+    try {
+      const next = await api<PreparedOverview>("/api/prepared");
+      setOverview(next);
+      const stillThere = new Set(next.items.map((item) => item.asin));
+      setSelected((prev) => prev.filter((asin) => stillThere.has(asin)));
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    }
+  }, [onError]);
+
+  const loadStatus = useCallback(async () => {
+    try {
+      setStatus(await api<UploadStatus>("/api/upload-items/status"));
+    } catch {
+      /* header already reports an unreachable API */
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+    void loadStatus();
+    const id = window.setInterval(() => {
+      void loadStatus();
+    }, 2000);
+    return () => window.clearInterval(id);
+  }, [load, loadStatus]);
+
+  const running = !!status?.running;
+  const wasRunning = useRef(false);
+
+  // Tick once a second so the running row's Time cell advances.
+  useEffect(() => {
+    if (!running) {
+      return;
+    }
+    setNowMs(Date.now());
+    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [running]);
+
+  // Refresh the overview once a publish run we observed running has ended.
+  useEffect(() => {
+    if (running) {
+      wasRunning.current = true;
+      return;
+    }
+    if (wasRunning.current) {
+      wasRunning.current = false;
+      void load();
+    }
+  }, [running, load]);
+
+  const items = overview?.items ?? [];
+  const liveDisabled = live || !!overview?.live_disabled;
+  const allSelected = items.length > 0 && selected.length === items.length;
+  // Only publish-run rows belong here; full/prepare runs are shown on Upload.
+  const rows = status?.mode === "publish" ? status?.rows ?? [] : [];
+
+  function toggle(asin: string) {
+    setSelected((prev) =>
+      prev.includes(asin) ? prev.filter((value) => value !== asin) : [...prev, asin],
+    );
+  }
+
+  function toggleAll() {
+    setSelected(allSelected ? [] : items.map((item) => item.asin));
+  }
+
+  async function publish(asins: string[]) {
+    onError("");
+    setMsg("Starting…");
+    setBusy(true);
+    try {
+      const next = await api<UploadStatus>("/api/prepared/publish", {
+        method: "POST",
+        body: JSON.stringify({ asins }),
+      });
+      setStatus(next);
+      setMsg(`Started ${next.run_id}`);
+      setSelected([]);
+      await load();
+    } catch (e) {
+      const text = e instanceof Error ? e.message : String(e);
+      onError(text);
+      setMsg(text);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function stop() {
+    onError("");
+    try {
+      setStatus(
+        await api<UploadStatus>("/api/upload-items/stop", { method: "POST", body: "{}" }),
+      );
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  return (
+    <div className="panel grid upload-panel">
+      <div className="upload-head">
+        <div>
+          <h2>Prepared — built but not live</h2>
+          <p className="muted">
+            Everything that was fetched, evaluated and drafted but is not on eBay yet. Putting
+            an item live re-checks the Amazon price first and never regenerates the AI copy.
+          </p>
+        </div>
+        <span className={liveDisabled ? "upload-target live" : "upload-target"}>
+          {liveDisabled ? "LIVE disabled" : `-> ${overview?.target_env || "sandbox"} eBay`}
+        </span>
+      </div>
+      {liveDisabled ? (
+        <p className="upload-warning">
+          Production target: publishing is refused with LIVE_UPLOAD_DISABLED before any network
+          call. Switch to sandbox eBay in Settings to put prepared items live.
+        </p>
+      ) : null}
+      <div className="actions">
+        <button type="button" disabled={busy} onClick={() => void load()}>
+          Refresh
+        </button>
+        <button type="button" disabled={items.length === 0 || running} onClick={toggleAll}>
+          {allSelected ? "Select none" : "Select all"}
+        </button>
+        <button
+          type="button"
+          className="primary"
+          disabled={liveDisabled || running || busy || selected.length === 0}
+          onClick={() => void publish(selected)}
+        >
+          Put selected live ({selected.length})
+        </button>
+        <button
+          type="button"
+          disabled={liveDisabled || running || busy || items.length === 0}
+          onClick={() => void publish(items.map((item) => item.asin))}
+        >
+          Put all live
+        </button>
+        {running ? (
+          <button type="button" onClick={() => void stop()}>
+            Stop
+          </button>
+        ) : null}
+        {msg ? <span className="muted">{msg}</span> : null}
+      </div>
+      <p className="muted">
+        {status?.mode === "publish"
+          ? running
+            ? `Publish run ${status?.run_id || "…"} · ${status?.phase || "starting"}`
+            : status?.run_id
+              ? `Last run ${status.run_id} · ${status.phase}`
+              : "No publish run yet."
+          : running
+            ? "Upload run in progress, see the Upload items tab."
+            : "No publish run yet."}
+        {status?.mode === "publish" && status?.error ? ` · ${status.error}` : ""}
+      </p>
       <table>
         <thead>
           <tr>
+            <th>
+              <input
+                type="checkbox"
+                checked={allSelected}
+                onChange={toggleAll}
+                disabled={running}
+                aria-label="Select all prepared items"
+              />
+            </th>
             <th>ASIN</th>
-            <th>State</th>
-            <th>Reason</th>
-            <th>Time</th>
-            <th>Offer</th>
-            <th>Sandbox item</th>
+            <th>Title</th>
+            <th>Price</th>
+            <th>Margin</th>
+            <th>Status</th>
+            <th>Age</th>
           </tr>
         </thead>
         <tbody>
-          {rows.map((row) => {
-            const bad = ["error", "rejected", "not_found"].includes(row.state);
-            const good = ["published", "skipped_existing", "already_listed"].includes(row.state);
-            return (
-              <tr key={row.line_no}>
-                <td className="mono">{row.asin || "—"}</td>
-                <td>
-                  <span className={bad ? "badge fail" : good ? "badge ok" : "badge"}>
-                    {uploadStateLabel(row.state)}
-                  </span>
-                </td>
-                <td>{row.reason || "—"}</td>
-                <td className="mono">
-                  {formatDuration(rowDurationSeconds(row, nowMs, running))}
-                </td>
-                <td className="mono">{row.offer_id || "—"}</td>
-                <td>
-                  {row.item_url ? (
-                    <a href={row.item_url} target="_blank" rel="noreferrer">
-                      {row.listing_id || "open"}
-                    </a>
-                  ) : (
-                    row.listing_id || "—"
-                  )}
-                </td>
-              </tr>
-            );
-          })}
+          {items.map((item) => (
+            <tr key={item.asin}>
+              <td>
+                <input
+                  type="checkbox"
+                  checked={selected.includes(item.asin)}
+                  onChange={() => toggle(item.asin)}
+                  aria-label={`Select ${item.asin}`}
+                />
+              </td>
+              <td className="mono">{item.asin}</td>
+              <td>{item.title}</td>
+              <td className="mono">€{item.ebay_price.toFixed(2)}</td>
+              <td className="mono">{formatMarginPct(item.margin.margin_pct)}</td>
+              <td>{preparedStatusLabel(item.ebay_status)}</td>
+              <td className="mono">{formatAgeDays(item.age_days)}</td>
+            </tr>
+          ))}
         </tbody>
       </table>
-      {rows.length === 0 ? <p className="muted">No rows in the upload file.</p> : null}
+      {items.length === 0 ? (
+        <p className="muted">
+          Nothing prepared yet — use "Only prepare (no eBay)" on the Upload items tab.
+        </p>
+      ) : null}
+      {status?.mode === "publish" ? (
+        <RunProgressTable rows={rows} running={running} nowMs={nowMs} />
+      ) : null}
     </div>
   );
 }

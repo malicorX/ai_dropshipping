@@ -25,6 +25,7 @@ from dropship_desk.amazon.product import (
     fetch_variation_offers,
 )
 from dropship_desk.asin import extract_asin
+from dropship_desk.db import get_candidate_by_asin, save_listing_draft
 from dropship_desk.ebay import listing as ebay_listing
 from dropship_desk.ebay import oauth as ebay_oauth
 from dropship_desk.evaluate_service import run_evaluate
@@ -40,9 +41,11 @@ ROW_STATES = (
     "fetching",
     "evaluated",
     "drafted",
+    "prepared",
     "staged",
     "published",
     "skipped_existing",
+    "not_prepared",
     "not_found",
     "rejected",
     "error",
@@ -50,8 +53,23 @@ ROW_STATES = (
 )
 _TERMINAL_STATES = frozenset(ROW_STATES) - {"queued", "fetching"}
 EXISTING_REASON = "haben wir schon"
+PREPARED_REASON = "haben wir schon (vorbereitet)"
 TITLE_LIMIT = 80
 VARIATION_SEPARATOR = " - "
+_ASIN_RE = re.compile(r"^[A-Z0-9]{10}$")
+
+
+def normalize_asin(value: Any) -> str:
+    """Return a canonical ASIN for a string input, else an empty string.
+
+    Publishing accepts operator/API input, so this is the trust boundary: it
+    must never pass a path fragment such as ``../../ESCB3B6D7`` on to the
+    product-directory/listing-state helpers.
+    """
+    if not isinstance(value, str):
+        return ""
+    candidate = value.strip().upper()
+    return candidate if _ASIN_RE.fullmatch(candidate) else ""
 
 
 class UploadFileMissing(FileNotFoundError):
@@ -160,6 +178,26 @@ def mark_row_listed(row: UploadRow, state: dict[str, Any], *, row_state: str) ->
     row.item_url = _item_url(state)
 
 
+def draft_title_for(asin: str) -> str:
+    """The stored draft title for ``asin`` (empty when there is no draft)."""
+    row = get_candidate_by_asin(asin)
+    draft = (row or {}).get("listing_draft") or {}
+    if not isinstance(draft, dict):
+        return ""
+    return str(draft.get("title") or "").strip()
+
+
+def already_prepared(asin: str, env: str) -> bool:
+    """True when a draft exists and the ASIN is not published for ``env``.
+
+    This is a local, file/DB-only read: it lets a second prepare run skip the
+    ASIN before any Amazon fetch or LLM call.
+    """
+    if published_listing_state(asin, env) is not None:
+        return False
+    return bool(draft_title_for(asin))
+
+
 def upload_items_path() -> Path:
     """The operator file, honouring the UPLOAD_ITEMS_FILE override."""
     override = (os.environ.get("UPLOAD_ITEMS_FILE") or "").strip()
@@ -240,6 +278,7 @@ class UploadJobState:
     running: bool = False
     stop_requested: bool = False
     phase: str = "idle"
+    mode: str = "full"
     error: str = ""
     rows: list[UploadRow] = field(default_factory=list)
 
@@ -259,6 +298,7 @@ class UploadJobState:
             "running": self.running,
             "stop_requested": self.stop_requested,
             "phase": self.phase,
+            "mode": self.mode,
             "error": self.error,
             "rows": [row.to_dict() for row in self.rows],
             "counters": self.counters(),
@@ -308,7 +348,10 @@ class UploadJobManager:
         with self._lock:
             return self.state.to_dict()
 
-    def start(self) -> dict[str, Any]:
+    def start(self, mode: str = "full") -> dict[str, Any]:
+        mode = str(mode or "full").strip().lower()
+        if mode not in ("full", "prepare"):
+            raise ValueError(f"unknown upload mode {mode!r} (use 'full' or 'prepare')")
         env = config.ebay_env()
         if env == "production":
             raise LiveUploadDisabled(
@@ -319,7 +362,8 @@ class UploadJobManager:
             if self.state.running:
                 raise UploadAlreadyRunning(self.state.run_id)
             rows = read_upload_file()
-            if not ebay_oauth.oauth_connected(env):
+            # Prepare mode never talks to eBay, so it does not need OAuth.
+            if mode == "full" and not ebay_oauth.oauth_connected(env):
                 raise NotSignedIn(
                     "NOT_SIGNED_IN: connect the sandbox eBay account before uploading"
                 )
@@ -330,6 +374,78 @@ class UploadJobManager:
                 started_at=_utc_now(),
                 running=True,
                 phase="starting",
+                mode=mode,
+                rows=rows,
+            )
+
+        self._thread = threading.Thread(target=self._run, name="upload-items", daemon=True)
+        self._thread.start()
+        return self.status()
+
+    def start_publish(self, asins: list[str]) -> dict[str, Any]:
+        """Stage + publish already-prepared ASINs (sandbox only)."""
+        env = config.ebay_env()
+        if env == "production":
+            raise LiveUploadDisabled(
+                "LIVE_UPLOAD_DISABLED: live eBay uploads are disabled by the operator"
+            )
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        rows: list[UploadRow] = []
+        line_no = 0
+        for raw in asins or []:
+            line_no += 1
+            asin = normalize_asin(raw)
+            if not asin:
+                # Never let junk reach product_dir()/load_listing_state(): an
+                # invalid value is reported as a row and nothing else.
+                rows.append(
+                    UploadRow(
+                        line_no=line_no,
+                        line=str(raw),
+                        asin="",
+                        state="not_prepared",
+                        reason="invalid asin",
+                    )
+                )
+                continue
+            if asin in seen:
+                continue
+            seen.add(asin)
+            normalized.append(asin)
+            rows.append(
+                UploadRow(line_no=line_no, line=asin, asin=asin, state="queued")
+            )
+        if not normalized:
+            raise ValueError("asins required (non-empty list of valid ASINs)")
+
+        with self._lock:
+            if self.state.running:
+                raise UploadAlreadyRunning(self.state.run_id)
+            if not ebay_oauth.oauth_connected(env):
+                raise NotSignedIn(
+                    "NOT_SIGNED_IN: connect the sandbox eBay account before publishing"
+                )
+            # Local-only pre-checks: never fetch Amazon for a known or
+            # unprepared ASIN, and never fail the whole batch for it.
+            for row in rows:
+                if row.state != "queued":
+                    continue
+                existing = published_listing_state(row.asin, env)
+                if existing is not None:
+                    mark_row_listed(row, existing, row_state="skipped_existing")
+                elif not draft_title_for(row.asin):
+                    row.state = "not_prepared"
+                    row.reason = "not prepared (no draft)"
+            run_id = f"publish-{uuid.uuid4().hex[:12]}"
+            self.state = UploadJobState(
+                run_id=run_id,
+                target_env=env,
+                started_at=_utc_now(),
+                running=True,
+                phase="starting",
+                mode="publish",
                 rows=rows,
             )
 
@@ -399,8 +515,10 @@ class UploadJobManager:
 
     def _abort_target_changed(self, row: UploadRow) -> None:
         with self._lock:
-            if row.state not in _TERMINAL_STATES:
-                row.state = "error"
+            # A row that only got as far as drafting/staging is not a success:
+            # the batch aborted around it, so surface it as an error exactly
+            # like the systemic-abort path does.
+            row.state = "error"
             row.reason = "aborted_target_changed: eBay target changed during the run"
             self._stamp_finished(row)
             self.state.error = row.reason
@@ -450,6 +568,10 @@ class UploadJobManager:
         )
 
     def _process_row(self, row: UploadRow) -> None:
+        if self.state.mode == "publish":
+            self._process_publish_row(row)
+            return
+
         asin = row.asin
 
         # Mark known ASINs before the expensive Amazon work starts.  This is a
@@ -458,6 +580,17 @@ class UploadJobManager:
         if existing is not None:
             with self._lock:
                 mark_row_listed(row, existing, row_state="skipped_existing")
+                self._stamp_finished(row)
+            return
+
+        if self.state.mode == "prepare" and already_prepared(
+            asin, self.state.target_env
+        ):
+            # A previous prepare run already built the draft.  Skip before any
+            # Amazon fetch or LLM call.
+            with self._lock:
+                row.state = "skipped_existing"
+                row.reason = PREPARED_REASON
                 self._stamp_finished(row)
             return
 
@@ -548,12 +681,146 @@ class UploadJobManager:
         with self._lock:
             row.state = "drafted"
 
+        if self.state.mode == "prepare":
+            # Persist the (patched) draft and stop: no stage_unpublished, no
+            # publish_offer, no eBay/OAuth traffic at all.
+            self._save_prepared_draft(row, generated, title_patch)
+            return
+
         self._check_target()
         try:
             if title_patch is not None:
                 staged = ebay_listing.stage_unpublished(asin, draft_patch=title_patch)
             else:
                 staged = ebay_listing.stage_unpublished(asin)
+        except Exception as exc:  # noqa: BLE001
+            if _is_live_write_blocked(exc) or config.ebay_env() != self.state.target_env:
+                raise _TargetChanged(_reason(exc)) from exc
+            self._finish(row, "error", _reason(exc))
+            return
+        with self._lock:
+            row.offer_id = str(staged.get("offer_id") or "")
+            row.state = "staged"
+
+        self._check_target()
+        try:
+            published = ebay_listing.publish_offer(asin)
+        except Exception as exc:  # noqa: BLE001
+            if _is_live_write_blocked(exc) or config.ebay_env() != self.state.target_env:
+                raise _TargetChanged(_reason(exc)) from exc
+            self._finish(row, "error", _reason(exc))
+            return
+        with self._lock:
+            row.offer_id = str(published.get("offer_id") or row.offer_id)
+            row.listing_id = str(published.get("listing_id") or "")
+            row.item_url = str(published.get("item_url") or "")
+            row.state = "published"
+            self._stamp_finished(row)
+
+    def _save_prepared_draft(
+        self, row: UploadRow, generated: Any, title_patch: dict[str, Any] | None
+    ) -> None:
+        """Store the generated draft (with the deterministic title patch)."""
+        draft = generated.get("draft") if isinstance(generated, dict) else None
+        if not isinstance(draft, dict) or not str(draft.get("title") or "").strip():
+            self._finish(row, "error", "draft missing title")
+            return
+        stored = dict(draft)
+        if title_patch:
+            stored.update(title_patch)
+        try:
+            save_listing_draft(row.asin, stored)
+        except Exception as exc:  # noqa: BLE001
+            self._finish(row, "error", _reason(exc))
+            return
+        self._finish(row, "prepared", "")
+
+    def _process_publish_row(self, row: UploadRow) -> None:
+        """Re-check the price, then stage + publish an already-prepared ASIN."""
+        asin = row.asin
+
+        existing = published_listing_state(asin, self.state.target_env)
+        if existing is not None:
+            with self._lock:
+                mark_row_listed(row, existing, row_state="skipped_existing")
+                self._stamp_finished(row)
+            return
+
+        if not draft_title_for(asin):
+            with self._lock:
+                row.state = "not_prepared"
+                row.reason = "not prepared (no draft)"
+                self._stamp_finished(row)
+            return
+
+        candidate = get_candidate_by_asin(asin) or {}
+        stored_price = candidate.get("ebay_price")
+        prepared_price = float(stored_price) if stored_price is not None else None
+
+        with self._lock:
+            row.state = "fetching"
+            row.reason = ""
+
+        try:
+            offer = self._fetch_offer(asin)
+        except VariationParentError:
+            self._finish(row, "rejected", "variation_parent")
+            return
+        except Exception as exc:  # noqa: BLE001 - classified below
+            if _is_not_found(exc):
+                self._finish(row, "not_found", _reason(exc) or "ASIN_NOT_FOUND")
+                return
+            if _is_systemic(exc):
+                raise _AbortRun(_reason(exc)) from exc
+            self._finish(row, "error", _reason(exc))
+            return
+
+        # Price re-check: never publish on a stale margin.  The candidate's
+        # prepared sale price is authoritative; run_evaluate() must not quietly
+        # replace it with a higher suggestion.  The draft itself is not
+        # regenerated (that already happened in prepare mode).
+        try:
+            evaluation = run_evaluate(
+                EvaluateRequest(
+                    asin_or_url=asin,
+                    offer=offer,
+                    ebay_price=prepared_price,
+                    save=True,
+                ),
+                persist="always",
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._finish(row, "error", _reason(exc))
+            return
+
+        if not evaluation.passed:
+            reasons = list(evaluation.hard_reject_reasons)
+            reasons.extend(str(x) for x in (evaluation.margin.get("fail_reasons") or []))
+            if prepared_price is not None and evaluation.margin.get("fail_reasons"):
+                reason = (
+                    f"price changed: prepared {prepared_price:.2f} EUR no longer "
+                    f"passes the margin gate (Amazon now {float(offer.amazon_total):.2f})"
+                )
+                if reasons:
+                    reason = f"{reason}: {'; '.join(reasons)}"
+            else:
+                reason = "; ".join(reasons) or "margin gate failed"
+            self._finish(row, "rejected", reason)
+            return
+
+        with self._lock:
+            row.state = "evaluated"
+
+        self._check_target()
+        existing = published_listing_state(asin, self.state.target_env)
+        if existing is not None:
+            with self._lock:
+                mark_row_listed(row, existing, row_state="skipped_existing")
+                self._stamp_finished(row)
+            return
+
+        try:
+            staged = ebay_listing.stage_unpublished(asin)
         except Exception as exc:  # noqa: BLE001
             if _is_live_write_blocked(exc) or config.ebay_env() != self.state.target_env:
                 raise _TargetChanged(_reason(exc)) from exc
