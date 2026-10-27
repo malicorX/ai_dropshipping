@@ -563,7 +563,7 @@ def _data_listing(path: Path) -> list[str]:
     return sorted(entry.name for entry in path.iterdir())
 
 
-@pytest.mark.parametrize("bad", ["../../ESCB3B6D7", {"a": 1}, None, "not-an-asin", 12345])
+@pytest.mark.parametrize("bad", ["../../ESCB3B6D7", "../../B0VALID001", {"a": 1}, None, "not-an-asin", 12345, 1234567890])
 def test_publish_all_invalid_asins_is_400_and_creates_nothing(
     client, tmp_path, monkeypatch, bad
 ):

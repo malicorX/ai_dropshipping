@@ -518,11 +518,7 @@ class UploadJobManager:
             # A row that only got as far as drafting/staging is not a success:
             # the batch aborted around it, so surface it as an error exactly
             # like the systemic-abort path does.
-            if (
-                row.state in {"drafted", "staged"}
-                or row.state not in _TERMINAL_STATES
-            ):
-                row.state = "error"
+            row.state = "error"
             row.reason = "aborted_target_changed: eBay target changed during the run"
             self._stamp_finished(row)
             self.state.error = row.reason
@@ -800,7 +796,7 @@ class UploadJobManager:
         if not evaluation.passed:
             reasons = list(evaluation.hard_reject_reasons)
             reasons.extend(str(x) for x in (evaluation.margin.get("fail_reasons") or []))
-            if prepared_price is not None:
+            if prepared_price is not None and evaluation.margin.get("fail_reasons"):
                 reason = (
                     f"price changed: prepared {prepared_price:.2f} EUR no longer "
                     f"passes the margin gate (Amazon now {float(offer.amazon_total):.2f})"
