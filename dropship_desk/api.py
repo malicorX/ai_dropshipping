@@ -39,6 +39,7 @@ from dropship_desk.product_media import (
 )
 from dropship_desk.reprice import reprice_candidates
 from dropship_desk.evaluate_service import run_evaluate
+from dropship_desk.prepared import overview as prepared_overview
 from dropship_desk.variation_expand import persist_variation_offers
 from dropship_desk.find_job import FIND_JOB
 from dropship_desk.listing_template import (
@@ -361,9 +362,10 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/api/upload-items/start")
-    def upload_items_start() -> dict:
+    def upload_items_start(body: dict | None = None) -> dict:
+        mode = str((body or {}).get("mode") or "full").strip().lower()
         try:
-            return UPLOAD_JOB.start()
+            return UPLOAD_JOB.start(mode=mode)
         except LiveUploadDisabled:
             return JSONResponse(
                 status_code=403,
@@ -383,6 +385,39 @@ def create_app() -> FastAPI:
             raise HTTPException(
                 status_code=404, detail=f"UPLOAD_FILE_MISSING: {e.path}"
             ) from e
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+    @app.get("/api/prepared")
+    def prepared_items() -> dict:
+        """Local overview of drafted items that are not live yet."""
+        return prepared_overview()
+
+    @app.post("/api/prepared/publish")
+    def prepared_publish(body: dict | None = None) -> dict:
+        raw_asins = (body or {}).get("asins")
+        asins = [str(asin) for asin in raw_asins] if isinstance(raw_asins, list) else []
+        if not asins:
+            raise HTTPException(status_code=400, detail="asins required (non-empty list)")
+        try:
+            return UPLOAD_JOB.start_publish(asins)
+        except LiveUploadDisabled:
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "code": "LIVE_UPLOAD_DISABLED",
+                    "detail": (
+                        "LIVE_UPLOAD_DISABLED: publishing refuses production; "
+                        "switch to sandbox first (no live eBay write was attempted)"
+                    ),
+                },
+            )
+        except UploadAlreadyRunning as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        except NotSignedIn as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
     @app.get("/api/upload-items/status")
     def upload_items_status() -> dict:
