@@ -1618,7 +1618,12 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
     return () => window.clearInterval(id);
   }, [loadPreview, loadStatus]);
 
-  const running = !!status?.running;
+  const anyRunning = !!status?.running;
+  // A publish run belongs to the Prepared tab; this panel renders progress and
+  // previews only for full and prepare runs.
+  const publishRunning = anyRunning && status?.mode === "publish";
+  const running = anyRunning && !publishRunning;
+  const hasUploadStatus = status?.mode === "full" || status?.mode === "prepare";
   const wasRunning = useRef(false);
 
   // Tick once a second so the running row's Time cell advances.
@@ -1647,9 +1652,10 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
   // When no run is active the badge must describe the current Settings
   // target, not the target_env remembered from the last run.
   const target = running ? status?.target_env || liveEnv : liveEnv;
-  const live = target === "production" || (!running && !!preview?.live_disabled);
-  const rows = status?.rows?.length ? status.rows : preview?.rows ?? [];
-  const counters = status?.counters ?? {};
+  const live = target === "production" || (!anyRunning && !!preview?.live_disabled);
+  const rows =
+    hasUploadStatus && status?.rows?.length ? status.rows : preview?.rows ?? [];
+  const counters = hasUploadStatus ? status?.counters ?? {} : {};
   const durationStats = uploadDurationStats(rows, nowMs, running);
 
   async function start(mode: "full" | "prepare") {
@@ -1712,19 +1718,19 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
         <button
           type="button"
           className="primary"
-          disabled={running || live || busy}
+          disabled={anyRunning || live || busy}
           onClick={() => void start("full")}
         >
           {running && status?.mode !== "prepare" ? "Uploading…" : "Start upload from file"}
         </button>
         <button
           type="button"
-          disabled={running || live || busy}
+          disabled={anyRunning || live || busy}
           onClick={() => void start("prepare")}
         >
           {running && status?.mode === "prepare" ? "Preparing…" : "Only prepare (no eBay)"}
         </button>
-        {running ? (
+        {anyRunning ? (
           <button type="button" onClick={() => void stop()}>
             Stop
           </button>
@@ -1737,15 +1743,19 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
         publish later from the Prepared tab.
       </p>
       <p className="muted">
-        {running
-          ? `Run ${status?.run_id || "…"} · ${status?.phase || "starting"}`
-          : status?.run_id
-            ? `Last run ${status.run_id} · ${status.phase}`
-            : "No run yet."}
+        {publishRunning
+          ? "Publish run in progress, see the Prepared tab."
+          : running
+            ? `Run ${status?.run_id || "…"} · ${status?.phase || "starting"}`
+            : hasUploadStatus && status?.run_id
+              ? `Last run ${status.run_id} · ${status.phase}`
+              : status?.mode === "publish"
+                ? "Last run was a publish run, see the Prepared tab."
+                : "No run yet."}
         {counters.total
           ? ` · ${counters.done ?? 0}/${counters.total} done · ${counters.published ?? 0} published`
           : ""}
-        {status?.error ? ` · ${status.error}` : ""}
+        {hasUploadStatus && status?.error ? ` · ${status.error}` : ""}
       </p>
       {durationStats.processed > 0 ? (
         <p className="muted upload-duration-summary">
@@ -1856,7 +1866,8 @@ function PreparedPanel({
   const items = overview?.items ?? [];
   const liveDisabled = live || !!overview?.live_disabled;
   const allSelected = items.length > 0 && selected.length === items.length;
-  const rows = status?.rows ?? [];
+  // Only publish-run rows belong here; full/prepare runs are shown on Upload.
+  const rows = status?.mode === "publish" ? status?.rows ?? [] : [];
 
   function toggle(asin: string) {
     setSelected((prev) =>
@@ -1951,12 +1962,16 @@ function PreparedPanel({
         {msg ? <span className="muted">{msg}</span> : null}
       </div>
       <p className="muted">
-        {running
-          ? `Publish run ${status?.run_id || "…"} · ${status?.phase || "starting"}`
-          : status?.run_id
-            ? `Last run ${status.run_id} · ${status.phase}`
+        {status?.mode === "publish"
+          ? running
+            ? `Publish run ${status?.run_id || "…"} · ${status?.phase || "starting"}`
+            : status?.run_id
+              ? `Last run ${status.run_id} · ${status.phase}`
+              : "No publish run yet."
+          : running
+            ? "Upload run in progress, see the Upload items tab."
             : "No publish run yet."}
-        {status?.error ? ` · ${status.error}` : ""}
+        {status?.mode === "publish" && status?.error ? ` · ${status.error}` : ""}
       </p>
       <table>
         <thead>
@@ -1966,6 +1981,7 @@ function PreparedPanel({
                 type="checkbox"
                 checked={allSelected}
                 onChange={toggleAll}
+                disabled={running}
                 aria-label="Select all prepared items"
               />
             </th>
@@ -2003,7 +2019,9 @@ function PreparedPanel({
           Nothing prepared yet — use "Only prepare (no eBay)" on the Upload items tab.
         </p>
       ) : null}
-      <RunProgressTable rows={rows} running={running} nowMs={nowMs} />
+      {status?.mode === "publish" ? (
+        <RunProgressTable rows={rows} running={running} nowMs={nowMs} />
+      ) : null}
     </div>
   );
 }

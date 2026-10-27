@@ -56,6 +56,20 @@ EXISTING_REASON = "haben wir schon"
 PREPARED_REASON = "haben wir schon (vorbereitet)"
 TITLE_LIMIT = 80
 VARIATION_SEPARATOR = " - "
+_ASIN_RE = re.compile(r"^[A-Z0-9]{10}$")
+
+
+def normalize_asin(value: Any) -> str:
+    """Return a canonical ASIN for a string input, else an empty string.
+
+    Publishing accepts operator/API input, so this is the trust boundary: it
+    must never pass a path fragment such as ``../../ESCB3B6D7`` on to the
+    product-directory/listing-state helpers.
+    """
+    if not isinstance(value, str):
+        return ""
+    candidate = value.strip().upper()
+    return candidate if _ASIN_RE.fullmatch(candidate) else ""
 
 
 class UploadFileMissing(FileNotFoundError):
@@ -378,14 +392,33 @@ class UploadJobManager:
 
         normalized: list[str] = []
         seen: set[str] = set()
+        rows: list[UploadRow] = []
+        line_no = 0
         for raw in asins or []:
-            asin = str(raw or "").strip().upper()
-            if not asin or asin in seen:
+            line_no += 1
+            asin = normalize_asin(raw)
+            if not asin:
+                # Never let junk reach product_dir()/load_listing_state(): an
+                # invalid value is reported as a row and nothing else.
+                rows.append(
+                    UploadRow(
+                        line_no=line_no,
+                        line=str(raw),
+                        asin="",
+                        state="not_prepared",
+                        reason="invalid asin",
+                    )
+                )
+                continue
+            if asin in seen:
                 continue
             seen.add(asin)
             normalized.append(asin)
+            rows.append(
+                UploadRow(line_no=line_no, line=asin, asin=asin, state="queued")
+            )
         if not normalized:
-            raise ValueError("asins required (non-empty list)")
+            raise ValueError("asins required (non-empty list of valid ASINs)")
 
         with self._lock:
             if self.state.running:
@@ -394,13 +427,11 @@ class UploadJobManager:
                 raise NotSignedIn(
                     "NOT_SIGNED_IN: connect the sandbox eBay account before publishing"
                 )
-            rows = [
-                UploadRow(line_no=index, line=asin, asin=asin, state="queued")
-                for index, asin in enumerate(normalized, start=1)
-            ]
             # Local-only pre-checks: never fetch Amazon for a known or
             # unprepared ASIN, and never fail the whole batch for it.
             for row in rows:
+                if row.state != "queued":
+                    continue
                 existing = published_listing_state(row.asin, env)
                 if existing is not None:
                     mark_row_listed(row, existing, row_state="skipped_existing")
@@ -484,7 +515,13 @@ class UploadJobManager:
 
     def _abort_target_changed(self, row: UploadRow) -> None:
         with self._lock:
-            if row.state not in _TERMINAL_STATES:
+            # A row that only got as far as drafting/staging is not a success:
+            # the batch aborted around it, so surface it as an error exactly
+            # like the systemic-abort path does.
+            if (
+                row.state in {"drafted", "staged"}
+                or row.state not in _TERMINAL_STATES
+            ):
                 row.state = "error"
             row.reason = "aborted_target_changed: eBay target changed during the run"
             self._stamp_finished(row)
@@ -720,6 +757,10 @@ class UploadJobManager:
                 self._stamp_finished(row)
             return
 
+        candidate = get_candidate_by_asin(asin) or {}
+        stored_price = candidate.get("ebay_price")
+        prepared_price = float(stored_price) if stored_price is not None else None
+
         with self._lock:
             row.state = "fetching"
             row.reason = ""
@@ -738,11 +779,18 @@ class UploadJobManager:
             self._finish(row, "error", _reason(exc))
             return
 
-        # Price re-check: never publish on a stale margin.  The draft itself is
-        # not regenerated (that already happened in prepare mode).
+        # Price re-check: never publish on a stale margin.  The candidate's
+        # prepared sale price is authoritative; run_evaluate() must not quietly
+        # replace it with a higher suggestion.  The draft itself is not
+        # regenerated (that already happened in prepare mode).
         try:
             evaluation = run_evaluate(
-                EvaluateRequest(asin_or_url=asin, offer=offer, save=True),
+                EvaluateRequest(
+                    asin_or_url=asin,
+                    offer=offer,
+                    ebay_price=prepared_price,
+                    save=True,
+                ),
                 persist="always",
             )
         except Exception as exc:  # noqa: BLE001
@@ -752,7 +800,16 @@ class UploadJobManager:
         if not evaluation.passed:
             reasons = list(evaluation.hard_reject_reasons)
             reasons.extend(str(x) for x in (evaluation.margin.get("fail_reasons") or []))
-            self._finish(row, "rejected", "; ".join(reasons) or "margin gate failed")
+            if prepared_price is not None:
+                reason = (
+                    f"price changed: prepared {prepared_price:.2f} EUR no longer "
+                    f"passes the margin gate (Amazon now {float(offer.amazon_total):.2f})"
+                )
+                if reasons:
+                    reason = f"{reason}: {'; '.join(reasons)}"
+            else:
+                reason = "; ".join(reasons) or "margin gate failed"
+            self._finish(row, "rejected", reason)
             return
 
         with self._lock:

@@ -57,12 +57,11 @@ def _draft_title(draft: Any) -> str:
 
 
 def list_prepared(
-    env: str | None = None,
     *,
     now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Every drafted candidate whose current-env listing is not published."""
-    target = (env or config.ebay_env() or "sandbox").strip()
+    target = (config.ebay_env() or "sandbox").strip()
     current = now or _now()
     items: list[dict[str, Any]] = []
     for row in list_candidates(limit=_CANDIDATE_LIMIT):
@@ -92,11 +91,11 @@ def list_prepared(
     return items
 
 
-def overview(env: str | None = None) -> dict[str, Any]:
-    """Payload for GET /api/prepared (local only)."""
-    target = (env or config.ebay_env() or "sandbox").strip()
+def overview() -> dict[str, Any]:
+    """Payload for GET /api/prepared (local only, always current env)."""
+    target = (config.ebay_env() or "sandbox").strip()
     return {
         "target_env": target,
         "live_disabled": target == "production",
-        "items": list_prepared(target),
+        "items": list_prepared(),
     }

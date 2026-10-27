@@ -554,3 +554,359 @@ def test_publish_reuses_single_flight_lock(client, monkeypatch):
         release.set()
     status = _wait_done(client)
     assert status["rows"][0]["state"] == "published"
+
+
+# ------------------------------------------------- hardening: ASIN validation
+
+
+def _data_listing(path: Path) -> list[str]:
+    return sorted(entry.name for entry in path.iterdir())
+
+
+@pytest.mark.parametrize("bad", ["../../ESCB3B6D7", {"a": 1}, None, "not-an-asin", 12345])
+def test_publish_all_invalid_asins_is_400_and_creates_nothing(
+    client, tmp_path, monkeypatch, bad
+):
+    calls = _install_stubs(monkeypatch)
+    before = _data_listing(tmp_path)
+
+    r = client.post("/api/prepared/publish", json={"asins": [bad]})
+
+    assert r.status_code == 400
+    assert _data_listing(tmp_path) == before
+    assert not (tmp_path / "products").exists()
+    for name, seen in calls.items():
+        assert seen == [], f"{name} was called for an invalid ASIN: {seen}"
+    assert client.get("/api/upload-items/status").json()["running"] is False
+
+
+def test_publish_invalid_asin_becomes_not_prepared_and_never_touches_disk(
+    client, tmp_path, monkeypatch
+):
+    valid = "B0VALID001"
+    _seed_prepared(valid)
+    calls = _install_stubs(monkeypatch)
+    before = _data_listing(tmp_path)
+
+    r = client.post(
+        "/api/prepared/publish",
+        json={"asins": ["../../ESCB3B6D7", {"a": 1}, None, valid]},
+    )
+
+    assert r.status_code == 200
+    status = _wait_done(client)
+    invalid_rows = [row for row in status["rows"] if row["asin"] != valid]
+    assert len(invalid_rows) == 3
+    for row in invalid_rows:
+        assert row["state"] == "not_prepared"
+        assert row["reason"] == "invalid asin"
+        assert row["asin"] == ""
+    states = {row["asin"]: row["state"] for row in status["rows"] if row["asin"]}
+    assert states == {valid: "published"}
+    assert calls["fetch"] == [valid]
+    # The only new directory is the legitimate product dir for the valid ASIN.
+    after = set(_data_listing(tmp_path))
+    assert after - set(before) == {"products"}
+    assert sorted(p.name for p in (tmp_path / "products").iterdir()) == [valid]
+
+
+# --------------------------------------- hardening: publish uses prepared price
+
+
+def _install_real_evaluate_with_ebay_spies(monkeypatch, *, total: float):
+    """Real run_evaluate; only the Amazon fetch and eBay writes are stubbed."""
+    calls: dict[str, list[str]] = {
+        "fetch": [],
+        "stage": [],
+        "publish": [],
+        "order": [],
+    }
+
+    def fake_offers(asin: str) -> list[OfferIn]:
+        calls["fetch"].append(asin)
+        return [_offer(asin, total=total)]
+
+    def fake_stage(asin, draft_patch=None):
+        calls["stage"].append(asin)
+        calls["order"].append("stage")
+        ebay_listing.save_listing_state(
+            asin,
+            {"status": "unpublished", "offer_id": f"OFF-{asin}", "listing_id": ""},
+        )
+        return ebay_listing.public_listing(asin)
+
+    def fake_publish(asin):
+        calls["publish"].append(asin)
+        calls["order"].append("publish")
+        state = ebay_listing.load_listing_state(asin)
+        ebay_listing.save_listing_state(
+            asin,
+            {
+                **state,
+                "status": "published",
+                "listing_id": f"1100{asin}",
+                "offer_id": state.get("offer_id") or f"OFF-{asin}",
+            },
+        )
+        return ebay_listing.public_listing(asin)
+
+    monkeypatch.setattr(upload_items, "fetch_variation_offers", fake_offers)
+    monkeypatch.setattr(upload_items.ebay_listing, "stage_unpublished", fake_stage)
+    monkeypatch.setattr(upload_items.ebay_listing, "publish_offer", fake_publish)
+    return calls
+
+
+def test_publish_rejects_when_amazon_price_rose_against_prepared_price(
+    client, monkeypatch
+):
+    asin = "B0PRICE001"
+    _seed_prepared(asin)  # stored amazon 20 / prepared eBay price 50
+    calls = _install_real_evaluate_with_ebay_spies(monkeypatch, total=45.0)
+
+    r = client.post("/api/prepared/publish", json={"asins": [asin]})
+
+    assert r.status_code == 200
+    status = _wait_done(client)
+    row = status["rows"][0]
+    assert row["state"] == "rejected"
+    assert "price changed" in row["reason"]
+    assert "prepared 50.00 EUR" in row["reason"]
+    assert "Amazon now 45.00" in row["reason"]
+    assert calls["stage"] == []
+    assert calls["publish"] == []
+    assert calls["order"] == []
+    stored = db.get_candidate_by_asin(asin)
+    assert stored is not None
+    assert stored["ebay_price"] == 50.0
+
+
+def test_publish_still_fine_price_publishes_at_prepared_price(client, monkeypatch):
+    asin = "B0PRICE002"
+    _seed_prepared(asin)  # stored amazon 20 / prepared eBay price 50
+    calls = _install_real_evaluate_with_ebay_spies(monkeypatch, total=20.0)
+
+    r = client.post("/api/prepared/publish", json={"asins": [asin]})
+
+    assert r.status_code == 200
+    status = _wait_done(client)
+    assert status["rows"][0]["state"] == "published"
+    assert calls["order"] == ["stage", "publish"]
+    stored = db.get_candidate_by_asin(asin)
+    assert stored is not None
+    # Never replaced by the lower suggested price.
+    assert stored["ebay_price"] == 50.0
+
+
+# ------------------------------------------------------ mutant-killing tests
+
+
+def test_publish_skips_when_listing_appears_during_evaluate(
+    client, monkeypatch
+):
+    """M1: the post-evaluate already-published check is required."""
+    asin = "B0RACE0001"
+    _seed_prepared(asin)
+    calls = _install_stubs(monkeypatch)
+
+    def publish_during_fetch(fetched: str) -> list[OfferIn]:
+        calls["fetch"].append(fetched)
+        ebay_listing.save_listing_state(
+            asin,
+            {
+                "status": "published",
+                "offer_id": f"OFF-{asin}",
+                "listing_id": f"1100{asin}",
+            },
+        )
+        return [_offer(fetched)]
+
+    monkeypatch.setattr(upload_items, "fetch_variation_offers", publish_during_fetch)
+
+    client.post("/api/prepared/publish", json={"asins": [asin]})
+    status = _wait_done(client)
+
+    assert status["rows"][0]["state"] == "skipped_existing"
+    assert calls["stage"] == []
+    assert calls["publish"] == []
+
+
+def test_publish_target_flip_after_stage_aborts_before_publish(
+    client, monkeypatch
+):
+    """M2: the _check_target() immediately before publish_offer is required."""
+    asin = "B0FLIPP001"
+    _seed_prepared(asin)
+    holder = {"env": "sandbox"}
+    monkeypatch.setattr(cfg, "ebay_env", lambda: holder["env"])
+    calls = _install_stubs(monkeypatch)
+
+    def flipping_stage(fetched, draft_patch=None):
+        calls["stage"].append(fetched)
+        calls["order"].append("stage")
+        ebay_listing.save_listing_state(
+            fetched,
+            {"status": "unpublished", "offer_id": f"OFF-{fetched}", "listing_id": ""},
+        )
+        holder["env"] = "production"
+        return ebay_listing.public_listing(fetched)
+
+    monkeypatch.setattr(upload_items.ebay_listing, "stage_unpublished", flipping_stage)
+
+    client.post("/api/prepared/publish", json={"asins": [asin]})
+    status = _wait_done(client)
+
+    assert status["phase"] == "aborted_target_changed"
+    assert calls["publish"] == []
+    assert status["rows"][0]["state"] == "error"
+
+
+def test_publish_rejects_variation_parent_without_evaluate_or_write(
+    client, monkeypatch
+):
+    """M3: the publish path must keep the variation-parent rejection."""
+    parent = "B0PARENT02"
+    _seed_prepared(parent)
+    calls = _install_stubs(monkeypatch)
+
+    def parent_offers(asin: str) -> list[OfferIn]:
+        return [_offer("B0CHILD001"), _offer("B0CHILD002")]
+
+    monkeypatch.setattr(upload_items, "fetch_variation_offers", parent_offers)
+
+    client.post("/api/prepared/publish", json={"asins": [parent]})
+    status = _wait_done(client)
+
+    row = status["rows"][0]
+    assert row["state"] == "rejected"
+    assert row["reason"] == "variation_parent"
+    assert calls["evaluate"] == []
+    assert calls["stage"] == []
+    assert calls["publish"] == []
+
+
+def test_publish_stop_after_first_row_leaves_second_queued(
+    client, monkeypatch
+):
+    """M7: a stop request must end the batch between rows."""
+    import threading
+
+    first, second = "B0STOP0001", "B0STOP0002"
+    _seed_prepared(first)
+    _seed_prepared(second)
+    started = threading.Event()
+    release = threading.Event()
+    calls = _install_stubs(monkeypatch)
+
+    def blocking_stage(asin, draft_patch=None):
+        calls["stage"].append(asin)
+        calls["order"].append("stage")
+        if asin == first:
+            started.set()
+            assert release.wait(timeout=10)
+        ebay_listing.save_listing_state(
+            asin,
+            {"status": "unpublished", "offer_id": f"OFF-{asin}", "listing_id": ""},
+        )
+        return ebay_listing.public_listing(asin)
+
+    monkeypatch.setattr(upload_items.ebay_listing, "stage_unpublished", blocking_stage)
+
+    try:
+        r = client.post("/api/prepared/publish", json={"asins": [first, second]})
+        assert r.status_code == 200
+        assert started.wait(timeout=5)
+        stopped = client.post("/api/upload-items/stop", json={})
+        assert stopped.status_code == 200
+        assert stopped.json()["stop_requested"] is True
+    finally:
+        release.set()
+
+    status = _wait_done(client)
+    rows = {row["asin"]: row["state"] for row in status["rows"]}
+    assert status["phase"] == "stopped"
+    assert rows[first] == "published"
+    assert rows[second] == "queued"
+    assert calls["stage"] == [first]
+
+
+def test_list_prepared_ignores_listing_state_from_another_env(client, monkeypatch):
+    """M4: the stored env guard must ignore records from another target."""
+    import json
+
+    asin = "B0ENV00001"
+    _seed_prepared(asin)
+    path = ebay_listing.listing_state_path(asin)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "env": "production",
+                "status": "published",
+                "offer_id": "OFF-PROD",
+                "listing_id": "1100PROD",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    items = prepared_mod.list_prepared()
+
+    assert [item["asin"] for item in items] == [asin], items
+    assert items[0]["ebay_status"] == "none"
+    assert items[0]["offer_id"] == ""
+
+
+def test_list_prepared_age_days_uses_prepared_at(client, monkeypatch):
+    """M5: age_days must be derived from the stored prepared timestamp."""
+    from datetime import datetime, timezone
+
+    asin = "B0AGE00001"
+    _seed_prepared(asin)
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE candidates SET updated_at = ? WHERE asin = ?",
+            ("2026-10-25T00:00:00+00:00", asin),
+        )
+
+    items = prepared_mod.list_prepared(
+        now=datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)
+    )
+
+    assert [item["asin"] for item in items] == [asin]
+    assert items[0]["age_days"] == 2.5
+
+
+def test_prepared_overview_sorts_newest_first(client, monkeypatch):
+    """M6: the overview is explicitly sorted by prepared_at descending."""
+    from datetime import datetime, timezone
+
+    old = {
+        "asin": "B0SORT0001",
+        "listing_draft": {"title": "old draft"},
+        "updated_at": "2026-10-20T00:00:00+00:00",
+        "ebay_price": 50.0,
+        "amazon_total": 20.0,
+        "margin": {},
+    }
+    new = {
+        "asin": "B0SORT0002",
+        "listing_draft": {"title": "new draft"},
+        "updated_at": "2026-10-26T00:00:00+00:00",
+        "ebay_price": 50.0,
+        "amazon_total": 20.0,
+        "margin": {},
+    }
+    # Deliberately ascending, unlike the DB query, to prove the explicit sort.
+    monkeypatch.setattr(prepared_mod, "list_candidates", lambda limit=0: [old, new])
+
+    items = prepared_mod.list_prepared(
+        now=datetime(2026, 10, 27, tzinfo=timezone.utc)
+    )
+
+    assert [item["asin"] for item in items] == ["B0SORT0002", "B0SORT0001"]
+
+
+def test_list_prepared_has_no_env_parameter():
+    """The overview always uses the current target; no env argument remains."""
+    with pytest.raises(TypeError):
+        prepared_mod.list_prepared("sandbox")

@@ -396,7 +396,9 @@ def create_app() -> FastAPI:
     @app.post("/api/prepared/publish")
     def prepared_publish(body: dict | None = None) -> dict:
         raw_asins = (body or {}).get("asins")
-        asins = [str(asin) for asin in raw_asins] if isinstance(raw_asins, list) else []
+        # Keep raw values: start_publish() is the validation trust boundary and
+        # must be able to reject non-strings instead of stringifying them.
+        asins = list(raw_asins) if isinstance(raw_asins, list) else []
         if not asins:
             raise HTTPException(status_code=400, detail="asins required (non-empty list)")
         try:
