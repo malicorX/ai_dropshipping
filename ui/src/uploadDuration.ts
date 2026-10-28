@@ -70,3 +70,45 @@ export function uploadDurationStats(
     averageSec: durations.length ? totalSec / durations.length : null,
   };
 }
+
+export type UploadFileListing = {
+  default: string;
+  files: Array<{ name: string }>;
+};
+
+/**
+ * The name whose preview may be requested: the folder listing must have
+ * arrived and the remembered/selected name must still exist.  Returning null
+ * lets the selection effect fall back to the listing default first.
+ */
+export function previewFileToLoad(
+  fileList: UploadFileListing | null,
+  selectedFile: string,
+): string | null {
+  if (!fileList) {
+    return null;
+  }
+  const names = fileList.files.map((entry) => entry.name);
+  if (!selectedFile || !names.includes(selectedFile)) {
+    return null;
+  }
+  return selectedFile;
+}
+
+/**
+ * Run rows belong to the file that was actually started.  A finished run of
+ * the same selected file still counts; another file's run does not.
+ */
+export function runRowsMatchSelectedFile(
+  hasUploadStatus: boolean,
+  runId: string,
+  statusFile: string,
+  selectedFile: string,
+): boolean {
+  return (
+    hasUploadStatus &&
+    !!runId &&
+    !!selectedFile &&
+    statusFile === selectedFile
+  );
+}

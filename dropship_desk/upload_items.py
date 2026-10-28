@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import threading
 import time
 import uuid
@@ -239,12 +240,17 @@ def upload_items_dir() -> Path:
 
 
 def _invalid_name(name: Any) -> bool:
-    """True unless ``name`` is a bare ``*.txt`` file name (no path parts)."""
+    """True unless ``name`` is a bare ``*.txt`` file name (no path parts).
+
+    A colon is always refused: on Windows ``name.txt:stream`` addresses an
+    alternate data stream and would read bytes that never appear in a normal
+    listing of the folder.
+    """
     if not isinstance(name, str):
         return True
     if not name or name != name.strip():
         return True
-    if "/" in name or "\\" in name:
+    if "/" in name or "\\" in name or ":" in name:
         return True
     # ``..`` anywhere is refused, not only as a whole component.
     if ".." in name or name in (".", ".."):
@@ -258,6 +264,17 @@ def _invalid_name(name: Any) -> bool:
     return Path(name).suffix.lower() != ".txt"
 
 
+def _is_reparse_point(path: Path) -> bool:
+    """True for Windows reparse points (junctions, mount points, ...)."""
+    try:
+        info = path.stat(follow_symlinks=False)
+    except (OSError, ValueError, NotImplementedError):
+        return False
+    attributes = getattr(info, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(attributes & reparse_flag)
+
+
 def resolve_upload_file(name: str | None = None) -> Path:
     """Resolve an optional bare file name to an existing file in the folder.
 
@@ -265,8 +282,10 @@ def resolve_upload_file(name: str | None = None) -> Path:
     ``UPLOAD_ITEMS_FILE`` override).  An explicitly supplied name is a trust
     boundary: it must be a bare ``*.txt`` file name resolving directly inside
     ``upload_items_dir()``.  Nothing is read before this validation passes.
+    Whitespace-only names are not "empty": they are rejected rather than
+    silently falling back to the default.
     """
-    if name is None or (isinstance(name, str) and not name.strip()):
+    if name is None or name == "":
         return upload_items_path()
     if _invalid_name(name):
         raise InvalidUploadFile(name)
@@ -283,7 +302,12 @@ def resolve_upload_file(name: str | None = None) -> Path:
 
 
 def list_upload_files() -> dict[str, Any]:
-    """List the ``*.txt`` lists directly inside the upload folder, newest first."""
+    """List the ``*.txt`` lists directly inside the upload folder, newest first.
+
+    Entries whose name is not a plain ``*.txt`` file name are skipped before
+    any filesystem access, and symlinks/reparse points are never followed for
+    size, line count or mtime.
+    """
     base = upload_items_dir()
     entries: list[dict[str, Any]] = []
     try:
@@ -291,22 +315,26 @@ def list_upload_files() -> dict[str, Any]:
     except OSError:
         children = []
     for path in children:
+        if _invalid_name(path.name):
+            continue
         try:
-            if not path.is_file() or path.suffix.lower() != ".txt":
+            if path.is_symlink() or _is_reparse_point(path):
                 continue
-            stat = path.stat()
+            if not path.is_file():
+                continue
+            info = path.stat()
             text = path.read_text(encoding="utf-8-sig", errors="replace")
         except OSError:
             continue
         entries.append(
             {
                 "name": path.name,
-                "size": stat.st_size,
+                "size": info.st_size,
                 "modified": datetime.fromtimestamp(
-                    stat.st_mtime, timezone.utc
+                    info.st_mtime, timezone.utc
                 ).isoformat(),
                 "lines": len(text.splitlines()),
-                "_mtime": stat.st_mtime,
+                "_mtime": info.st_mtime,
             }
         )
     entries.sort(key=lambda entry: entry["_mtime"], reverse=True)
@@ -621,7 +649,6 @@ class UploadJobManager:
                     return
 
             with self._lock:
-                self._finalize_retry_reasons()
                 if self.state.stop_requested:
                     self.state.phase = "stopped"
                 else:
@@ -633,6 +660,10 @@ class UploadJobManager:
         finally:
             config.pin_sandbox_for_upload(False)
             with self._lock:
+                # Also covers early exits via Stop / abort / target change:
+                # retryable rows that were already retried keep one consistent
+                # "after N attempts: ..." reason.
+                self._finalize_retry_reasons()
                 self.state.running = False
 
     def _run_pass(self) -> bool:
@@ -671,8 +702,15 @@ class UploadJobManager:
 
     @staticmethod
     def _is_retryable(row: UploadRow) -> bool:
-        return row.state == "error" and str(row.reason).strip().upper().startswith(
-            RETRYABLE_ERROR_PREFIX
+        if row.state != "error":
+            return False
+        text = str(row.reason).strip().upper()
+        if not text.startswith(RETRYABLE_ERROR_PREFIX):
+            return False
+        # ``AMAZON_UNREACHABLE_NOT...`` is a different error and must not be
+        # treated as a transient connection failure.
+        return len(text) == len(RETRYABLE_ERROR_PREFIX) or (
+            text[len(RETRYABLE_ERROR_PREFIX)] == ":"
         )
 
     def _requeue_retryable(self) -> None:

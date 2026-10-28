@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  previewFileToLoad,
   rowDurationSeconds,
+  runRowsMatchSelectedFile,
   uploadDurationStats,
 } from "../.test-build/uploadDuration.js";
 
@@ -88,4 +90,26 @@ test("the running row ticks only while the run is live", () => {
 
   assert.equal(rowDurationSeconds(row, Date.parse(row.started_at) + 4000, true), 4);
   assert.equal(rowDurationSeconds(row, Date.parse(row.started_at) + 4000, false), null);
+});
+
+test("run rows are shown only for the selected file", () => {
+  assert.equal(runRowsMatchSelectedFile(true, "upload-1", "a.txt", "a.txt"), true);
+  assert.equal(runRowsMatchSelectedFile(true, "upload-1", "a.txt", "b.txt"), false);
+  assert.equal(runRowsMatchSelectedFile(false, "upload-1", "a.txt", "a.txt"), false);
+  assert.equal(runRowsMatchSelectedFile(true, "", "a.txt", "a.txt"), false);
+  assert.equal(runRowsMatchSelectedFile(true, "upload-1", "", ""), false);
+});
+
+test("preview waits for the file listing and a surviving selection", () => {
+  const listing = {
+    default: "a.txt",
+    files: [{ name: "a.txt" }, { name: "b.txt" }],
+  };
+
+  // A remembered file must not be previewed before /files answers.
+  assert.equal(previewFileToLoad(null, "gone.txt"), null);
+  // Once the listing arrives, a missing remembered file waits for fallback.
+  assert.equal(previewFileToLoad(listing, "gone.txt"), null);
+  assert.equal(previewFileToLoad(listing, ""), null);
+  assert.equal(previewFileToLoad(listing, "b.txt"), "b.txt");
 });

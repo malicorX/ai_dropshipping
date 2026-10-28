@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { rowDurationSeconds, uploadDurationStats } from "./uploadDuration";
+import {
+  previewFileToLoad,
+  rowDurationSeconds,
+  runRowsMatchSelectedFile,
+  uploadDurationStats,
+} from "./uploadDuration";
 
 type Tab = "find" | "queue" | "list" | "upload" | "prepared" | "settings";
 
@@ -1622,6 +1627,7 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const previewFailed = useRef(false);
 
   const loadFiles = useCallback(async () => {
     try {
@@ -1636,8 +1642,14 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
       ? `?file=${encodeURIComponent(selectedFile)}`
       : "";
     try {
-      setPreview(await api<UploadPreview>(`/api/upload-items/preview${query}`));
+      const next = await api<UploadPreview>(`/api/upload-items/preview${query}`);
+      setPreview(next);
+      if (previewFailed.current) {
+        previewFailed.current = false;
+        onError("");
+      }
     } catch (e) {
+      previewFailed.current = true;
       onError(e instanceof Error ? e.message : String(e));
     }
   }, [onError, selectedFile]);
@@ -1667,13 +1679,23 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
   }, [fileList]);
 
   useEffect(() => {
-    void loadPreview();
     void loadStatus();
     const id = window.setInterval(() => {
       void loadStatus();
     }, 2000);
     return () => window.clearInterval(id);
-  }, [loadPreview, loadStatus]);
+  }, [loadStatus]);
+
+  // Do not preview a remembered file before /files confirms it still exists:
+  // a stale localStorage entry would otherwise produce a pointless 400.  Wait
+  // for the listing, then the selection effect above falls back to the
+  // default and this effect previews that valid name.
+  useEffect(() => {
+    if (previewFileToLoad(fileList, selectedFile) === null) {
+      return;
+    }
+    void loadPreview();
+  }, [fileList, selectedFile, loadPreview]);
 
   function chooseFile(name: string) {
     setSelectedFile(name);
@@ -1719,9 +1741,17 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
   // target, not the target_env remembered from the last run.
   const target = running ? status?.target_env || liveEnv : liveEnv;
   const live = target === "production" || (!anyRunning && !!preview?.live_disabled);
-  const rows =
-    hasUploadStatus && status?.rows?.length ? status.rows : preview?.rows ?? [];
-  const counters = hasUploadStatus ? status?.counters ?? {} : {};
+  // Run rows belong to the file that was actually started.  If the selected
+  // file differs (or there is no upload run at all), show the preview of the
+  // selected file instead of another file's run.
+  const selectedRun = runRowsMatchSelectedFile(
+    hasUploadStatus,
+    status?.run_id ?? "",
+    status?.file ?? "",
+    selectedFile,
+  );
+  const rows = selectedRun ? status?.rows ?? [] : preview?.rows ?? [];
+  const counters = selectedRun ? status?.counters ?? {} : {};
   const durationStats = uploadDurationStats(rows, nowMs, running);
 
   async function start(mode: "full" | "prepare") {
