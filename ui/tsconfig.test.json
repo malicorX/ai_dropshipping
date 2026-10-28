@@ -8,5 +8,5 @@
     "rootDir": "src",
     "sourceMap": false
   },
-  "include": ["src/uploadDuration.ts"]
+  "include": ["src/uploadDuration.ts", "src/liveUi.ts"]
 }

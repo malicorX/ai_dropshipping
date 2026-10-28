@@ -358,6 +358,34 @@ html[data-ebay-target="production"] button.linkish {
   color: #f3c7c0;
 }
 
+.live-run-banner {
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--danger);
+  background: var(--danger);
+  color: #fff;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.live-plan {
+  display: grid;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.6rem;
+  border: 1px solid var(--danger);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+
+.live-plan-summary {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.live-confirm input {
+  min-width: 9rem;
+  margin-left: 0.4rem;
+}
+
 .upload-duration-summary {
   margin: 0;
   font-variant-numeric: tabular-nums;

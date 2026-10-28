@@ -74,16 +74,20 @@ def _upload_one(path: Path) -> str:
         "file": (path.name, path.read_bytes(), "application/octet-stream"),
     }
     endpoint = ebay_http.trading_endpoint()
-    # Guard before token acquisition (which can itself use the auth host) and
-    # before any HTTP client is constructed.
+    # Read/bind the token first, then make the final gate the last step before
+    # the socket is opened.  A flag/target flip during the token read is
+    # therefore observed here.
+    token = ebay_oauth.access_token()
+    ebay_oauth.ensure_token_env_matches(endpoint)
     ebay_http.ensure_write_target_allowed(endpoint)
     headers = {
         "X-EBAY-API-SITEID": "77",
         "X-EBAY-API-COMPATIBILITY-LEVEL": "1399",
         "X-EBAY-API-CALL-NAME": "UploadSiteHostedPictures",
-        "X-EBAY-API-IAF-TOKEN": ebay_oauth.access_token(),
+        "X-EBAY-API-IAF-TOKEN": token,
     }
     with httpx.Client(timeout=60.0) as client:
+        ebay_http.ensure_write_target_allowed(endpoint)  # re-check after client/TLS setup, right before dispatch
         response = client.post(endpoint, headers=headers, files=files)
     if response.status_code >= 400:
         raise RuntimeError(f"picture upload HTTP {response.status_code}")

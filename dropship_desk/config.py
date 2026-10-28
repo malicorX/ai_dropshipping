@@ -5,10 +5,13 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 from urllib.parse import urlparse
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 IS_FROZEN = bool(getattr(sys, "frozen", False))
 
@@ -17,7 +20,8 @@ if IS_FROZEN:
 else:
     RUNTIME_ROOT = Path(__file__).resolve().parent.parent
 
-load_dotenv(RUNTIME_ROOT / ".env")
+ENV_FILE = RUNTIME_ROOT / ".env"
+load_dotenv(ENV_FILE)
 
 DATA_DIR = Path(os.environ.get("DROPSHIP_DATA_DIR", str(RUNTIME_ROOT / "data")))
 DB_PATH = DATA_DIR / "dropship.sqlite3"
@@ -35,12 +39,125 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+# Live-gate flags must follow the operator's .env edits while the process keeps
+# running.  ``load_dotenv`` only copies values into ``os.environ`` at import
+# time, so a running server would otherwise never see a flip back to false.
+#
+# Fail closed: once a .env file has existed in this process, a gate key is only
+# true when the file still parses AND contains the key AND the process-env
+# value is also true.  A missing / unreadable / empty / malformed file (or a
+# missing key) can therefore never fall back to a stale ``os.environ`` true.
+LIVE_ENV_CACHE_SEC = 1.0
+_live_env_lock = threading.Lock()
+_live_env_cache: dict[str, object] = {
+    "path": None,
+    "values": {},
+    "ok": False,
+    "present": False,
+    "read_at": 0.0,
+}
+_live_env_seen = bool(ENV_FILE.is_file())
+
+
+def _bool_value(raw: object, default: bool = False) -> bool:
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _read_live_dotenv(path) -> dict[str, object]:
+    """Return ``{'ok', 'values', 'reason'}`` for one .env read (never raises)."""
+    try:
+        is_file = path.is_file()
+    except OSError:
+        is_file = False
+    if not is_file:
+        return {"ok": False, "values": {}, "reason": "missing"}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError, ValueError):
+        return {"ok": False, "values": {}, "reason": "unreadable"}
+    if not text.strip():
+        return {"ok": False, "values": {}, "reason": "empty"}
+    try:
+        values = dict(dotenv_values(path))
+    except Exception:  # noqa: BLE001 - any parse failure closes every gate
+        return {"ok": False, "values": {}, "reason": "unreadable"}
+    return {"ok": True, "values": values, "reason": ""}
+
+
+def _live_dotenv_snapshot() -> dict[str, object]:
+    global _live_env_seen
+    now = time.monotonic()
+    path = ENV_FILE
+    with _live_env_lock:
+        fresh = (
+            _live_env_cache.get("path") == path
+            and now - float(_live_env_cache.get("read_at") or 0.0) < LIVE_ENV_CACHE_SEC
+        )
+        if fresh:
+            return dict(_live_env_cache)
+        try:
+            path_exists = path.is_file()
+        except OSError:
+            path_exists = False
+        if path_exists:
+            _live_env_seen = True
+        if not _live_env_seen:
+            snapshot: dict[str, object] = {
+                "path": path,
+                "values": {},
+                "ok": False,
+                "present": False,
+                "read_at": now,
+            }
+        else:
+            parsed = _read_live_dotenv(path)
+            snapshot = {
+                "path": path,
+                "values": parsed["values"],
+                "ok": parsed["ok"],
+                "present": True,
+                "read_at": now,
+            }
+        _live_env_cache.clear()
+        _live_env_cache.update(snapshot)
+        return dict(snapshot)
+
+
+def clear_live_env_cache() -> None:
+    """Drop the cached .env snapshot (tests / immediately after a file edit)."""
+    global _live_env_seen
+    with _live_env_lock:
+        _live_env_seen = False
+        _live_env_cache["path"] = None
+        _live_env_cache["values"] = {}
+        _live_env_cache["ok"] = False
+        _live_env_cache["present"] = False
+        _live_env_cache["read_at"] = 0.0
+
+
+def _live_env_bool(name: str, default: bool = False) -> bool:
+    """Fail-closed live gate: (file value AND process env), else False."""
+    snapshot = _live_dotenv_snapshot()
+    if not snapshot.get("present"):
+        # A deployment that never had a .env file may use process env alone.
+        return _env_bool(name, default)
+    if not snapshot.get("ok"):
+        return False
+    values = snapshot.get("values") or {}
+    if name not in values:
+        return False
+    file_value = _bool_value(values.get(name), False)
+    return file_value and _env_bool(name, False)
+
+
 def amazon_automation_enabled() -> bool:
     return _env_bool("AMAZON_AUTOMATION_ENABLED", False)
 
 
 def ebay_automation_enabled() -> bool:
-    return _env_bool("EBAY_AUTOMATION_ENABLED", False)
+    return _live_env_bool("EBAY_AUTOMATION_ENABLED", False)
 
 
 def amazon_allow_cart() -> bool:
@@ -52,7 +169,8 @@ def amazon_allow_purchase() -> bool:
 
 
 def ebay_allow_list() -> bool:
-    return _env_bool("EBAY_ALLOW_LIST", False)
+    return _live_env_bool("EBAY_ALLOW_LIST", False)
+
 
 
 def ebay_allow_tracking() -> bool:
@@ -61,6 +179,30 @@ def ebay_allow_tracking() -> bool:
 
 def ebay_auto_publish() -> bool:
     return _env_bool("EBAY_AUTO_PUBLISH", False)
+
+
+# Live upload is a second, explicit master switch.  It is read at call time
+# (like every other flag) so an operator can still kill a run by setting it to
+# false in the environment; the worker re-checks it before every eBay write.
+LIVE_MAX_PER_RUN_DEFAULT = 5
+LIVE_MAX_PER_RUN_HARD_CAP = 50
+
+
+def ebay_live_upload_enabled() -> bool:
+    """Master switch for the guarded production upload/publish path."""
+    return _live_env_bool("EBAY_LIVE_UPLOAD_ENABLED", False)
+
+
+def ebay_live_max_per_run() -> int:
+    """Per-run live batch cap: default 5, clamped to the code ceiling 50."""
+    raw = os.environ.get("EBAY_LIVE_MAX_PER_RUN")
+    if raw is None or str(raw).strip() == "":
+        return LIVE_MAX_PER_RUN_DEFAULT
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return LIVE_MAX_PER_RUN_DEFAULT
+    return max(0, min(value, LIVE_MAX_PER_RUN_HARD_CAP))
 
 
 _ebay_env_override: str | None = None
@@ -96,6 +238,7 @@ def ebay_env() -> str:
 # hosts while it is set.
 _upload_pin_lock = threading.RLock()
 _upload_sandbox_pinned = False
+_upload_production_live_pinned = False
 
 
 def pin_sandbox_for_upload(pinned: bool) -> bool:
@@ -112,14 +255,129 @@ def upload_sandbox_pinned() -> bool:
         return _upload_sandbox_pinned
 
 
+def pin_production_for_live(pinned: bool) -> bool:
+    """Pin or release the inverse guard for a live (production) run.
+
+    A live run must never reach a sandbox host, and it must abort when the
+    process-wide target flips away from production while the run is active.
+    The pin is set for the worker lifetime and released in ``finally``.
+    """
+    global _upload_production_live_pinned
+    with _upload_pin_lock:
+        _upload_production_live_pinned = bool(pinned)
+        return _upload_production_live_pinned
+
+
+def production_live_pinned() -> bool:
+    """True while a live run requires every eBay host to be production."""
+    with _upload_pin_lock:
+        return _upload_production_live_pinned
+
+
 def is_sandbox_host(host: str) -> bool:
     """True for every eBay sandbox hostname (api/auth/www)."""
     host = (host or "").strip().lower().rstrip(".")
     return host == "sandbox.ebay.com" or host.endswith(".sandbox.ebay.com")
 
 
+def env_for_ebay_host(host: str) -> str:
+    """The eBay env a URL host belongs to (sandbox hosts vs production)."""
+    return "sandbox" if is_sandbox_host(host) else "production"
+
+
+# A batch worker captures its target env at start.  State files and helper
+# defaults use that captured env, never a process-wide target that may have
+# been flipped while a response was in flight.
+_run_env_local = threading.local()
+
+
+def set_run_env(env: str | None) -> None:
+    if env is None:
+        try:
+            del _run_env_local.env
+        except AttributeError:
+            pass
+        return
+    _run_env_local.env = normalize_ebay_env(env)
+
+
+def run_env() -> str | None:
+    value = getattr(_run_env_local, "env", None)
+    return str(value) if value in ("sandbox", "production") else None
+
+
+# ----------------------------------------------------------- eBay operations
+#
+# The eBay environment is a process-wide mutable target.  Every seller / OAuth /
+# account operation runs inside this context manager: it captures one immutable
+# env and increments a process-wide in-flight counter.  While the counter is
+# non-zero the target switch endpoint and an OAuth callback that would change
+# the env are refused, so derived data (base URL, credentials, token record,
+# account cache, persistence target) can never be split across two envs.
+_ebay_ops_lock = threading.RLock()
+_ebay_ops_counter = 0
+_ebay_op_env_local = threading.local()
+
+
+def ebay_ops_in_flight() -> int:
+    with _ebay_ops_lock:
+        return _ebay_ops_counter
+
+
+def ebay_operation_running() -> bool:
+    return ebay_ops_in_flight() > 0
+
+
+@contextmanager
+def ebay_operation(env: str | None = None) -> Iterator[str]:
+    global _ebay_ops_counter
+    captured = normalize_ebay_env(
+        env if env is not None else (run_env() or ebay_env())
+    )
+    previous = getattr(_ebay_op_env_local, "env", None)
+    with _ebay_ops_lock:
+        _ebay_ops_counter += 1
+    _ebay_op_env_local.env = captured
+    try:
+        yield captured
+    finally:
+        _ebay_op_env_local.env = previous
+        with _ebay_ops_lock:
+            _ebay_ops_counter = max(0, _ebay_ops_counter - 1)
+
+
+def operation_env() -> str:
+    """The env captured by the active operation, else the active run/current."""
+    value = getattr(_ebay_op_env_local, "env", None)
+    if value in ("sandbox", "production"):
+        return str(value)
+    return run_env() or ebay_env()
+
+
+def state_env() -> str:
+    """Env for listing/token state: captured operation, run, else current."""
+    return operation_env()
+
+
+LIVE_WRITE_GATE_FLAG = "EBAY_LIVE_UPLOAD_ENABLED"
+LIVE_WRITE_GATE_AUTOMATION = "EBAY_AUTOMATION_ENABLED"
+LIVE_WRITE_GATE_ALLOW_LIST = "EBAY_ALLOW_LIST"
+
+
+def live_write_gate_missing() -> list[str]:
+    """Names of the closed live gates (never values) for transport checks."""
+    missing: list[str] = []
+    if not ebay_live_upload_enabled():
+        missing.append(LIVE_WRITE_GATE_FLAG)
+    if not ebay_automation_enabled():
+        missing.append(LIVE_WRITE_GATE_AUTOMATION)
+    if not ebay_allow_list():
+        missing.append(LIVE_WRITE_GATE_ALLOW_LIST)
+    return missing
+
+
 def ensure_write_target_allowed(url: str) -> None:
-    """Refuse a non-sandbox eBay host while an upload run is pinned.
+    """Refuse the wrong eBay target / a closed live gate on every write.
 
     This lives in ``config`` (which imports no eBay transport module) so both
     ``ebay.client`` and ``ebay.oauth`` can call it without an import cycle.
@@ -127,15 +385,47 @@ def ensure_write_target_allowed(url: str) -> None:
     target checks and immediately before any HTTP client is created.  It
     therefore still holds when ``config.ebay_env()`` flips between the job's
     check and the actual request.
+
+    Sandbox runs keep blocking production exactly as before.  A live run is the
+    inverse: production only, never a sandbox host or a sandbox target, and the
+    live gate (master flag, automation, allow-list) is re-read on every call so
+    the operator can stop a run by flipping the flag or editing .env.
     """
-    if not upload_sandbox_pinned():
+    sandbox_pinned = upload_sandbox_pinned()
+    live_pinned = production_live_pinned()
+    if not sandbox_pinned and not live_pinned:
         return
     host = urlparse(url).hostname or ""
-    if not is_sandbox_host(host):
+    if sandbox_pinned and live_pinned:
+        raise RuntimeError(
+            "LIVE_WRITE_BLOCKED: conflicting transport pins; refusing to "
+            f"contact {host or url}"
+        )
+    if sandbox_pinned and not is_sandbox_host(host):
         raise RuntimeError(
             "LIVE_WRITE_BLOCKED: upload run is pinned to the eBay sandbox; "
             f"refusing to contact {host or url}"
         )
+    if live_pinned:
+        if is_sandbox_host(host):
+            raise RuntimeError(
+                "LIVE_WRITE_BLOCKED: live run is pinned to eBay production; "
+                f"refusing to contact {host or url}"
+            )
+        if operation_env() != "production":
+            raise RuntimeError(
+                "LIVE_WRITE_BLOCKED: live run is pinned to eBay production "
+                "but the current target changed; refusing to contact "
+                f"{host or url}"
+            )
+        missing = live_write_gate_missing()
+        if missing:
+            raise RuntimeError(
+                "LIVE_WRITE_BLOCKED: live gate closed ("
+                + ", ".join(missing)
+                + f"); refusing to contact {host or url}"
+            )
+
 
 
 def _ebay_credential(env: str, sandbox_key: str, prod_key: str) -> str:
@@ -144,24 +434,28 @@ def _ebay_credential(env: str, sandbox_key: str, prod_key: str) -> str:
     return os.environ.get(sandbox_key, "").strip()
 
 
+def _credential_env(env: str | None) -> str:
+    return normalize_ebay_env(env) if env is not None else operation_env()
+
+
 def ebay_app_id(env: str | None = None) -> str:
-    return _ebay_credential(env or ebay_env(), "EBAY_SANDBOX_APP_ID", "EBAY_PROD_APP_ID")
+    return _ebay_credential(_credential_env(env), "EBAY_SANDBOX_APP_ID", "EBAY_PROD_APP_ID")
 
 
 def ebay_cert_id(env: str | None = None) -> str:
-    return _ebay_credential(env or ebay_env(), "EBAY_SANDBOX_CERT_ID", "EBAY_PROD_CERT_ID")
+    return _ebay_credential(_credential_env(env), "EBAY_SANDBOX_CERT_ID", "EBAY_PROD_CERT_ID")
 
 
 def ebay_dev_id(env: str | None = None) -> str:
-    return _ebay_credential(env or ebay_env(), "EBAY_SANDBOX_DEV_ID", "EBAY_PROD_DEV_ID")
+    return _ebay_credential(_credential_env(env), "EBAY_SANDBOX_DEV_ID", "EBAY_PROD_DEV_ID")
 
 
 def ebay_runame(env: str | None = None) -> str:
-    return _ebay_credential(env or ebay_env(), "EBAY_SANDBOX_RUNAME", "EBAY_PROD_RUNAME")
+    return _ebay_credential(_credential_env(env), "EBAY_SANDBOX_RUNAME", "EBAY_PROD_RUNAME")
 
 
 def ebay_target_gaps(env: str | None = None) -> list[str]:
-    target = normalize_ebay_env(env) if env is not None else ebay_env()
+    target = _credential_env(env)
     if target == "production":
         pairs = (
             ("EBAY_PROD_APP_ID", ebay_app_id(target)),
@@ -181,19 +475,21 @@ def ebay_target_ready(env: str | None = None) -> bool:
     return not ebay_target_gaps(env)
 
 
-def ebay_api_base() -> str:
-    if ebay_env() == "production":
+def ebay_api_base(env: str | None = None) -> str:
+    target = normalize_ebay_env(env) if env is not None else operation_env()
+    if target == "production":
         return "https://api.ebay.com"
     return "https://api.sandbox.ebay.com"
 
 
-def ebay_auth_base() -> str:
-    if ebay_env() == "production":
+def ebay_auth_base(env: str | None = None) -> str:
+    target = normalize_ebay_env(env) if env is not None else operation_env()
+    if target == "production":
         return "https://auth.ebay.com"
     return "https://auth.sandbox.ebay.com"
 
 
-def automation_snapshot() -> dict[str, bool]:
+def automation_snapshot() -> dict[str, bool | int]:
     return {
         "amazon_enabled": amazon_automation_enabled(),
         "ebay_enabled": ebay_automation_enabled(),
@@ -202,6 +498,8 @@ def automation_snapshot() -> dict[str, bool]:
         "ebay_allow_list": ebay_allow_list(),
         "ebay_allow_tracking": ebay_allow_tracking(),
         "ebay_auto_publish": ebay_auto_publish(),
+        "ebay_live_upload_enabled": ebay_live_upload_enabled(),
+        "ebay_live_max_per_run": ebay_live_max_per_run(),
     }
 
 
