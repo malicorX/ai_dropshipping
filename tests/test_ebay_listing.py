@@ -427,3 +427,18 @@ def test_inventory_description_stays_under_4000():
     html = _inventory_description("Titel", bullets)
     assert 1 <= len(html) <= 4000
     assert "Titel" in html
+
+
+def test_ebay_safe_description_strips_document_style_details_and_feedback():
+    html = (
+        "<!DOCTYPE html><html><head><style>.a{color:red}</style></head><body>"
+        '<div class="dd-wrap"><h1>T</h1>'
+        '<details class="x" open><summary>Versand</summary><div>3-7 Tage</div></details>'
+        "<details><summary>Feedback</summary><p>positive Bewertung bitte</p></details>"
+        "<p>Zahlung (z.&nbsp;B. PayPal, Karte)</p></div></body></html>"
+    )
+    out = ebay_listing.ebay_safe_description(html)
+    low = out.lower()
+    for bad in ("<style", "doctype", "<html", "<head", "<details", "<summary", "class=", "bewertung", "paypal"):
+        assert bad not in low, (bad, out)
+    assert "<h3>Versand</h3>" in out and "3-7 Tage" in out and "<h1>T</h1>" in out

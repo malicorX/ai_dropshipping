@@ -194,6 +194,7 @@ def _stage_unpublished(
         bullets = draft.get("bullet_points") or []
         items = "".join(f"<li>{_escape(b)}</li>" for b in bullets)
         description = f"<p>{_escape(title)}</p><ul>{items}</ul>"
+    description = ebay_safe_description(description)
     inventory_description = _inventory_description(
         title, draft.get("bullet_points") or []
     )
@@ -398,6 +399,40 @@ def _inventory_description(title: str, bullets: list[Any]) -> str:
     if items:
         html += f"<ul>{items}</ul>"
     return _clip(html, 4000)
+
+
+_DETAILS_RE = re.compile(
+    r"<details\b[^>]*>\s*<summary\b[^>]*>(.*?)</summary>(.*?)</details>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def ebay_safe_description(html: str) -> str:
+    """Reduce the shop-shell page to markup eBay accepts as a listing description.
+
+    eBay rejects full documents, <style>/<head> blocks and interactive elements
+    (<details>), and its policy bans feedback solicitation and off-platform
+    payment wording.  The stored draft is left untouched; only what is sent changes.
+    """
+    text = str(html or "")
+    body = re.search(r"<body\b[^>]*>(.*)</body>", text, re.IGNORECASE | re.DOTALL)
+    if body:
+        text = body.group(1)
+    text = re.sub(r"<!DOCTYPE[^>]*>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<(style|script|head)\b.*?</\1>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"</?(html|body)\b[^>]*>", "", text, flags=re.IGNORECASE)
+
+    def _section(match: re.Match) -> str:
+        title = re.sub(r"<[^>]+>", "", match.group(1)).strip()
+        if re.search(r"feedback|bewertung", title, re.IGNORECASE):
+            return ""
+        return f"<h3>{title}</h3>{match.group(2)}"
+
+    text = _DETAILS_RE.sub(_section, text)
+    text = re.sub(r"</?(details|summary)\b[^>]*>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+class=\"[^\"]*\"", "", text)
+    text = re.sub(r"PayPal,\s*", "", text)
+    return re.sub(r"\n\s*\n+", "\n", text).strip()
 
 
 def _escape(value: Any) -> str:
