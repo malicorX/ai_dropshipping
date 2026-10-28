@@ -37,35 +37,40 @@ def generate_listing_draft(
     ebay_price: float,
     image_urls: list[str] | None = None,
     bullets_hint: str = "",
+    bullets: list[str] | None = None,
+    specs: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
     Ask the local LLM for a German eBay listing that is NOT a 1:1 Amazon clone.
     Returns title, subtitle, description_html, bullet_points, image_plan.
     """
     images = image_urls or []
-    prompt = f"""Du schreibst ein eBay-Angebot (Deutschland) für Dropshipping.
-Regeln (befolgen, aber NICHT im Output wiederholen): kein Amazon-1:1-Klon; eigene Formulierungen;
-keine Amazon-Markennamen im Fließtext.
+    bullets = [str(b) for b in (bullets or []) if str(b).strip()]
+    specs = {str(k): str(v) for k, v in (specs or {}).items()}
+    facts = _facts_block(amazon_title, bullets, specs)
+    prompt = f"""Du formulierst ein sachliches eBay-Angebot (Deutschland) NUR aus den unten stehenden Fakten.
+Strikte Regeln:
+- Verwende ausschließlich Aussagen, die in den Fakten stehen. Erfinde nichts: keine Eigenschaften,
+  Materialien, Maße, Zahlen, Lieferumfang, Garantien, Einsatzzwecke oder Wirkungen, die nicht dort stehen.
+- Lieber weniger Punkte als ein erfundener Punkt. Wenn die Fakten dünn sind, schreibe kurz.
+- Eigene Formulierungen sind erlaubt, aber keine neuen Behauptungen. Keine Marketing-Superlative.
+- Keine Amazon-Markennamen im Fließtext.
 
-Produktfakten:
-- ASIN: {asin}
-- Amazon-Titel: {amazon_title}
-- Einkaufspreis ca.: {amazon_price:.2f} EUR
-- Geplanter eBay-Preis: {ebay_price:.2f} EUR
+Fakten (Amazon-Produktseite):
+{facts}
 - Extra-Hinweise: {bullets_hint or "—"}
 - Produktbild-URLs ({len(images)}): {json.dumps(images[:8], ensure_ascii=False)}
 
-Pflicht: Wenn Extra-Hinweise eine Variante/Größe/Farbe nennen, MUSS diese wörtlich im title stehen
-(z.B. „20 kg“, nicht die Geschwistervariante). Titel, Text und Lieferumfang nur für DIESE Variante.
+Pflicht: Wenn Extra-Hinweise eine Variante/Größe/Farbe nennen, MUSS diese wörtlich im title stehen.
 
 Gib genau ein JSON-Objekt mit diesen Keys zurück:
 {{
-  "title": "eBay-Titel max 80 Zeichen, deutsch, verkaufsstark",
-  "subtitle": "kurze zweite Zeile max 55 Zeichen",
-  "intro_html": "<p>2-4 Sätze Produktvorstellung, eigene Worte, HTML nur mit p/strong/em</p>",
-  "advantages": ["5 kurze Vorteile / Verkaufsargumente"],
-  "functions": ["5 Funktionen oder technische Details, eigene Worte"],
-  "scope_of_delivery": ["1x ... Lieferumfang-Positionen"],
+  "title": "eBay-Titel max 80 Zeichen, deutsch, sachlich, nur Fakten",
+  "subtitle": "kurze zweite Zeile max 55 Zeichen, nur Fakten",
+  "intro_html": "<p>1-3 Sätze, nur Fakten, HTML nur mit p/strong/em</p>",
+  "advantages": ["bis zu 5 kurze Punkte, jeder direkt aus den Fakten"],
+  "functions": ["bis zu 5 technische Details, jeder direkt aus den Fakten"],
+  "scope_of_delivery": ["nur wenn in den Fakten genannt, sonst leer"],
   "image_plan": {{
     "strategy": "1-2 Sätze zur Bildreihenfolge",
     "ordered_urls": ["subset der gegebenen URLs"],
@@ -74,8 +79,7 @@ Gib genau ein JSON-Objekt mit diesen Keys zurück:
   }}
 }}
 
-WICHTIG: Nur Produktinhalt. KEIN Versand-, Rückgabe-, Zahlungs-, Feedback- oder Kontakt-Block —
-das hängt das System als feste Shop-Vorlage an.
+WICHTIG: Nur Produktinhalt. KEIN Versand-, Rückgabe-, Zahlungs-, Feedback- oder Kontakt-Block.
 Antworte ausschließlich mit dem JSON-Objekt. Kein Markdown, kein Denken, kein Prolog.
 Das erste Zeichen der Antwort muss {{ sein.
 """
@@ -96,7 +100,9 @@ Das erste Zeichen der Antwort muss {{ sein.
         data = r.json()
     text = str(data.get("response") or "").strip()
     draft = _parse_json_object(text)
+    draft, dropped = enforce_facts(draft, amazon_title, bullets, specs)
     draft = apply_listing_template(draft)
+    draft["unsupported_claims_dropped"] = dropped
     draft["model"] = config.OLLAMA_MODEL
     draft["source_asin"] = asin
     draft["source_amazon_title"] = amazon_title
@@ -169,3 +175,72 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     if not isinstance(obj, dict):
         raise ValueError("LLM JSON was not an object")
     return obj
+
+
+def _facts_block(title: str, bullets: list[str], specs: dict[str, str]) -> str:
+    lines = [f"- Titel: {title}"]
+    lines += [f"- Merkmal: {b}" for b in bullets[:10]]
+    lines += [f"- {k}: {v}" for k, v in specs.items()]
+    return "\n".join(lines)
+
+
+def _stems(text: str) -> set[str]:
+    return {w[:6] for w in re.findall(r"[a-zäöüß]{5,}", str(text).casefold())}
+
+
+def _numbers(text: str) -> set[str]:
+    return {n.replace(",", ".") for n in re.findall(r"\d+(?:[.,]\d+)?", str(text))}
+
+
+def enforce_facts(
+    draft: dict[str, Any], title: str, bullets: list[str], specs: dict[str, str]
+) -> tuple[dict[str, Any], list[str]]:
+    """Drop every generated statement the Amazon facts do not support.
+
+    A line is kept only if every number in it appears in the facts and at least
+    60 % of its content words (>=5 letters, by 6-letter stem) do too.  Dropped
+    lines are returned so the operator can see what was removed.
+    """
+    facts = " ".join([title, *bullets, *[f"{k} {v}" for k, v in specs.items()]])
+    fact_stems, fact_nums = _stems(facts), _numbers(facts)
+    dropped: list[str] = []
+
+    def supported(line: str) -> bool:
+        if _numbers(line) - fact_nums:
+            return False
+        words = _stems(line)
+        if not words:
+            return True
+        return len(words & fact_stems) / len(words) >= 0.6
+
+    out = dict(draft)
+    for key in ("advantages", "functions"):
+        kept = []
+        for item in out.get(key) or []:
+            if supported(str(item)):
+                kept.append(item)
+            else:
+                dropped.append(str(item))
+        out[key] = kept
+    intro = str(out.get("intro_html") or "")
+    parts = re.split(r"(?<=[.!?])\s+", re.sub(r"</?(?:p|strong|em)>", " ", intro))
+    kept_sent = []
+    for sent in (p.strip() for p in parts):
+        if not sent:
+            continue
+        (kept_sent if supported(sent) else dropped).append(sent)
+    out["intro_html"] = f"<p>{' '.join(kept_sent)}</p>" if kept_sent else ""
+    # Delivery scope only when Amazon states it; never an invented accessory list.
+    spec_scope = next(
+        (v for k, v in specs.items() if "lieferumfang" in k.casefold() or "packungsinhalt" in k.casefold()),
+        "",
+    )
+    out["scope_of_delivery"] = [spec_scope] if spec_scope else []
+    if _numbers(str(out.get("title") or "")) - fact_nums:
+        dropped.append(str(out.get("title")))
+        out["title"] = title[:80]
+    if _numbers(str(out.get("subtitle") or "")) - fact_nums or not supported(str(out.get("subtitle") or "")):
+        if out.get("subtitle"):
+            dropped.append(str(out.get("subtitle")))
+        out["subtitle"] = ""
+    return out, dropped

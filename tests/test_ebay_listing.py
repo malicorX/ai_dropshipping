@@ -552,3 +552,44 @@ def test_category_must_share_a_word_with_the_title():
     title = "Familie Einkaufstasche Faltbar Einkaufskorb"
     assert aspects.category_fits(title, [sug("1", "Damentaschen", "Damen"), sug("2", "Einkaufstaschen", "Haushalt")])["category_id"] == "2"
     assert aspects.category_fits(title, [sug("1", "Damentaschen", "Damen")]) is None
+
+
+def test_enforce_facts_drops_invented_claims():
+    from dropship_desk.ollama_client import enforce_facts
+
+    title = "Einkaufstasche Faltbar mit Deckel"
+    bullets = ["Maße: 40 x 27 x 28 cm, Tragkraft 15kg", "Faltbar, gefaltet 40 x 27 x 7cm"]
+    specs = {"Marke": "Diurwur", "Farbe": "Schwarz"}
+    draft = {
+        "title": "Einkaufstasche Faltbar 99 Liter",
+        "subtitle": "Wasserdicht und extrem langlebig",
+        "intro_html": "<p>Faltbare Einkaufstasche mit Tragkraft 15kg. Schützt den Inhalt vor Regen und Sturm.</p>",
+        "advantages": ["Faltbar mit Tragkraft 15kg", "Lebenslange Garantie inklusive"],
+        "functions": ["Maße 40 x 27 x 28 cm", "Hält 50 kg aus"],
+        "scope_of_delivery": ["1x Tasche, 2x Schultergurt, 1x Beutel"],
+    }
+    out, dropped = enforce_facts(draft, title, bullets, specs)
+    assert out["advantages"] == ["Faltbar mit Tragkraft 15kg"]
+    assert out["functions"] == ["Maße 40 x 27 x 28 cm"]
+    assert "Regen" not in out["intro_html"] and "15kg" in out["intro_html"]
+    assert out["scope_of_delivery"] == []
+    assert out["title"] == title and out["subtitle"] == ""
+    assert any("Garantie" in d for d in dropped) and any("50 kg" in d for d in dropped)
+
+
+def test_unproven_aspects_become_honest_placeholders_when_allowed():
+    from dropship_desk.ebay import aspects
+
+    free = _defs("Länge")[0]
+    sel = {
+        "localizedAspectName": "Stil",
+        "aspectConstraint": {"aspectRequired": True, "aspectMode": "SELECTION_ONLY"},
+        "aspectValues": [{"localizedValue": "Modern"}, {"localizedValue": "Keine Angabe"}],
+    }
+    sel_no_placeholder = dict(sel, localizedAspectName="Form", aspectValues=[{"localizedValue": "Rund"}])
+    offer = {"title": "Tasche", "bullets": [], "specs": {}}
+    filled, problems = aspects.resolve_aspects(
+        [free, sel, sel_no_placeholder], offer, fill_placeholders=True
+    )
+    assert filled == {"Länge": ["Keine Angabe"], "Stil": ["Keine Angabe"]}
+    assert len(problems) == 1 and problems[0].startswith("Form")

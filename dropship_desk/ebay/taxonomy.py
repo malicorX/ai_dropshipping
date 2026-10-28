@@ -220,6 +220,7 @@ def verified_listing_specifics(
         offer,
         overrides,
         category_name=category.get("category_name", ""),
+        fill_placeholders=True,
     )
     if problems:
         raise aspects_mod.AspectsUnverified(

@@ -76,8 +76,12 @@ def generate_draft(
     offer_data = (row or {}).get("offer") or {}
     image_urls = list(offer_data.get("image_urls") or [])
     variation_label = str(offer_data.get("variation_label") or "")
+    facts_bullets = list(offer_data.get("bullets") or [])
+    facts_specs = dict(offer_data.get("specs") or {})
 
     if offer is not None:
+        facts_bullets = list(offer.bullets or facts_bullets)
+        facts_specs = dict(offer.specs or facts_specs)
         picked = offer
         amazon_title = picked.title or amazon_title
         amazon_total = picked.amazon_total
@@ -115,6 +119,8 @@ def generate_draft(
                     "do not publish the parent ASIN."
                 )
             picked = next((o for o in offers if o.asin.strip().upper() == asin), offers[0])
+            facts_bullets = list(picked.bullets or facts_bullets)
+            facts_specs = dict(picked.specs or facts_specs)
             amazon_title = picked.title or amazon_title
             amazon_total = picked.amazon_total
             image_urls = picked.image_urls or image_urls
@@ -160,6 +166,8 @@ def generate_draft(
             amazon_price=float(amazon_total),
             ebay_price=float(ebay_price),
             image_urls=image_urls,
+            bullets=facts_bullets,
+            specs=facts_specs,
             bullets_hint=(
                 f"Variante/Größe/Farbe: {variation_label}. "
                 "Nur DIESE Variante beschreiben; Geschwistergrößen nicht erwähnen."

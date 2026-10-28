@@ -131,6 +131,7 @@ def resolve_aspects(
     overrides: dict[str, Any] | None = None,
     *,
     category_name: str = "",
+    fill_placeholders: bool = False,
 ) -> tuple[dict[str, list[str]], list[str]]:
     """Return (aspects, problems); problems are required aspects without proof."""
     overrides = overrides or {}
@@ -140,6 +141,7 @@ def resolve_aspects(
     dims, dim_conflicts = dimensions(offer)
     filled: dict[str, list[str]] = {}
     problems: list[str] = []
+    placeholder_for: dict[str, list[str]] = {}
     for aspect in aspect_defs:
         name = str(aspect.get("localizedAspectName") or "").strip()
         if not name:
@@ -208,7 +210,35 @@ def resolve_aspects(
             problems.append(f"{name}: '{value}' ist kein erlaubter eBay-Wert")
             continue
         filled[name] = [value]
+    if fill_placeholders:
+        remaining: list[str] = []
+        for problem in problems:
+            name = problem.split(":", 1)[0]
+            definition = next(
+                (a for a in aspect_defs if str(a.get("localizedAspectName") or "").strip() == name),
+                {},
+            )
+            placeholder = _honest_placeholder(definition)
+            if placeholder:
+                filled[name] = [placeholder]
+            else:
+                remaining.append(problem)
+        problems = remaining
     return filled, problems
+
+
+_PLACEHOLDERS = ("Keine Angabe", "Nicht angegeben", "Unbekannt", "Nicht zutreffend")
+
+
+def _honest_placeholder(aspect: dict[str, Any]) -> str:
+    """'Not stated' value eBay accepts, instead of a guess.  Empty if none fits."""
+    allowed = _allowed(aspect)
+    selection_only = str((aspect.get("aspectConstraint") or {}).get("aspectMode") or "") == "SELECTION_ONLY"
+    for wanted in _PLACEHOLDERS:
+        for value in allowed:
+            if _fold(value) == _fold(wanted):
+                return value
+    return "" if selection_only else "Keine Angabe"
 
 
 def _title_noun_for_category(title: str, category_name: str) -> str:
