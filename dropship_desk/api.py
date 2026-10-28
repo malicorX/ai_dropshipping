@@ -295,12 +295,33 @@ def create_app() -> FastAPI:
                 detail="Live eBay Send/Publish needs an explicit confirm in the app",
             )
 
+    def _legacy_live_response() -> JSONResponse:
+        """The old single-listing endpoints are closed in production.
+
+        They write outside the guarded upload/publish plan (no server batch,
+        no cap, no live audit), so production always points the operator at
+        the Prepared tab / upload plan instead.  Sandbox is unchanged.
+        """
+        return JSONResponse(
+            status_code=403,
+            content={
+                "code": "LIVE_UPLOAD_DISABLED",
+                "detail": (
+                    "LIVE_UPLOAD_DISABLED: single-listing stage/publish is "
+                    "disabled in production — use the Prepared tab or the "
+                    "guarded upload plan."
+                ),
+            },
+        )
+
     @app.get("/api/ebay/listings/{asin}")
     def ebay_listing_get(asin: str) -> dict:
         return ebay_listing.public_listing(asin)
 
     @app.post("/api/ebay/listings/{asin}/stage")
-    def ebay_listing_stage(asin: str, body: dict | None = None) -> dict:
+    def ebay_listing_stage(asin: str, body: dict | None = None):
+        if config.ebay_env() == "production":
+            return _legacy_live_response()
         _require_ebay_sell(body)
         try:
             return ebay_listing.stage_unpublished(asin, body or None)
@@ -312,7 +333,9 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
     @app.post("/api/ebay/listings/{asin}/publish")
-    def ebay_listing_publish(asin: str, body: dict | None = None) -> dict:
+    def ebay_listing_publish(asin: str, body: dict | None = None):
+        if config.ebay_env() == "production":
+            return _legacy_live_response()
         _require_ebay_sell(body)
         try:
             return ebay_listing.publish_offer(asin)
@@ -423,6 +446,7 @@ def create_app() -> FastAPI:
                 file=file_name,
                 confirm=payload.get("confirm"),
                 batch_hash=payload.get("batch_hash"),
+                plan_nonce=payload.get("plan_nonce"),
             )
         except LiveUploadDisabled as e:
             return JSONResponse(
@@ -485,6 +509,7 @@ def create_app() -> FastAPI:
                 asins,
                 confirm=payload.get("confirm"),
                 batch_hash=payload.get("batch_hash"),
+                plan_nonce=payload.get("plan_nonce"),
             )
         except LiveUploadDisabled as e:
             return JSONResponse(

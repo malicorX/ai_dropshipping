@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "test": "tsc -p tsconfig.test.json && node --test test/uploadDuration.test.mjs",
+    "test": "tsc -p tsconfig.test.json && node --test test/uploadDuration.test.mjs test/liveUi.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

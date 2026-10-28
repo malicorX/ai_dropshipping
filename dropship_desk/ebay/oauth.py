@@ -7,7 +7,7 @@ import json
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import httpx
 
@@ -45,6 +45,37 @@ def load_tokens_for(env: str) -> dict[str, Any]:
 def oauth_connected(env: str | None = None) -> bool:
     tokens = load_tokens_for(env or config.ebay_env())
     return bool(tokens.get("refresh_token"))
+
+
+def env_for_url(url: str) -> str:
+    """The eBay env a request URL host belongs to."""
+    host = urlparse(url).hostname or ""
+    return config.env_for_ebay_host(host)
+
+
+def ensure_token_env_matches(url: str) -> str:
+    """Refuse a request whose URL host and token record disagree.
+
+    A sandbox access token must never be sent to a production URL and vice
+    versa.  The record's ``env`` is checked when present; legacy records
+    without an ``env`` field are accepted only when the live target has not
+    changed between building the URL and dispatching the request.
+    """
+    request_env = env_for_url(url)
+    current_env = config.ebay_env()
+    if current_env != request_env:
+        raise RuntimeError(
+            "LIVE_WRITE_BLOCKED: token env mismatch; the eBay target changed "
+            f"from {request_env} to {current_env} for host {urlparse(url).hostname}"
+        )
+    tokens = load_tokens_for(request_env)
+    record_env = str((tokens or {}).get("env") or "").strip()
+    if record_env and record_env != request_env:
+        raise RuntimeError(
+            "LIVE_WRITE_BLOCKED: token env mismatch; the stored "
+            f"{request_env} token record says {record_env}"
+        )
+    return request_env
 
 
 def _mask(value: str, keep: int = 6) -> str:
@@ -108,22 +139,24 @@ def load_tokens() -> dict[str, Any]:
     return load_tokens_for(config.ebay_env())
 
 
-def save_tokens(payload: dict[str, Any]) -> None:
+def save_tokens(payload: dict[str, Any], env: str | None = None) -> None:
+    target = config.normalize_ebay_env(env or config.ebay_env())
     now = time.time()
     expires_in = int(payload.get("expires_in") or 0)
     record = {
         "access_token": payload.get("access_token"),
-        "refresh_token": payload.get("refresh_token") or load_tokens().get("refresh_token"),
+        "refresh_token": payload.get("refresh_token")
+        or load_tokens_for(target).get("refresh_token"),
         "token_type": payload.get("token_type"),
         "expires_in": expires_in,
         "expires_at": datetime.fromtimestamp(now + expires_in, tz=timezone.utc).isoformat()
         if expires_in
         else None,
         "refresh_token_expires_in": payload.get("refresh_token_expires_in"),
-        "env": config.ebay_env(),
+        "env": target,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    token_path().write_text(json.dumps(record, indent=2), encoding="utf-8")
+    token_path_for(target).write_text(json.dumps(record, indent=2), encoding="utf-8")
 
 
 def _basic_auth_header() -> str:
@@ -132,6 +165,7 @@ def _basic_auth_header() -> str:
 
 
 def exchange_code(code: str) -> dict[str, Any]:
+    request_env = config.ebay_env()
     runame = config.ebay_runame()
     if not runame:
         raise ValueError("EBAY_*_RUNAME is empty")
@@ -154,13 +188,23 @@ def exchange_code(code: str) -> dict[str, Any]:
         if r.status_code >= 400:
             raise RuntimeError(f"eBay token exchange failed ({r.status_code}): {r.text[:400]}")
         payload = r.json()
-    save_tokens(payload)
+    # The response belongs to the env captured before the request; a flip while
+    # it was in flight must never write a production token into the sandbox
+    # file (or vice versa).
+    save_tokens(payload, env=request_env)
     return public_status()
 
 
 def access_token(*, skew_seconds: int = 120) -> str:
     """Return a usable user access token, refreshing when close to expiry."""
-    tokens = load_tokens()
+    current_env = config.ebay_env()
+    tokens = load_tokens_for(current_env)
+    record_env = str(tokens.get("env") or "").strip()
+    if record_env and record_env != current_env:
+        raise RuntimeError(
+            "LIVE_WRITE_BLOCKED: token env mismatch; the stored "
+            f"{current_env} token record says {record_env}"
+        )
     token = str(tokens.get("access_token") or "")
     refresh = str(tokens.get("refresh_token") or "")
     if not token and not refresh:
@@ -185,6 +229,14 @@ def _token_expiring(expires_at: Any, *, skew_seconds: int) -> bool:
 
 
 def _refresh_access_token(refresh_token: str) -> str:
+    request_env = config.ebay_env()
+    tokens = load_tokens_for(request_env)
+    record_env = str(tokens.get("env") or "").strip()
+    if record_env and record_env != request_env:
+        raise RuntimeError(
+            "LIVE_WRITE_BLOCKED: token env mismatch; cannot refresh a "
+            f"{record_env} token against {request_env}"
+        )
     data = {
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
@@ -204,7 +256,9 @@ def _refresh_access_token(refresh_token: str) -> str:
         if r.status_code >= 400:
             raise RuntimeError(f"eBay token refresh failed ({r.status_code}): {r.text[:400]}")
         payload = r.json()
-    save_tokens(payload)
+    # Persist under the env the refresh was issued for, not a target that may
+    # have flipped while the response was in flight.
+    save_tokens(payload, env=request_env)
     token = str(payload.get("access_token") or "")
     if not token:
         raise RuntimeError("eBay token refresh returned no access_token")

@@ -345,14 +345,18 @@ def test_production_stage_requires_confirm_live(tmp_path, monkeypatch):
     monkeypatch.setenv("EBAY_ENV", "production")
     monkeypatch.setenv("EBAY_AUTOMATION_ENABLED", "true")
     monkeypatch.setenv("EBAY_ALLOW_LIST", "true")
+    cfg.clear_live_env_cache()
     (tmp_path / "ebay_oauth_production.json").write_text(
         json.dumps({"refresh_token": "r", "access_token": "a"}),
         encoding="utf-8",
     )
     client = TestClient(create_app())
     r = client.post("/api/ebay/listings/B0TESTASI1/stage", json={})
-    assert r.status_code == 400
-    assert "confirm" in r.json()["detail"].lower()
+    # The old single-listing path is closed in production regardless of
+    # confirm_live: only the guarded Prepared/upload plan may write.
+    assert r.status_code == 403
+    assert r.json()["code"] == "LIVE_UPLOAD_DISABLED"
+    assert "Prepared" in r.json()["detail"]
 
 
 def test_target_switch_blocked_without_prod_keys(tmp_path, monkeypatch):

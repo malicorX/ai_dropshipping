@@ -57,8 +57,15 @@ def request(
     # the auth host.  The URL is fixed at this point, so a later env flip
     # cannot redirect this request to production.
     ensure_write_target_allowed(url)
+    token_value = token if token is not None else ebay_oauth.access_token()
+    # Re-check AFTER the token exists: a refresh can take long enough for the
+    # operator/target to change.  The token record's env must also match the
+    # host we are about to contact, so a sandbox token can never be sent to a
+    # production URL (and vice versa).
+    ensure_write_target_allowed(url)
+    ebay_oauth.ensure_token_env_matches(url)
     headers = {
-        "Authorization": f"Bearer {token or ebay_oauth.access_token()}",
+        "Authorization": f"Bearer {token_value}",
         "Accept": "application/json",
         "Accept-Language": CONTENT_LANGUAGE,
         "Content-Language": CONTENT_LANGUAGE,

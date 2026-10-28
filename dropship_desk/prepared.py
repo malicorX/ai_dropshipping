@@ -26,7 +26,7 @@ def _now() -> datetime:
 def _listing_state(asin: str, env: str) -> dict[str, Any]:
     """The current-env listing state, ignoring records for another target."""
     try:
-        state = ebay_listing.load_listing_state(asin)
+        state = ebay_listing.load_listing_state(asin, env=env)
     except OSError:
         return {}
     if not isinstance(state, dict) or not state:

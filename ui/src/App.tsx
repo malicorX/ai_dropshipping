@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
+  LEGACY_LIVE_DISABLED_REASON,
+  legacyListingDisabled,
+  liveBannerVisible,
+  withPlanNonce,
+} from "./liveUi";
+import {
   previewFileToLoad,
   rowDurationSeconds,
   runRowsMatchSelectedFile,
@@ -192,6 +198,7 @@ type LivePlan = {
   env: string;
   n: number;
   batch_hash: string;
+  nonce: string;
   cap: number;
   total: number;
   items: LivePlanItem[];
@@ -845,6 +852,10 @@ function EvaluatePanel({
   async function sendUnpublished() {
     if (!asinOnly || !draft) return;
     onError("");
+    if (legacyListingDisabled(ebayEnv)) {
+      onError(LEGACY_LIVE_DISABLED_REASON);
+      return;
+    }
     if (ebayEnv === "production") {
       const ok = window.confirm(
         `Send this unpublished offer to LIVE eBay?\n\n${draft.title || asinOnly}\n\nThis is not the sandbox.`
@@ -874,6 +885,10 @@ function EvaluatePanel({
   async function publishListing() {
     if (!asinOnly) return;
     onError("");
+    if (legacyListingDisabled(ebayEnv)) {
+      onError(LEGACY_LIVE_DISABLED_REASON);
+      return;
+    }
     if (ebayEnv === "production") {
       const ok = window.confirm(
         `Publish this offer on LIVE eBay? Buyers will see it.\n\n${
@@ -905,8 +920,8 @@ function EvaluatePanel({
       </p>
       {ebayEnv === "production" ? (
         <p className="error">
-          Target is live eBay. Send and Publish hit your real seller account (Settings → Sandbox to
-          switch back).
+          Target is live eBay. Send and Publish are disabled here —{" "}
+          {LEGACY_LIVE_DISABLED_REASON} (Settings → Sandbox to use this page).
         </p>
       ) : null}
       <div className="grid two">
@@ -1068,7 +1083,14 @@ function EvaluatePanel({
             <button
               type="button"
               className="primary"
-              disabled={ebayBusy !== null || !asinOnly}
+              disabled={
+                ebayBusy !== null || !asinOnly || legacyListingDisabled(ebayEnv)
+              }
+              title={
+                legacyListingDisabled(ebayEnv)
+                  ? LEGACY_LIVE_DISABLED_REASON
+                  : undefined
+              }
               onClick={() => void sendUnpublished()}
             >
               {ebayBusy === "stage"
@@ -1081,7 +1103,16 @@ function EvaluatePanel({
             </button>
             <button
               type="button"
-              disabled={ebayBusy !== null || ebayListing?.status !== "unpublished"}
+              disabled={
+                ebayBusy !== null ||
+                ebayListing?.status !== "unpublished" ||
+                legacyListingDisabled(ebayEnv)
+              }
+              title={
+                legacyListingDisabled(ebayEnv)
+                  ? LEGACY_LIVE_DISABLED_REASON
+                  : undefined
+              }
               onClick={() => void publishListing()}
             >
               {ebayBusy === "publish"
@@ -1487,6 +1518,9 @@ function DraftsPanel({
         Items that passed Find (margin + in-stock). Click List on eBay to write copy and send it.
         Refresh Amazon if a row is still a generic parent (no size/color).
       </p>
+      {legacyListingDisabled(ebayEnv) ? (
+        <p className="upload-warning">{LEGACY_LIVE_DISABLED_REASON}</p>
+      ) : null}
       <div className="actions">
         {(
           [
@@ -1568,7 +1602,12 @@ function DraftsPanel({
                 <button
                   type="button"
                   className="linkish"
-                  disabled={busyAsin === r.asin}
+                  disabled={busyAsin === r.asin || legacyListingDisabled(ebayEnv)}
+                  title={
+                    legacyListingDisabled(ebayEnv)
+                      ? LEGACY_LIVE_DISABLED_REASON
+                      : undefined
+                  }
                   onClick={() => void prepareWithRefresh(r)}
                 >
                   {busyAsin === r.asin ? "Refreshing…" : "List on eBay"}
@@ -1935,7 +1974,6 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
   const liveReady =
     production && (!!preview?.live_enabled || (running && !!status?.live));
   const liveBlocked = production && !liveReady;
-  const liveRunning = running && production && !!status?.live;
   const liveReason =
     (preview?.live_missing ?? []).join(", ") ||
     "EBAY_LIVE_UPLOAD_ENABLED is false";
@@ -1976,12 +2014,14 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
   async function startLive(plan: LivePlan, confirm: string) {
     const next = await api<UploadStatus>("/api/upload-items/start", {
       method: "POST",
-      body: JSON.stringify({
-        mode: "full",
-        file: selectedFile || undefined,
-        confirm,
-        batch_hash: plan.batch_hash,
-      }),
+      body: JSON.stringify(
+        withPlanNonce(plan, {
+          mode: "full",
+          file: selectedFile || undefined,
+          confirm,
+          batch_hash: plan.batch_hash,
+        }),
+      ),
     });
     setStatus(next);
     setMsg(`Started live ${next.run_id} (${next.mode})`);
@@ -2025,7 +2065,7 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
           gate is open. Switch to sandbox eBay in Settings to use the sandbox path.
         </p>
       ) : null}
-      {liveRunning ? (
+      {liveBannerVisible(status) ? (
         <div className="live-run-banner">PRODUCTION - real listings</div>
       ) : null}
       <div className="actions upload-file-picker">
@@ -2222,8 +2262,6 @@ function PreparedPanel({
         !!status?.live &&
         status?.target_env === "production"));
   const liveBlocked = production && !liveReady;
-  const liveRunning =
-    running && status?.mode === "publish" && !!status?.live;
   const liveReason =
     (overview?.live_missing ?? []).join(", ") ||
     "EBAY_LIVE_UPLOAD_ENABLED is false";
@@ -2267,7 +2305,9 @@ function PreparedPanel({
     const asins = plan.items.map((item) => item.asin);
     const next = await api<UploadStatus>("/api/prepared/publish", {
       method: "POST",
-      body: JSON.stringify({ asins, confirm, batch_hash: plan.batch_hash }),
+      body: JSON.stringify(
+        withPlanNonce(plan, { asins, confirm, batch_hash: plan.batch_hash }),
+      ),
     });
     setStatus(next);
     setMsg(`Started live ${next.run_id}`);
@@ -2310,7 +2350,7 @@ function PreparedPanel({
           gate is open. Switch to sandbox eBay in Settings to put prepared items live.
         </p>
       ) : null}
-      {liveRunning ? (
+      {liveBannerVisible(status) ? (
         <div className="live-run-banner">PRODUCTION - real listings</div>
       ) : null}
       <div className="actions">

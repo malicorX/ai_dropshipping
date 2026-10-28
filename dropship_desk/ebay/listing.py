@@ -25,12 +25,17 @@ def sku_for_asin(asin: str) -> str:
     return f"{SKU_PREFIX}{asin.strip().upper()}"
 
 
-def listing_state_path(asin: str):
-    return product_dir(asin) / f"ebay_{config.ebay_env()}.json"
+def _state_env(env: str | None = None) -> str:
+    """The env a state record belongs to (explicit, run env, else current)."""
+    return config.normalize_ebay_env(env if env is not None else config.state_env())
 
 
-def load_listing_state(asin: str) -> dict[str, Any]:
-    path = listing_state_path(asin)
+def listing_state_path(asin: str, env: str | None = None):
+    return product_dir(asin) / f"ebay_{_state_env(env)}.json"
+
+
+def load_listing_state(asin: str, env: str | None = None) -> dict[str, Any]:
+    path = listing_state_path(asin, env)
     if not path.is_file():
         return {}
     try:
@@ -39,54 +44,62 @@ def load_listing_state(asin: str) -> dict[str, Any]:
         return {}
 
 
-def save_listing_state(asin: str, state: dict[str, Any]) -> dict[str, Any]:
+def save_listing_state(
+    asin: str, state: dict[str, Any], env: str | None = None
+) -> dict[str, Any]:
+    target = _state_env(env)
     record = dict(state)
-    record["env"] = config.ebay_env()
+    record["env"] = target
     record["updated_at"] = datetime.now(timezone.utc).isoformat()
     record.setdefault("sku", sku_for_asin(asin))
-    record["seller_hub_url"] = seller_hub_url(record.get("status") or "")
-    record["item_url"] = item_url(str(record.get("listing_id") or ""))
-    listing_state_path(asin).write_text(json.dumps(record, indent=2), encoding="utf-8")
+    record["seller_hub_url"] = seller_hub_url(record.get("status") or "", env=target)
+    record["item_url"] = item_url(str(record.get("listing_id") or ""), env=target)
+    listing_state_path(asin, target).write_text(
+        json.dumps(record, indent=2), encoding="utf-8"
+    )
     save_ebay_listing(asin, record)
     return record
 
 
-def seller_hub_url(status: str) -> str:
+def seller_hub_url(status: str, env: str | None = None) -> str:
     """Unpublished Inventory offers are not Seller Hub drafts; that page 500s. After publish, My eBay."""
-    if config.ebay_env() != "production":
+    if _state_env(env) != "production":
         return ""
     if status == "published":
         return "https://www.ebay.de/mys/active"
     return ""
 
 
-def item_url(listing_id: str) -> str:
+def item_url(listing_id: str, env: str | None = None) -> str:
     if not listing_id:
         return ""
-    if config.ebay_env() == "production":
+    if _state_env(env) == "production":
         return f"https://www.ebay.de/itm/{listing_id}"
     return f"https://www.sandbox.ebay.com/itm/{listing_id}"
 
 
-def public_listing(asin: str) -> dict[str, Any]:
-    state = load_listing_state(asin)
+def public_listing(asin: str, env: str | None = None) -> dict[str, Any]:
+    target = _state_env(env)
+    state = load_listing_state(asin, target)
     if not state:
         return {
             "asin": asin.strip().upper(),
-            "env": config.ebay_env(),
+            "env": target,
             "status": "none",
             "sku": sku_for_asin(asin),
             "offer_id": "",
             "listing_id": "",
             "item_url": "",
-            "seller_hub_url": seller_hub_url(""),
+            "seller_hub_url": seller_hub_url("", env=target),
             "category_id": "",
             "category_name": "",
             "error": "",
         }
     listing = {"asin": asin.strip().upper(), **state}
-    listing["seller_hub_url"] = seller_hub_url(str(listing.get("status") or ""))
-    listing["item_url"] = item_url(str(listing.get("listing_id") or ""))
+    listing["seller_hub_url"] = seller_hub_url(
+        str(listing.get("status") or ""), env=target
+    )
+    listing["item_url"] = item_url(str(listing.get("listing_id") or ""), env=target)
     return listing
 
 
@@ -94,10 +107,19 @@ def stage_unpublished(
     asin: str,
     draft_patch: dict[str, Any] | None = None,
     *,
+    expected_price: float | None = None,
     http: HttpFn | None = None,
+    env: str | None = None,
 ) -> dict[str, Any]:
-    """Create/replace inventory item + unpublished offer. Does not publish."""
+    """Create/replace inventory item + unpublished offer. Does not publish.
+
+    ``expected_price`` is the price that passed the margin gate.  When given it
+    is the only price sent to eBay and the stored candidate price must still
+    match it at staging time, so a concurrent ``/api/evaluate`` can never
+    change what an in-flight live/publish row uploads.
+    """
     requester = http or ebay_http.request
+    request_env = _state_env(env)
     asin = asin.strip().upper()
     row = get_candidate_by_asin(asin)
     if not row:
@@ -114,7 +136,16 @@ def stage_unpublished(
         raise RuntimeError(
             "This ASIN is a variation parent. Send a child size/color row, not this one."
         )
-    price = float(row["ebay_price"])
+    stored_price = float(row["ebay_price"])
+    if expected_price is not None:
+        price = float(expected_price)
+        if abs(stored_price - price) > 0.005:
+            raise RuntimeError(
+                "PRICE_BINDING_MISMATCH: the candidate price changed after the "
+                f"margin gate (stored {stored_price:.2f}, expected {price:.2f})"
+            )
+    else:
+        price = stored_price
     if price <= 0:
         raise RuntimeError("eBay price must be > 0")
 
@@ -198,20 +229,32 @@ def stage_unpublished(
             "image_count": len(image_urls),
             "error": "",
         },
+        env=request_env,
     )
-    return public_listing(asin)
+    return public_listing(asin, env=request_env)
 
 
-def publish_offer(asin: str, *, http: HttpFn | None = None) -> dict[str, Any]:
-    """Convert an unpublished offer into a live (sandbox or production) listing."""
+def publish_offer(
+    asin: str,
+    *,
+    http: HttpFn | None = None,
+    env: str | None = None,
+) -> dict[str, Any]:
+    """Convert an unpublished offer into a live (sandbox or production) listing.
+
+    State is always read and written under the env captured when the call
+    started, never a process-wide target that flipped while the response was
+    in flight.
+    """
     requester = http or ebay_http.request
+    request_env = _state_env(env)
     asin = asin.strip().upper()
-    state = load_listing_state(asin)
+    state = load_listing_state(asin, request_env)
     offer_id = str(state.get("offer_id") or "")
     if not offer_id:
         raise RuntimeError("No unpublished offer yet — send the draft to eBay first")
     if state.get("status") == "published" and state.get("listing_id"):
-        return public_listing(asin)
+        return public_listing(asin, env=request_env)
     data = requester("POST", f"/sell/inventory/v1/offer/{offer_id}/publish") or {}
     listing_id = str(data.get("listingId") or "")
     save_listing_state(
@@ -222,8 +265,9 @@ def publish_offer(asin: str, *, http: HttpFn | None = None) -> dict[str, Any]:
             "listing_id": listing_id,
             "error": "",
         },
+        env=request_env,
     )
-    return public_listing(asin)
+    return public_listing(asin, env=request_env)
 
 
 def _create_or_update_offer(sku: str, payload: dict[str, Any], *, http: HttpFn) -> str:

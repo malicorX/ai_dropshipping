@@ -112,8 +112,9 @@ def _install_stubs(
             "artifacts": {},
         }
 
-    def fake_stage(asin, draft_patch=None):
+    def fake_stage(asin, draft_patch=None, **kwargs):
         calls["stage"].append(asin)
+        calls.setdefault("stage_kwargs", []).append(dict(kwargs))
         calls["pin"].append(cfg.production_live_pinned())
         ebay_listing.save_listing_state(
             asin,
@@ -241,6 +242,7 @@ def _upload_live(
         "batch_hash": (
             plan["batch_hash"] if batch_hash is _UNSET else batch_hash
         ),
+        "plan_nonce": plan.get("nonce", ""),
         **extra,
     }
     return client.post("/api/upload-items/start", json=body)
@@ -509,7 +511,7 @@ def test_live_happy_path_writes_planned_skus_and_audit(client, tmp_path, monkeyp
 
     lines = _audit_lines(tmp_path)
     starts = [line for line in lines if line.get("event") == "start"]
-    rows = {line["asin"]: line for line in lines if line.get("event") == "row"}
+    rows = {line["asin"]: line for line in lines if line.get("event") == "result"}
     assert len(starts) == 1
     assert starts[0]["n"] == 2
     assert starts[0]["batch_hash"] == plan["batch_hash"]
@@ -526,6 +528,10 @@ def test_live_happy_path_writes_planned_skus_and_audit(client, tmp_path, monkeyp
 
 def test_production_pin_allows_production_hosts_and_blocks_sandbox(monkeypatch):
     monkeypatch.setattr(cfg, "ebay_env", lambda: "production")
+    monkeypatch.setenv("EBAY_LIVE_UPLOAD_ENABLED", "true")
+    monkeypatch.setenv("EBAY_AUTOMATION_ENABLED", "true")
+    monkeypatch.setenv("EBAY_ALLOW_LIST", "true")
+    cfg.clear_live_env_cache()
     cfg.pin_production_for_live(True)
     try:
         cfg.ensure_write_target_allowed("https://api.ebay.com/sell/inventory/v1/offer")
@@ -626,7 +632,8 @@ def test_audit_append_failure_aborts_before_next_write(client, tmp_path, monkeyp
 
     def flaky(entry):
         seen["count"] += 1
-        if seen["count"] == 2:  # start line, then the first row line
+        # Start, intent and both writes succeed; the first result append fails.
+        if entry.get("event") == "result":
             raise OSError("audit disk full")
         return original(entry)
 
@@ -726,6 +733,7 @@ def test_live_publish_skips_existing_and_rechecks_prepared_price(
             "asins": [ASIN_A, ASIN_B],
             "confirm": "LIVE 2",
             "batch_hash": plan["batch_hash"],
+            "plan_nonce": plan["nonce"],
         },
     )
     assert response.status_code == 200, response.text
@@ -739,7 +747,7 @@ def test_live_publish_skips_existing_and_rechecks_prepared_price(
     # Publish re-checks the prepared sale price, not a fresh suggestion.
     assert calls["evaluate"] == [(ASIN_A, "always", 50.0)]
     lines = _audit_lines(tmp_path)
-    rows = {line["asin"]: line for line in lines if line.get("event") == "row"}
+    rows = {line["asin"]: line for line in lines if line.get("event") == "result"}
     assert rows[ASIN_A]["state"] == "published"
     assert rows[ASIN_B]["state"] == "skipped_existing"
 
@@ -756,6 +764,7 @@ def test_live_publish_margin_failure_writes_nothing(client, tmp_path, monkeypatc
             "asins": [ASIN_A],
             "confirm": "LIVE 1",
             "batch_hash": plan["batch_hash"],
+            "plan_nonce": plan["nonce"],
         },
     )
     assert response.status_code == 200, response.text
@@ -782,6 +791,7 @@ def test_live_publish_variation_parent_writes_nothing(client, tmp_path, monkeypa
             "asins": [ASIN_A],
             "confirm": "LIVE 1",
             "batch_hash": plan["batch_hash"],
+            "plan_nonce": plan["nonce"],
         },
     )
     assert response.status_code == 200, response.text

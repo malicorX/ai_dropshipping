@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import threading
 import time
@@ -77,6 +78,11 @@ LIVE_MISSING_ACCOUNT = "EBAY_PRODUCTION_ACCOUNT"
 LIVE_MODE_UPLOAD = "upload"
 LIVE_MODE_PUBLISH = "publish"
 LIVE_AUDIT_FILENAME = "live_audit.jsonl"
+# A live plan is confirmed by a server-issued, single-use nonce that expires
+# after ten minutes.  It is kept in memory only; a restart invalidates plans.
+LIVE_NONCE_TTL_SEC = 600.0
+_live_nonce_lock = threading.Lock()
+_live_nonces: dict[str, dict[str, Any]] = {}
 
 
 def normalize_asin(value: Any) -> str:
@@ -183,6 +189,7 @@ class UploadRow:
         default=None, repr=False, compare=False
     )
     _audited: bool = field(default=False, repr=False, compare=False)
+    _intent_audited: bool = field(default=False, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -233,7 +240,7 @@ def published_listing_state(asin: str, env: str) -> dict[str, Any] | None:
     """
     target = (env or "").strip()
     try:
-        state = ebay_listing.load_listing_state(asin)
+        state = ebay_listing.load_listing_state(asin, env=target or None)
     except OSError:
         return None
     if str(state.get("status") or "") != "published":
@@ -522,6 +529,73 @@ def compute_batch_hash(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def clear_live_nonces() -> None:
+    """Drop every outstanding plan nonce (tests; also useful after a target switch)."""
+    with _live_nonce_lock:
+        _live_nonces.clear()
+
+
+def _prune_live_nonces(now: float | None = None) -> None:
+    moment = _monotonic() if now is None else now
+    expired = [
+        nonce
+        for nonce, record in _live_nonces.items()
+        if moment - float(record.get("issued_at") or 0.0) > LIVE_NONCE_TTL_SEC
+    ]
+    for nonce in expired:
+        _live_nonces.pop(nonce, None)
+
+
+def issue_live_nonce(*, mode: str, env: str, batch_hash: str) -> str:
+    """Server-generated, single-use confirmation nonce for one plan."""
+    nonce = secrets.token_urlsafe(24)
+    with _live_nonce_lock:
+        _prune_live_nonces()
+        _live_nonces[nonce] = {
+            "mode": mode,
+            "env": config.normalize_ebay_env(env),
+            "batch_hash": batch_hash,
+            "issued_at": _monotonic(),
+        }
+    return nonce
+
+
+def _live_nonce_record(nonce: Any, *, mode: str, env: str, batch_hash: str) -> dict[str, Any]:
+    if not isinstance(nonce, str) or not nonce:
+        raise LiveConfirmMismatch(
+            "LIVE_CONFIRM_MISMATCH: plan nonce missing; request a fresh plan"
+        )
+    with _live_nonce_lock:
+        _prune_live_nonces()
+        record = _live_nonces.get(nonce)
+    if record is None:
+        raise LiveConfirmMismatch(
+            "LIVE_CONFIRM_MISMATCH: plan nonce is unknown, expired or already used"
+        )
+    if (
+        record.get("batch_hash") != batch_hash
+        or record.get("mode") != mode
+        or record.get("env") != config.normalize_ebay_env(env)
+    ):
+        raise LiveConfirmMismatch(
+            "LIVE_CONFIRM_MISMATCH: plan nonce was issued for a different batch"
+        )
+    return record
+
+
+def validate_live_nonce(nonce: Any, *, mode: str, env: str, batch_hash: str) -> None:
+    """Check a nonce without consuming it (start still has to succeed first)."""
+    _live_nonce_record(nonce, mode=mode, env=env, batch_hash=batch_hash)
+
+
+def consume_live_nonce(nonce: Any, *, mode: str, env: str, batch_hash: str) -> None:
+    """Validate and burn a nonce; only a successful start reaches this."""
+    _live_nonce_record(nonce, mode=mode, env=env, batch_hash=batch_hash)
+    with _live_nonce_lock:
+        _live_nonces.pop(str(nonce), None)
+
+
+
 def _unique_valid_asins(values: Any) -> list[str]:
     normalized: list[str] = []
     seen: set[str] = set()
@@ -584,11 +658,13 @@ def plan_live_batch(
     items = [_plan_item(asin) for asin in selected]
     total = round(sum(item["price"] for item in items if item["price"] is not None), 2)
     missing = live_gate_missing(target)
+    nonce = issue_live_nonce(mode=normalized_mode, env=target, batch_hash=batch_hash)
     return {
         "mode": normalized_mode,
         "env": target,
         "n": len(selected),
         "batch_hash": batch_hash,
+        "nonce": nonce,
         "cap": config.ebay_live_max_per_run(),
         "items": items,
         "total": total,
@@ -769,6 +845,7 @@ class UploadJobManager:
         file: str | None = None,
         confirm: str | None = None,
         batch_hash: str | None = None,
+        plan_nonce: str | None = None,
     ) -> dict[str, Any]:
         mode = str(mode or "full").strip().lower()
         if mode not in ("full", "prepare"):
@@ -811,6 +888,12 @@ class UploadJobManager:
                 if n > cap:
                     raise LiveCapExceeded(n, cap)
                 _validate_live_confirmation(confirm, n, batch_hash, computed_hash)
+                validate_live_nonce(
+                    plan_nonce,
+                    mode=LIVE_MODE_UPLOAD,
+                    env=env,
+                    batch_hash=computed_hash,
+                )
             # Prepare mode never talks to eBay, so it does not need OAuth.
             if mode == "full" and not ebay_oauth.oauth_connected(env):
                 label = "live" if production else "sandbox"
@@ -833,6 +916,15 @@ class UploadJobManager:
                         "cap": cap,
                         "who": "local",
                     }
+                )
+                # Consume only after every other check and the start line
+                # succeeded; a rejected start keeps the nonce for a retry with
+                # the same batch.
+                consume_live_nonce(
+                    plan_nonce,
+                    mode=LIVE_MODE_UPLOAD,
+                    env=env,
+                    batch_hash=computed_hash,
                 )
             self.state = UploadJobState(
                 run_id=run_id,
@@ -858,6 +950,7 @@ class UploadJobManager:
         asins: list[str],
         confirm: str | None = None,
         batch_hash: str | None = None,
+        plan_nonce: str | None = None,
     ) -> dict[str, Any]:
         """Stage + publish already-prepared ASINs (sandbox or guarded live)."""
         env = config.ebay_env()
@@ -914,6 +1007,12 @@ class UploadJobManager:
                 if n > cap:
                     raise LiveCapExceeded(n, cap)
                 _validate_live_confirmation(confirm, n, batch_hash, computed_hash)
+                validate_live_nonce(
+                    plan_nonce,
+                    mode=LIVE_MODE_PUBLISH,
+                    env=env,
+                    batch_hash=computed_hash,
+                )
             if not ebay_oauth.oauth_connected(env):
                 label = "live" if production else "sandbox"
                 raise NotSignedIn(
@@ -944,6 +1043,12 @@ class UploadJobManager:
                         "cap": cap,
                         "who": "local",
                     }
+                )
+                consume_live_nonce(
+                    plan_nonce,
+                    mode=LIVE_MODE_PUBLISH,
+                    env=env,
+                    batch_hash=computed_hash,
                 )
             self.state = UploadJobState(
                 run_id=run_id,
@@ -978,6 +1083,10 @@ class UploadJobManager:
         # a normal finish and after an unexpected crash.  A live run uses the
         # inverse pin: production only, and no sandbox host can be reached.
         live = self.state.live
+        # Freeze the run's env for the whole worker lifetime: state files use
+        # this captured value even if the target flips while a response is in
+        # flight.
+        config.set_run_env(self.state.target_env)
         if live:
             config.pin_production_for_live(True)
         else:
@@ -1025,6 +1134,7 @@ class UploadJobManager:
                     config.pin_production_for_live(False)
                 else:
                     config.pin_sandbox_for_upload(False)
+                config.set_run_env(None)
                 with self._lock:
                     # Also covers early exits via Stop / abort / target change:
                     # retryable rows that were already retried keep one
@@ -1076,6 +1186,11 @@ class UploadJobManager:
                     self.state.error = _reason(exc)
                     self.state.phase = "aborted"
                 self._audit_row_quietly(row)
+                return False
+            except LiveAuditError as exc:
+                # No eBay call happened for this row: the intent append failed
+                # first, so the run stops exactly like a failed result append.
+                self._abort_audit(row, exc)
                 return False
             retry_may_follow = (
                 self._is_retryable(row)
@@ -1222,13 +1337,35 @@ class UploadJobManager:
     def _check_target(self) -> None:
         self._check_live_guard()
 
+    def _check_target_after_response(self) -> None:
+        """The response belongs to the start env even if the target flipped."""
+        if config.ebay_env() != self.state.target_env:
+            raise _TargetChanged("target changed after response")
+
+    def _audit_intent(self, row: UploadRow) -> None:
+        """Append the pre-write intent line; a failure aborts before any call."""
+        if not self.state.live or row._intent_audited:
+            return
+        _append_live_audit_strict(
+            {
+                "ts": _utc_now(),
+                "event": "intent",
+                "run_id": self.state.run_id,
+                "asin": row.asin,
+                "sku": ebay_listing.sku_for_asin(row.asin) if row.asin else "",
+                "price": row.price,
+                "mode": self.state.mode,
+            }
+        )
+        row._intent_audited = True
+
     def _audit_row(self, row: UploadRow) -> None:
         if not self.state.live or row._audited:
             return
         _append_live_audit_strict(
             {
                 "ts": _utc_now(),
-                "event": "row",
+                "event": "result",
                 "run_id": self.state.run_id,
                 "asin": row.asin,
                 "sku": ebay_listing.sku_for_asin(row.asin) if row.asin else "",
@@ -1237,6 +1374,7 @@ class UploadJobManager:
                 "listing_id": row.listing_id,
                 "price": row.price,
                 "reason": row.reason,
+                "mode": self.state.mode,
             }
         )
         row._audited = True
@@ -1423,11 +1561,20 @@ class UploadJobManager:
             return
 
         self._check_target()
+        # Audit intent before the first eBay call of this row.  A failed
+        # append raises here, so the row makes no eBay call.
+        self._audit_intent(row)
+        stage_kwargs: dict[str, Any] = {}
+        if self.state.live:
+            # Bind the price that passed the margin gate.
+            stage_kwargs["expected_price"] = row.price
         try:
             if title_patch is not None:
-                staged = ebay_listing.stage_unpublished(asin, draft_patch=title_patch)
+                staged = ebay_listing.stage_unpublished(
+                    asin, draft_patch=title_patch, **stage_kwargs
+                )
             else:
-                staged = ebay_listing.stage_unpublished(asin)
+                staged = ebay_listing.stage_unpublished(asin, **stage_kwargs)
         except Exception as exc:  # noqa: BLE001
             if _is_live_write_blocked(exc) or config.ebay_env() != self.state.target_env:
                 raise _TargetChanged(_reason(exc)) from exc
@@ -1435,7 +1582,12 @@ class UploadJobManager:
             return
         with self._lock:
             row.offer_id = str(staged.get("offer_id") or "")
+            # The audit/result line records the price actually staged.
+            staged_price = _state_price(staged)
+            if staged_price is not None:
+                row.price = staged_price
             row.state = "staged"
+        self._check_target_after_response()
 
         self._check_target()
         try:
@@ -1449,8 +1601,12 @@ class UploadJobManager:
             row.offer_id = str(published.get("offer_id") or row.offer_id)
             row.listing_id = str(published.get("listing_id") or "")
             row.item_url = str(published.get("item_url") or "")
+            published_price = _state_price(published)
+            if published_price is not None:
+                row.price = published_price
             row.state = "published"
             self._stamp_finished(row)
+        self._check_target_after_response()
 
     def _save_prepared_draft(
         self, row: UploadRow, generated: Any, title_patch: dict[str, Any] | None
@@ -1559,8 +1715,12 @@ class UploadJobManager:
                 self._stamp_finished(row)
             return
 
+        self._audit_intent(row)
+        stage_kwargs: dict[str, Any] = {}
+        if self.state.live:
+            stage_kwargs["expected_price"] = row.price
         try:
-            staged = ebay_listing.stage_unpublished(asin)
+            staged = ebay_listing.stage_unpublished(asin, **stage_kwargs)
         except Exception as exc:  # noqa: BLE001
             if _is_live_write_blocked(exc) or config.ebay_env() != self.state.target_env:
                 raise _TargetChanged(_reason(exc)) from exc
@@ -1568,7 +1728,11 @@ class UploadJobManager:
             return
         with self._lock:
             row.offer_id = str(staged.get("offer_id") or "")
+            staged_price = _state_price(staged)
+            if staged_price is not None:
+                row.price = staged_price
             row.state = "staged"
+        self._check_target_after_response()
 
         self._check_target()
         try:
@@ -1582,8 +1746,12 @@ class UploadJobManager:
             row.offer_id = str(published.get("offer_id") or row.offer_id)
             row.listing_id = str(published.get("listing_id") or "")
             row.item_url = str(published.get("item_url") or "")
+            published_price = _state_price(published)
+            if published_price is not None:
+                row.price = published_price
             row.state = "published"
             self._stamp_finished(row)
+        self._check_target_after_response()
 
     def _finish(self, row: UploadRow, state: str, reason: str) -> None:
         with self._lock:
