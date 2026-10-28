@@ -14,7 +14,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from dropship_desk import config
@@ -56,6 +56,13 @@ EXISTING_REASON = "haben wir schon"
 PREPARED_REASON = "haben wir schon (vorbereitet)"
 TITLE_LIMIT = 80
 VARIATION_SEPARATOR = " - "
+DEFAULT_UPLOAD_FILE = "upload_items.txt"
+# Transient Amazon failures (connection reset/PDP unreachable) get a bounded
+# number of extra full passes.  The pause is patchable so tests run instantly.
+MAX_RETRY_PASSES = 2
+RETRY_PASS_PAUSE_SEC = 30
+RETRYABLE_ERROR_PREFIX = "AMAZON_UNREACHABLE"
+_RETRY_PAUSE_STEP_SEC = 0.25
 _ASIN_RE = re.compile(r"^[A-Z0-9]{10}$")
 
 
@@ -78,6 +85,17 @@ class UploadFileMissing(FileNotFoundError):
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         super().__init__(f"UPLOAD_FILE_MISSING: {self.path}")
+
+
+class InvalidUploadFile(ValueError):
+    """A requested upload file name is not a bare ``*.txt`` inside the folder."""
+
+    def __init__(self, name: Any) -> None:
+        self.name = str(name)
+        super().__init__(
+            f"INVALID_UPLOAD_FILE: {self.name!r} is not a .txt file directly "
+            f"inside {upload_items_dir()}"
+        )
 
 
 class UploadAlreadyRunning(RuntimeError):
@@ -117,6 +135,7 @@ class UploadRow:
     started_at: str = ""
     finished_at: str = ""
     duration_sec: float | None = None
+    attempts: int = 1
     _started_monotonic: float | None = field(
         default=None, repr=False, compare=False
     )
@@ -134,6 +153,7 @@ class UploadRow:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "duration_sec": self.duration_sec,
+            "attempts": self.attempts,
         }
 
 
@@ -203,7 +223,110 @@ def upload_items_path() -> Path:
     override = (os.environ.get("UPLOAD_ITEMS_FILE") or "").strip()
     if override:
         return Path(override)
-    return config.RUNTIME_ROOT / "upload_items" / "upload_items.txt"
+    return upload_items_dir() / DEFAULT_UPLOAD_FILE
+
+
+def _upload_override() -> str:
+    return (os.environ.get("UPLOAD_ITEMS_FILE") or "").strip()
+
+
+def upload_items_dir() -> Path:
+    """Folder that holds selectable ``*.txt`` upload lists (non-recursive)."""
+    override = _upload_override()
+    if override:
+        return Path(override).parent
+    return config.RUNTIME_ROOT / "upload_items"
+
+
+def _invalid_name(name: Any) -> bool:
+    """True unless ``name`` is a bare ``*.txt`` file name (no path parts)."""
+    if not isinstance(name, str):
+        return True
+    if not name or name != name.strip():
+        return True
+    if "/" in name or "\\" in name:
+        return True
+    # ``..`` anywhere is refused, not only as a whole component.
+    if ".." in name or name in (".", ".."):
+        return True
+    if os.path.isabs(name) or PureWindowsPath(name).is_absolute():
+        return True
+    if PureWindowsPath(name).drive or PureWindowsPath(name).root:
+        return True
+    if Path(name).name != name:
+        return True
+    return Path(name).suffix.lower() != ".txt"
+
+
+def resolve_upload_file(name: str | None = None) -> Path:
+    """Resolve an optional bare file name to an existing file in the folder.
+
+    ``None``/empty keeps the historical default (``upload_items.txt`` or the
+    ``UPLOAD_ITEMS_FILE`` override).  An explicitly supplied name is a trust
+    boundary: it must be a bare ``*.txt`` file name resolving directly inside
+    ``upload_items_dir()``.  Nothing is read before this validation passes.
+    """
+    if name is None or (isinstance(name, str) and not name.strip()):
+        return upload_items_path()
+    if _invalid_name(name):
+        raise InvalidUploadFile(name)
+    assert isinstance(name, str)
+    base = upload_items_dir().resolve()
+    candidate = (base / name).resolve()
+    try:
+        candidate.relative_to(base)
+    except ValueError as exc:
+        raise InvalidUploadFile(name) from exc
+    if candidate.parent != base or not candidate.is_file():
+        raise InvalidUploadFile(name)
+    return candidate
+
+
+def list_upload_files() -> dict[str, Any]:
+    """List the ``*.txt`` lists directly inside the upload folder, newest first."""
+    base = upload_items_dir()
+    entries: list[dict[str, Any]] = []
+    try:
+        children = list(base.iterdir())
+    except OSError:
+        children = []
+    for path in children:
+        try:
+            if not path.is_file() or path.suffix.lower() != ".txt":
+                continue
+            stat = path.stat()
+            text = path.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            continue
+        entries.append(
+            {
+                "name": path.name,
+                "size": stat.st_size,
+                "modified": datetime.fromtimestamp(
+                    stat.st_mtime, timezone.utc
+                ).isoformat(),
+                "lines": len(text.splitlines()),
+                "_mtime": stat.st_mtime,
+            }
+        )
+    entries.sort(key=lambda entry: entry["_mtime"], reverse=True)
+    for entry in entries:
+        entry.pop("_mtime", None)
+    names = [entry["name"] for entry in entries]
+    override = _upload_override()
+    if override:
+        override_name = Path(override).name
+        if override_name in names:
+            default = override_name
+        elif DEFAULT_UPLOAD_FILE in names:
+            default = DEFAULT_UPLOAD_FILE
+        else:
+            default = names[0] if names else override_name
+    elif DEFAULT_UPLOAD_FILE in names:
+        default = DEFAULT_UPLOAD_FILE
+    else:
+        default = names[0] if names else DEFAULT_UPLOAD_FILE
+    return {"dir": str(base), "default": default, "files": entries}
 
 
 def read_upload_file(path: str | Path | None = None) -> list[UploadRow]:
@@ -280,6 +403,8 @@ class UploadJobState:
     phase: str = "idle"
     mode: str = "full"
     error: str = ""
+    file: str = ""
+    retry_pass: int = 0
     rows: list[UploadRow] = field(default_factory=list)
 
     def counters(self) -> dict[str, int]:
@@ -300,6 +425,8 @@ class UploadJobState:
             "phase": self.phase,
             "mode": self.mode,
             "error": self.error,
+            "file": self.file,
+            "retry_pass": self.retry_pass,
             "rows": [row.to_dict() for row in self.rows],
             "counters": self.counters(),
         }
@@ -348,7 +475,7 @@ class UploadJobManager:
         with self._lock:
             return self.state.to_dict()
 
-    def start(self, mode: str = "full") -> dict[str, Any]:
+    def start(self, mode: str = "full", file: str | None = None) -> dict[str, Any]:
         mode = str(mode or "full").strip().lower()
         if mode not in ("full", "prepare"):
             raise ValueError(f"unknown upload mode {mode!r} (use 'full' or 'prepare')")
@@ -357,11 +484,13 @@ class UploadJobManager:
             raise LiveUploadDisabled(
                 "LIVE_UPLOAD_DISABLED: live eBay uploads are disabled by the operator"
             )
+        # Trust boundary: an explicit name is validated before any file read.
+        path = resolve_upload_file(file)
 
         with self._lock:
             if self.state.running:
                 raise UploadAlreadyRunning(self.state.run_id)
-            rows = read_upload_file()
+            rows = read_upload_file(path)
             # Prepare mode never talks to eBay, so it does not need OAuth.
             if mode == "full" and not ebay_oauth.oauth_connected(env):
                 raise NotSignedIn(
@@ -375,6 +504,7 @@ class UploadJobManager:
                 running=True,
                 phase="starting",
                 mode=mode,
+                file=path.name,
                 rows=rows,
             )
 
@@ -468,38 +598,30 @@ class UploadJobManager:
         # a normal finish and after an unexpected crash.
         config.pin_sandbox_for_upload(True)
         try:
-            for row in self.state.rows:
-                with self._lock:
-                    if self.state.stop_requested:
-                        self.state.phase = "stopped"
-                        return
-                    if row.state != "queued":
-                        continue
-                    self.state.phase = "running"
-                    row.started_at = _utc_now()
-                    row.finished_at = ""
-                    row.duration_sec = None
-                    row._started_monotonic = _monotonic()
-
-                if config.ebay_env() != self.state.target_env:
-                    self._abort_target_changed(row)
-                    return
-
-                try:
-                    self._process_row(row)
-                except _TargetChanged:
-                    self._abort_target_changed(row)
-                    return
-                except _AbortRun as exc:
+            for pass_no in range(0, MAX_RETRY_PASSES + 1):
+                if pass_no > 0:
                     with self._lock:
-                        row.state = "error"
-                        row.reason = _reason(exc)
-                        self._stamp_finished(row)
-                        self.state.error = _reason(exc)
-                        self.state.phase = "aborted"
+                        eligible = [
+                            row for row in self.state.rows if self._is_retryable(row)
+                        ]
+                        if not eligible:
+                            break
+                        if self.state.stop_requested:
+                            self.state.phase = "stopped"
+                            return
+                        self.state.retry_pass = pass_no
+                        self.state.phase = "retrying"
+                    # The pause is interruptible: Stop/target change ends the
+                    # run within one small step instead of after the full wait.
+                    if not self._retry_pause():
+                        return
+                    with self._lock:
+                        self._requeue_retryable()
+                if not self._run_pass():
                     return
 
             with self._lock:
+                self._finalize_retry_reasons()
                 if self.state.stop_requested:
                     self.state.phase = "stopped"
                 else:
@@ -512,6 +634,96 @@ class UploadJobManager:
             config.pin_sandbox_for_upload(False)
             with self._lock:
                 self.state.running = False
+
+    def _run_pass(self) -> bool:
+        """Run every queued row once; False means the whole run must end."""
+        for row in self.state.rows:
+            with self._lock:
+                if self.state.stop_requested:
+                    self.state.phase = "stopped"
+                    return False
+                if row.state != "queued":
+                    continue
+                self.state.phase = "running"
+                row.started_at = _utc_now()
+                row.finished_at = ""
+                row.duration_sec = None
+                row._started_monotonic = _monotonic()
+
+            if config.ebay_env() != self.state.target_env:
+                self._abort_target_changed(row)
+                return False
+
+            try:
+                self._process_row(row)
+            except _TargetChanged:
+                self._abort_target_changed(row)
+                return False
+            except _AbortRun as exc:
+                with self._lock:
+                    row.state = "error"
+                    row.reason = _reason(exc)
+                    self._stamp_finished(row)
+                    self.state.error = _reason(exc)
+                    self.state.phase = "aborted"
+                return False
+        return True
+
+    @staticmethod
+    def _is_retryable(row: UploadRow) -> bool:
+        return row.state == "error" and str(row.reason).strip().upper().startswith(
+            RETRYABLE_ERROR_PREFIX
+        )
+
+    def _requeue_retryable(self) -> None:
+        """Reset every transient row to queued for another pass (lock held)."""
+        for row in self.state.rows:
+            if not self._is_retryable(row):
+                continue
+            row.attempts += 1
+            row.state = "queued"
+            row.reason = ""
+            row.started_at = ""
+            row.finished_at = ""
+            row.duration_sec = None
+            row._started_monotonic = None
+
+    def _retry_pause(self) -> bool:
+        """Sleep before a retry pass in small slices; False ends the run."""
+        remaining = max(0.0, float(RETRY_PASS_PAUSE_SEC))
+        while remaining > 0:
+            if self.state.stop_requested:
+                with self._lock:
+                    self.state.phase = "stopped"
+                return False
+            if config.ebay_env() != self.state.target_env:
+                with self._lock:
+                    self.state.error = (
+                        "aborted_target_changed: eBay target changed during the run"
+                    )
+                    self.state.phase = "aborted_target_changed"
+                return False
+            step = min(_RETRY_PAUSE_STEP_SEC, remaining)
+            time.sleep(step)
+            remaining -= step
+        if self.state.stop_requested:
+            with self._lock:
+                self.state.phase = "stopped"
+            return False
+        if config.ebay_env() != self.state.target_env:
+            with self._lock:
+                self.state.error = (
+                    "aborted_target_changed: eBay target changed during the run"
+                )
+                self.state.phase = "aborted_target_changed"
+            return False
+        return True
+
+    def _finalize_retry_reasons(self) -> None:
+        """Mark exhausted transient failures with their total attempt count."""
+        for row in self.state.rows:
+            if row.attempts > 1 and self._is_retryable(row):
+                row.reason = f"after {row.attempts} attempts: {row.reason}"
 
     def _abort_target_changed(self, row: UploadRow) -> None:
         with self._lock:

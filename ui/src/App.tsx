@@ -145,12 +145,27 @@ type UploadRow = {
   started_at: string;
   finished_at: string;
   duration_sec: number | null;
+  attempts: number;
+};
+
+type UploadFileEntry = {
+  name: string;
+  size: number;
+  modified: string;
+  lines: number;
+};
+
+type UploadFiles = {
+  dir: string;
+  default: string;
+  files: UploadFileEntry[];
 };
 
 type UploadPreview = {
   target_env: string;
   live_disabled: boolean;
   path: string;
+  file: string;
   rows: UploadRow[];
 };
 
@@ -163,6 +178,8 @@ type UploadStatus = {
   phase: string;
   mode: string;
   error: string;
+  file: string;
+  retry_pass: number;
   rows: UploadRow[];
   counters: Record<string, number>;
 };
@@ -1563,6 +1580,9 @@ function RunProgressTable({
                 <span className={bad ? "badge fail" : good ? "badge ok" : "badge"}>
                   {uploadStateLabel(row.state)}
                 </span>
+                {row.attempts > 1 ? (
+                  <span className="muted"> {row.attempts}x</span>
+                ) : null}
               </td>
               <td>{row.reason || "—"}</td>
               <td className="mono">
@@ -1586,20 +1606,41 @@ function RunProgressTable({
   );
 }
 
+const UPLOAD_FILE_STORAGE_KEY = "dropship.uploadFile";
+
 function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
   const [preview, setPreview] = useState<UploadPreview | null>(null);
   const [status, setStatus] = useState<UploadStatus | null>(null);
+  const [fileList, setFileList] = useState<UploadFiles | null>(null);
+  const [selectedFile, setSelectedFile] = useState<string>(() => {
+    try {
+      return window.localStorage.getItem(UPLOAD_FILE_STORAGE_KEY) ?? "";
+    } catch {
+      return "";
+    }
+  });
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   const [nowMs, setNowMs] = useState(() => Date.now());
 
-  const loadPreview = useCallback(async () => {
+  const loadFiles = useCallback(async () => {
     try {
-      setPreview(await api<UploadPreview>("/api/upload-items/preview"));
+      setFileList(await api<UploadFiles>("/api/upload-items/files"));
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e));
     }
   }, [onError]);
+
+  const loadPreview = useCallback(async () => {
+    const query = selectedFile
+      ? `?file=${encodeURIComponent(selectedFile)}`
+      : "";
+    try {
+      setPreview(await api<UploadPreview>(`/api/upload-items/preview${query}`));
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    }
+  }, [onError, selectedFile]);
 
   const loadStatus = useCallback(async () => {
     try {
@@ -1610,6 +1651,22 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
   }, []);
 
   useEffect(() => {
+    void loadFiles();
+  }, [loadFiles]);
+
+  // Once the folder listing arrives, keep the remembered name when it still
+  // exists; otherwise fall back to upload_items.txt (or the newest list).
+  useEffect(() => {
+    if (!fileList) {
+      return;
+    }
+    const names = fileList.files.map((entry) => entry.name);
+    setSelectedFile((current) =>
+      current && names.includes(current) ? current : fileList.default || names[0] || "",
+    );
+  }, [fileList]);
+
+  useEffect(() => {
     void loadPreview();
     void loadStatus();
     const id = window.setInterval(() => {
@@ -1617,6 +1674,15 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
     }, 2000);
     return () => window.clearInterval(id);
   }, [loadPreview, loadStatus]);
+
+  function chooseFile(name: string) {
+    setSelectedFile(name);
+    try {
+      window.localStorage.setItem(UPLOAD_FILE_STORAGE_KEY, name);
+    } catch {
+      /* storage may be disabled; the choice still holds for this session */
+    }
+  }
 
   const anyRunning = !!status?.running;
   // A publish run belongs to the Prepared tab; this panel renders progress and
@@ -1665,7 +1731,7 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
     try {
       const next = await api<UploadStatus>("/api/upload-items/start", {
         method: "POST",
-        body: JSON.stringify({ mode }),
+        body: JSON.stringify({ mode, file: selectedFile || undefined }),
       });
       setStatus(next);
       setMsg(`Started ${next.run_id} (${next.mode})`);
@@ -1696,9 +1762,10 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
         <div>
           <h2>Upload items from file</h2>
           <p className="muted">
-            Reads <span className="mono">{preview?.path || "upload_items/upload_items.txt"}</span>{" "}
-            (one Amazon.de link per line) and runs every link through fetch → evaluate → draft →
-            stage → publish. Sequential and reattaches after a reload.
+            Reads <span className="mono">{preview?.file || "upload_items.txt"}</span> from{" "}
+            <span className="mono">{fileList?.dir || "upload_items/"}</span> (one Amazon.de
+            link per line) and runs every link through fetch → evaluate → draft → stage →
+            publish. Sequential and reattaches after a reload.
           </p>
         </div>
         <span className={live ? "upload-target live" : "upload-target"}>
@@ -1711,6 +1778,28 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
           any network call. Switch to sandbox eBay in Settings to use them.
         </p>
       ) : null}
+      <div className="actions upload-file-picker">
+        <label htmlFor="upload-file-select">List file</label>
+        <select
+          id="upload-file-select"
+          value={selectedFile}
+          disabled={anyRunning || busy}
+          onChange={(event) => chooseFile(event.target.value)}
+        >
+          {selectedFile &&
+          !(fileList?.files ?? []).some((entry) => entry.name === selectedFile) ? (
+            <option value={selectedFile}>{selectedFile}</option>
+          ) : null}
+          {(fileList?.files ?? []).map((entry) => (
+            <option key={entry.name} value={entry.name}>
+              {entry.name} · {entry.lines} lines
+            </option>
+          ))}
+        </select>
+        {fileList && fileList.files.length === 0 ? (
+          <span className="muted">No .txt files in {fileList.dir}</span>
+        ) : null}
+      </div>
       <div className="actions">
         <button type="button" onClick={() => void loadPreview()}>
           Preview
@@ -1746,9 +1835,9 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
         {publishRunning
           ? "Publish run in progress, see the Prepared tab."
           : running
-            ? `Run ${status?.run_id || "…"} · ${status?.phase || "starting"}`
+            ? `Run ${status?.run_id || "…"} · ${status?.phase || "starting"} · ${status?.file || "…"}`
             : hasUploadStatus && status?.run_id
-              ? `Last run ${status.run_id} · ${status.phase}`
+              ? `Last run ${status.run_id} · ${status.phase} · ${status.file || "…"}`
               : status?.mode === "publish"
                 ? "Last run was a publish run, see the Prepared tab."
                 : "No run yet."}
