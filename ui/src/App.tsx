@@ -32,6 +32,10 @@ type Health = {
     production_oauth_connected?: boolean;
     sandbox_gaps?: string[];
     production_gaps?: string[];
+    live_upload_enabled?: boolean;
+    live_max_per_run?: number;
+    live_upload_missing?: string[];
+    live_upload_ready?: boolean;
   };
 };
 
@@ -169,9 +173,30 @@ type UploadFiles = {
 type UploadPreview = {
   target_env: string;
   live_disabled: boolean;
+  live_enabled?: boolean;
+  live_missing?: string[];
+  live_cap?: number;
   path: string;
   file: string;
   rows: UploadRow[];
+};
+
+type LivePlanItem = {
+  asin: string;
+  title: string;
+  price: number | null;
+};
+
+type LivePlan = {
+  mode: string;
+  env: string;
+  n: number;
+  batch_hash: string;
+  cap: number;
+  total: number;
+  items: LivePlanItem[];
+  live_enabled: boolean;
+  live_missing: string[];
 };
 
 type UploadStatus = {
@@ -185,6 +210,10 @@ type UploadStatus = {
   error: string;
   file: string;
   retry_pass: number;
+  live?: boolean;
+  batch_hash?: string;
+  live_cap?: number;
+  planned?: number;
   rows: UploadRow[];
   counters: Record<string, number>;
 };
@@ -208,6 +237,9 @@ type PreparedItem = {
 type PreparedOverview = {
   target_env: string;
   live_disabled: boolean;
+  live_enabled?: boolean;
+  live_missing?: string[];
+  live_cap?: number;
   items: PreparedItem[];
 };
 
@@ -1611,6 +1643,165 @@ function RunProgressTable({
   );
 }
 
+function LivePlanPanel({
+  mode,
+  file,
+  asins,
+  disabled,
+  runLabel,
+  onError,
+  onRun,
+}: {
+  mode: "upload" | "publish";
+  file?: string;
+  asins?: string[];
+  disabled?: boolean;
+  runLabel?: string;
+  onError: (msg: string) => void;
+  onRun: (plan: LivePlan, confirm: string) => Promise<void>;
+}) {
+  const [plan, setPlan] = useState<LivePlan | null>(null);
+  const [confirmText, setConfirmText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  const selectionKey =
+    mode === "upload" ? (file ?? "") : (asins ?? []).join(",");
+  useEffect(() => {
+    setPlan(null);
+    setConfirmText("");
+    setMsg("");
+  }, [selectionKey, mode]);
+
+  const expected = plan ? `LIVE ${plan.n}` : "";
+  const overCap = !!plan && plan.n > plan.cap;
+  const matches =
+    !!plan && plan.live_enabled && !overCap && confirmText === expected;
+
+  async function makePlan() {
+    onError("");
+    setBusy(true);
+    setMsg("Planning…");
+    try {
+      const body =
+        mode === "upload"
+          ? { mode: "upload", file: file || undefined }
+          : { mode: "publish", asins: asins ?? [] };
+      const next = await api<LivePlan>("/api/live/plan", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      setPlan(next);
+      setConfirmText("");
+      setMsg(
+        `Plan: ${next.n} item(s), total €${next.total.toFixed(2)}, cap ${next.cap}`,
+      );
+    } catch (e) {
+      const text = e instanceof Error ? e.message : String(e);
+      onError(text);
+      setMsg(text);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function run() {
+    if (!plan || !matches) {
+      return;
+    }
+    onError("");
+    setBusy(true);
+    setMsg("Starting live run…");
+    try {
+      await onRun(plan, confirmText);
+      setMsg("Live run started.");
+    } catch (e) {
+      const text = e instanceof Error ? e.message : String(e);
+      onError(text);
+      setMsg(text);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="live-plan">
+      <div className="actions">
+        <button
+          type="button"
+          className="primary"
+          disabled={!!disabled || busy}
+          onClick={() => void makePlan()}
+        >
+          {busy && !plan ? "Planning…" : "Live: plan..."}
+        </button>
+        {msg ? <span className="muted">{msg}</span> : null}
+      </div>
+      {plan ? (
+        <>
+          <p className="live-plan-summary">
+            LIVE <strong>{plan.n}</strong> item(s) · total €{plan.total.toFixed(2)} · cap{" "}
+            {plan.cap} · {plan.mode}
+          </p>
+          {!plan.live_enabled ? (
+            <p className="upload-warning">
+              Live gate closed: {plan.live_missing.join(", ") || "unknown gate"}.
+            </p>
+          ) : null}
+          {overCap ? (
+            <p className="upload-warning">
+              Batch of {plan.n} exceeds the live cap of {plan.cap}.
+            </p>
+          ) : null}
+          <table>
+            <thead>
+              <tr>
+                <th>ASIN</th>
+                <th>Title</th>
+                <th>Price</th>
+              </tr>
+            </thead>
+            <tbody>
+              {plan.items.slice(0, 6).map((item) => (
+                <tr key={item.asin}>
+                  <td className="mono">{item.asin}</td>
+                  <td>{item.title || "—"}</td>
+                  <td className="mono">
+                    {item.price === null ? "—" : `€${item.price.toFixed(2)}`}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {plan.items.length > 6 ? (
+            <p className="muted">… {plan.items.length - 6} more item(s)</p>
+          ) : null}
+          <div className="actions live-confirm">
+            <label>
+              Type <span className="mono">{expected}</span> exactly{" "}
+              <input
+                value={confirmText}
+                onChange={(event) => setConfirmText(event.target.value)}
+                autoComplete="off"
+                spellCheck={false}
+                disabled={busy}
+              />
+            </label>
+            <button
+              type="button"
+              className="primary"
+              disabled={busy || !matches || !!disabled}
+              onClick={() => void run()}
+            >
+              {runLabel || `LIVE: ${plan.n} item(s)`}
+            </button>
+          </div>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
 const UPLOAD_FILE_STORAGE_KEY = "dropship.uploadFile";
 
 function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
@@ -1740,7 +1931,14 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
   // When no run is active the badge must describe the current Settings
   // target, not the target_env remembered from the last run.
   const target = running ? status?.target_env || liveEnv : liveEnv;
-  const live = target === "production" || (!anyRunning && !!preview?.live_disabled);
+  const production = target === "production";
+  const liveReady =
+    production && (!!preview?.live_enabled || (running && !!status?.live));
+  const liveBlocked = production && !liveReady;
+  const liveRunning = running && production && !!status?.live;
+  const liveReason =
+    (preview?.live_missing ?? []).join(", ") ||
+    "EBAY_LIVE_UPLOAD_ENABLED is false";
   // Run rows belong to the file that was actually started.  If the selected
   // file differs (or there is no upload run at all), show the preview of the
   // selected file instead of another file's run.
@@ -1775,6 +1973,21 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
     }
   }
 
+  async function startLive(plan: LivePlan, confirm: string) {
+    const next = await api<UploadStatus>("/api/upload-items/start", {
+      method: "POST",
+      body: JSON.stringify({
+        mode: "full",
+        file: selectedFile || undefined,
+        confirm,
+        batch_hash: plan.batch_hash,
+      }),
+    });
+    setStatus(next);
+    setMsg(`Started live ${next.run_id} (${next.mode})`);
+    await loadPreview();
+  }
+
   async function stop() {
     onError("");
     try {
@@ -1798,15 +2011,22 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
             publish. Sequential and reattaches after a reload.
           </p>
         </div>
-        <span className={live ? "upload-target live" : "upload-target"}>
-          {live ? "LIVE disabled" : "-> sandbox eBay"}
+        <span className={production ? "upload-target live" : "upload-target"}>
+          {production
+            ? liveReady
+              ? "LIVE (guarded)"
+              : "LIVE disabled"
+            : "-> sandbox eBay"}
         </span>
       </div>
-      {live ? (
+      {liveBlocked ? (
         <p className="upload-warning">
-          Production target: upload and prepare are refused with LIVE_UPLOAD_DISABLED before
-          any network call. Switch to sandbox eBay in Settings to use them.
+          Production live path is closed: {liveReason}. Nothing is sent to eBay until every
+          gate is open. Switch to sandbox eBay in Settings to use the sandbox path.
         </p>
+      ) : null}
+      {liveRunning ? (
+        <div className="live-run-banner">PRODUCTION - real listings</div>
       ) : null}
       <div className="actions upload-file-picker">
         <label htmlFor="upload-file-select">List file</label>
@@ -1834,17 +2054,28 @@ function UploadItemsPanel({ onError }: { onError: (msg: string) => void }) {
         <button type="button" onClick={() => void loadPreview()}>
           Preview
         </button>
+        {!production ? (
+          <button
+            type="button"
+            className="primary"
+            disabled={anyRunning || busy}
+            onClick={() => void start("full")}
+          >
+            {running && status?.mode !== "prepare" ? "Uploading…" : "Start upload from file"}
+          </button>
+        ) : liveReady ? (
+          <LivePlanPanel
+            mode="upload"
+            file={selectedFile || undefined}
+            disabled={anyRunning || busy}
+            runLabel="LIVE: upload this file"
+            onError={onError}
+            onRun={startLive}
+          />
+        ) : null}
         <button
           type="button"
-          className="primary"
-          disabled={anyRunning || live || busy}
-          onClick={() => void start("full")}
-        >
-          {running && status?.mode !== "prepare" ? "Uploading…" : "Start upload from file"}
-        </button>
-        <button
-          type="button"
-          disabled={anyRunning || live || busy}
+          disabled={anyRunning || liveBlocked || busy}
           onClick={() => void start("prepare")}
         >
           {running && status?.mode === "prepare" ? "Preparing…" : "Only prepare (no eBay)"}
@@ -1983,7 +2214,19 @@ function PreparedPanel({
   }, [running, load]);
 
   const items = overview?.items ?? [];
-  const liveDisabled = live || !!overview?.live_disabled;
+  const production = live;
+  const liveReady =
+    production &&
+    (!!overview?.live_enabled ||
+      (running &&
+        !!status?.live &&
+        status?.target_env === "production"));
+  const liveBlocked = production && !liveReady;
+  const liveRunning =
+    running && status?.mode === "publish" && !!status?.live;
+  const liveReason =
+    (overview?.live_missing ?? []).join(", ") ||
+    "EBAY_LIVE_UPLOAD_ENABLED is false";
   const allSelected = items.length > 0 && selected.length === items.length;
   // Only publish-run rows belong here; full/prepare runs are shown on Upload.
   const rows = status?.mode === "publish" ? status?.rows ?? [] : [];
@@ -2020,6 +2263,18 @@ function PreparedPanel({
     }
   }
 
+  async function publishLive(plan: LivePlan, confirm: string) {
+    const asins = plan.items.map((item) => item.asin);
+    const next = await api<UploadStatus>("/api/prepared/publish", {
+      method: "POST",
+      body: JSON.stringify({ asins, confirm, batch_hash: plan.batch_hash }),
+    });
+    setStatus(next);
+    setMsg(`Started live ${next.run_id}`);
+    setSelected([]);
+    await load();
+  }
+
   async function stop() {
     onError("");
     try {
@@ -2041,15 +2296,22 @@ function PreparedPanel({
             an item live re-checks the Amazon price first and never regenerates the AI copy.
           </p>
         </div>
-        <span className={liveDisabled ? "upload-target live" : "upload-target"}>
-          {liveDisabled ? "LIVE disabled" : `-> ${overview?.target_env || "sandbox"} eBay`}
+        <span className={production ? "upload-target live" : "upload-target"}>
+          {production
+            ? liveReady
+              ? "LIVE (guarded)"
+              : "LIVE disabled"
+            : `-> ${overview?.target_env || "sandbox"} eBay`}
         </span>
       </div>
-      {liveDisabled ? (
+      {liveBlocked ? (
         <p className="upload-warning">
-          Production target: publishing is refused with LIVE_UPLOAD_DISABLED before any network
-          call. Switch to sandbox eBay in Settings to put prepared items live.
+          Production live path is closed: {liveReason}. Nothing is sent to eBay until every
+          gate is open. Switch to sandbox eBay in Settings to put prepared items live.
         </p>
+      ) : null}
+      {liveRunning ? (
+        <div className="live-run-banner">PRODUCTION - real listings</div>
       ) : null}
       <div className="actions">
         <button type="button" disabled={busy} onClick={() => void load()}>
@@ -2058,21 +2320,38 @@ function PreparedPanel({
         <button type="button" disabled={items.length === 0 || running} onClick={toggleAll}>
           {allSelected ? "Select none" : "Select all"}
         </button>
-        <button
-          type="button"
-          className="primary"
-          disabled={liveDisabled || running || busy || selected.length === 0}
-          onClick={() => void publish(selected)}
-        >
-          Put selected live ({selected.length})
-        </button>
-        <button
-          type="button"
-          disabled={liveDisabled || running || busy || items.length === 0}
-          onClick={() => void publish(items.map((item) => item.asin))}
-        >
-          Put all live
-        </button>
+        {!production ? (
+          <>
+            <button
+              type="button"
+              className="primary"
+              disabled={running || busy || selected.length === 0}
+              onClick={() => void publish(selected)}
+            >
+              Put selected live ({selected.length})
+            </button>
+            <button
+              type="button"
+              disabled={running || busy || items.length === 0}
+              onClick={() => void publish(items.map((item) => item.asin))}
+            >
+              Put all live
+            </button>
+          </>
+        ) : liveReady ? (
+          <LivePlanPanel
+            mode="publish"
+            asins={selected.length ? selected : items.map((item) => item.asin)}
+            disabled={running || busy || items.length === 0}
+            runLabel={
+              selected.length
+                ? `LIVE: publish selected (${selected.length})`
+                : `LIVE: publish all (${items.length})`
+            }
+            onError={onError}
+            onRun={publishLive}
+          />
+        ) : null}
         {running ? (
           <button type="button" onClick={() => void stop()}>
             Stop

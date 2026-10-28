@@ -13,6 +13,7 @@ from typing import Any
 from dropship_desk import config
 from dropship_desk.db import list_candidates
 from dropship_desk.ebay import listing as ebay_listing
+from dropship_desk.upload_items import live_gate_missing
 
 # Effectively unbounded: the overview must show every prepared candidate.
 _CANDIDATE_LIMIT = 1_000_000
@@ -94,8 +95,12 @@ def list_prepared(
 def overview() -> dict[str, Any]:
     """Payload for GET /api/prepared (local only, always current env)."""
     target = (config.ebay_env() or "sandbox").strip()
+    missing = live_gate_missing(target)
     return {
         "target_env": target,
-        "live_disabled": target == "production",
+        "live_disabled": target == "production" and bool(missing),
+        "live_enabled": target == "production" and not missing,
+        "live_missing": missing,
+        "live_cap": config.ebay_live_max_per_run(),
         "items": list_prepared(),
     }

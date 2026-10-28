@@ -59,12 +59,17 @@ from dropship_desk.safety import check_ebay_sell
 from dropship_desk.upload_items import (
     UPLOAD_JOB,
     InvalidUploadFile,
+    LiveAuditError,
+    LiveCapExceeded,
+    LiveConfirmMismatch,
     LiveUploadDisabled,
     NotSignedIn,
     UploadAlreadyRunning,
     UploadFileMissing,
+    live_gate_missing,
     list_upload_files,
     mark_row_listed,
+    plan_live_batch,
     published_listing_state,
     read_upload_file,
     resolve_upload_file,
@@ -88,10 +93,15 @@ _ALLOWED_OPEN_HOSTS = frozenset(
 
 def _ebay_health() -> dict:
     sell = check_ebay_sell()
+    missing = live_gate_missing()
     return {
         **ebay_oauth.public_status(),
         "sell_allowed": sell.ok,
         "sell_block_reason": "" if sell.ok else sell.reason,
+        "live_upload_enabled": config.ebay_live_upload_enabled(),
+        "live_max_per_run": config.ebay_live_max_per_run(),
+        "live_upload_missing": missing,
+        "live_upload_ready": not missing,
     }
 
 
@@ -347,6 +357,25 @@ def create_app() -> FastAPI:
     def candidates_enrich_stop() -> dict:
         return ENRICH_JOB.stop()
 
+    @app.post("/api/live/plan")
+    def live_plan(body: dict | None = None) -> dict:
+        """Read-only batch plan: server n + hash + item preview, no eBay write."""
+        payload = body or {}
+        try:
+            return plan_live_batch(
+                mode=payload.get("mode") or "upload",
+                file=payload.get("file"),
+                asins=payload.get("asins"),
+            )
+        except InvalidUploadFile as e:
+            return _invalid_upload_file(e)
+        except UploadFileMissing as e:
+            raise HTTPException(
+                status_code=404, detail=f"UPLOAD_FILE_MISSING: {e.path}"
+            ) from e
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
     @app.get("/api/upload-items/files")
     def upload_items_files() -> dict:
         """The selectable ``*.txt`` lists directly inside the upload folder."""
@@ -371,9 +400,13 @@ def create_app() -> FastAPI:
             existing = published_listing_state(row.asin, env)
             if existing is not None:
                 mark_row_listed(row, existing, row_state="already_listed")
+        missing = live_gate_missing(env)
         return {
             "target_env": env,
-            "live_disabled": env == "production",
+            "live_disabled": env == "production" and bool(missing),
+            "live_enabled": env == "production" and not missing,
+            "live_missing": missing,
+            "live_cap": config.ebay_live_max_per_run(),
             "path": str(path),
             "file": path.name,
             "rows": [row.to_dict() for row in rows],
@@ -381,20 +414,44 @@ def create_app() -> FastAPI:
 
     @app.post("/api/upload-items/start")
     def upload_items_start(body: dict | None = None) -> dict:
-        mode = str((body or {}).get("mode") or "full").strip().lower()
-        file_name = (body or {}).get("file")
+        payload = body or {}
+        mode = str(payload.get("mode") or "full").strip().lower()
+        file_name = payload.get("file")
         try:
-            return UPLOAD_JOB.start(mode=mode, file=file_name)
-        except LiveUploadDisabled:
+            return UPLOAD_JOB.start(
+                mode=mode,
+                file=file_name,
+                confirm=payload.get("confirm"),
+                batch_hash=payload.get("batch_hash"),
+            )
+        except LiveUploadDisabled as e:
             return JSONResponse(
                 status_code=403,
                 content={
                     "code": "LIVE_UPLOAD_DISABLED",
-                    "detail": (
-                        "LIVE_UPLOAD_DISABLED: upload-from-file refuses production; "
-                        "switch to sandbox first (no live eBay write was attempted)"
-                    ),
+                    "detail": str(e),
+                    "missing": e.missing,
                 },
+            )
+        except LiveCapExceeded as e:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "code": "LIVE_CAP_EXCEEDED",
+                    "detail": str(e),
+                    "n": e.n,
+                    "cap": e.cap,
+                },
+            )
+        except LiveConfirmMismatch as e:
+            return JSONResponse(
+                status_code=409,
+                content={"code": "LIVE_CONFIRM_MISMATCH", "detail": str(e)},
+            )
+        except LiveAuditError as e:
+            return JSONResponse(
+                status_code=500,
+                content={"code": "LIVE_AUDIT_FAILED", "detail": str(e)},
             )
         except InvalidUploadFile as e:
             return _invalid_upload_file(e)
@@ -416,24 +473,47 @@ def create_app() -> FastAPI:
 
     @app.post("/api/prepared/publish")
     def prepared_publish(body: dict | None = None) -> dict:
-        raw_asins = (body or {}).get("asins")
+        payload = body or {}
+        raw_asins = payload.get("asins")
         # Keep raw values: start_publish() is the validation trust boundary and
         # must be able to reject non-strings instead of stringifying them.
         asins = list(raw_asins) if isinstance(raw_asins, list) else []
         if not asins:
             raise HTTPException(status_code=400, detail="asins required (non-empty list)")
         try:
-            return UPLOAD_JOB.start_publish(asins)
-        except LiveUploadDisabled:
+            return UPLOAD_JOB.start_publish(
+                asins,
+                confirm=payload.get("confirm"),
+                batch_hash=payload.get("batch_hash"),
+            )
+        except LiveUploadDisabled as e:
             return JSONResponse(
                 status_code=403,
                 content={
                     "code": "LIVE_UPLOAD_DISABLED",
-                    "detail": (
-                        "LIVE_UPLOAD_DISABLED: publishing refuses production; "
-                        "switch to sandbox first (no live eBay write was attempted)"
-                    ),
+                    "detail": str(e),
+                    "missing": e.missing,
                 },
+            )
+        except LiveCapExceeded as e:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "code": "LIVE_CAP_EXCEEDED",
+                    "detail": str(e),
+                    "n": e.n,
+                    "cap": e.cap,
+                },
+            )
+        except LiveConfirmMismatch as e:
+            return JSONResponse(
+                status_code=409,
+                content={"code": "LIVE_CONFIRM_MISMATCH", "detail": str(e)},
+            )
+        except LiveAuditError as e:
+            return JSONResponse(
+                status_code=500,
+                content={"code": "LIVE_AUDIT_FAILED", "detail": str(e)},
             )
         except UploadAlreadyRunning as e:
             raise HTTPException(status_code=409, detail=str(e)) from e

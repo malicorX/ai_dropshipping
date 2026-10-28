@@ -63,6 +63,30 @@ def ebay_auto_publish() -> bool:
     return _env_bool("EBAY_AUTO_PUBLISH", False)
 
 
+# Live upload is a second, explicit master switch.  It is read at call time
+# (like every other flag) so an operator can still kill a run by setting it to
+# false in the environment; the worker re-checks it before every eBay write.
+LIVE_MAX_PER_RUN_DEFAULT = 5
+LIVE_MAX_PER_RUN_HARD_CAP = 50
+
+
+def ebay_live_upload_enabled() -> bool:
+    """Master switch for the guarded production upload/publish path."""
+    return _env_bool("EBAY_LIVE_UPLOAD_ENABLED", False)
+
+
+def ebay_live_max_per_run() -> int:
+    """Per-run live batch cap: default 5, clamped to the code ceiling 50."""
+    raw = os.environ.get("EBAY_LIVE_MAX_PER_RUN")
+    if raw is None or str(raw).strip() == "":
+        return LIVE_MAX_PER_RUN_DEFAULT
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return LIVE_MAX_PER_RUN_DEFAULT
+    return max(0, min(value, LIVE_MAX_PER_RUN_HARD_CAP))
+
+
 _ebay_env_override: str | None = None
 
 
@@ -96,6 +120,7 @@ def ebay_env() -> str:
 # hosts while it is set.
 _upload_pin_lock = threading.RLock()
 _upload_sandbox_pinned = False
+_upload_production_live_pinned = False
 
 
 def pin_sandbox_for_upload(pinned: bool) -> bool:
@@ -112,6 +137,25 @@ def upload_sandbox_pinned() -> bool:
         return _upload_sandbox_pinned
 
 
+def pin_production_for_live(pinned: bool) -> bool:
+    """Pin or release the inverse guard for a live (production) run.
+
+    A live run must never reach a sandbox host, and it must abort when the
+    process-wide target flips away from production while the run is active.
+    The pin is set for the worker lifetime and released in ``finally``.
+    """
+    global _upload_production_live_pinned
+    with _upload_pin_lock:
+        _upload_production_live_pinned = bool(pinned)
+        return _upload_production_live_pinned
+
+
+def production_live_pinned() -> bool:
+    """True while a live run requires every eBay host to be production."""
+    with _upload_pin_lock:
+        return _upload_production_live_pinned
+
+
 def is_sandbox_host(host: str) -> bool:
     """True for every eBay sandbox hostname (api/auth/www)."""
     host = (host or "").strip().lower().rstrip(".")
@@ -119,7 +163,7 @@ def is_sandbox_host(host: str) -> bool:
 
 
 def ensure_write_target_allowed(url: str) -> None:
-    """Refuse a non-sandbox eBay host while an upload run is pinned.
+    """Refuse the wrong eBay target while an upload/live run is pinned.
 
     This lives in ``config`` (which imports no eBay transport module) so both
     ``ebay.client`` and ``ebay.oauth`` can call it without an import cycle.
@@ -127,13 +171,28 @@ def ensure_write_target_allowed(url: str) -> None:
     target checks and immediately before any HTTP client is created.  It
     therefore still holds when ``config.ebay_env()`` flips between the job's
     check and the actual request.
+
+    Sandbox runs keep blocking production exactly as before.  A live run is the
+    inverse: production only, and never a sandbox host or a sandbox target.
     """
-    if not upload_sandbox_pinned():
+    sandbox_pinned = upload_sandbox_pinned()
+    live_pinned = production_live_pinned()
+    if not sandbox_pinned and not live_pinned:
         return
     host = urlparse(url).hostname or ""
-    if not is_sandbox_host(host):
+    if sandbox_pinned and live_pinned:
+        raise RuntimeError(
+            "LIVE_WRITE_BLOCKED: conflicting transport pins; refusing to "
+            f"contact {host or url}"
+        )
+    if sandbox_pinned and not is_sandbox_host(host):
         raise RuntimeError(
             "LIVE_WRITE_BLOCKED: upload run is pinned to the eBay sandbox; "
+            f"refusing to contact {host or url}"
+        )
+    if live_pinned and (ebay_env() != "production" or is_sandbox_host(host)):
+        raise RuntimeError(
+            "LIVE_WRITE_BLOCKED: live run is pinned to eBay production; "
             f"refusing to contact {host or url}"
         )
 
@@ -193,7 +252,7 @@ def ebay_auth_base() -> str:
     return "https://auth.sandbox.ebay.com"
 
 
-def automation_snapshot() -> dict[str, bool]:
+def automation_snapshot() -> dict[str, bool | int]:
     return {
         "amazon_enabled": amazon_automation_enabled(),
         "ebay_enabled": ebay_automation_enabled(),
@@ -202,6 +261,8 @@ def automation_snapshot() -> dict[str, bool]:
         "ebay_allow_list": ebay_allow_list(),
         "ebay_allow_tracking": ebay_allow_tracking(),
         "ebay_auto_publish": ebay_auto_publish(),
+        "ebay_live_upload_enabled": ebay_live_upload_enabled(),
+        "ebay_live_max_per_run": ebay_live_max_per_run(),
     }
 
 
