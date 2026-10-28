@@ -10,6 +10,10 @@ def _reset_ebay_env_override(tmp_path, monkeypatch):
     # unless they explicitly install a temporary .env file.
     monkeypatch.setattr(cfg, "ENV_FILE", tmp_path / "no-such-dotenv", raising=False)
     cfg.clear_live_env_cache()
+    # load_dotenv at import copies the operator's real .env gate values into
+    # os.environ; tests must start with every live gate closed.
+    for key in ("EBAY_LIVE_UPLOAD_ENABLED", "EBAY_AUTOMATION_ENABLED", "EBAY_ALLOW_LIST"):
+        monkeypatch.delenv(key, raising=False)
 
     cfg.set_ebay_env_override(None)
     cfg.pin_sandbox_for_upload(False)
