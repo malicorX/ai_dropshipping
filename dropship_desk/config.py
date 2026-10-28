@@ -6,7 +6,9 @@ import os
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 from urllib.parse import urlparse
 
 from dotenv import dotenv_values, load_dotenv
@@ -40,15 +42,21 @@ def _env_bool(name: str, default: bool = False) -> bool:
 # Live-gate flags must follow the operator's .env edits while the process keeps
 # running.  ``load_dotenv`` only copies values into ``os.environ`` at import
 # time, so a running server would otherwise never see a flip back to false.
-# Read the file again at call time (cached for at most one second) and let the
-# file win over the stale environment value.
+#
+# Fail closed: once a .env file has existed in this process, a gate key is only
+# true when the file still parses AND contains the key AND the process-env
+# value is also true.  A missing / unreadable / empty / malformed file (or a
+# missing key) can therefore never fall back to a stale ``os.environ`` true.
 LIVE_ENV_CACHE_SEC = 1.0
 _live_env_lock = threading.Lock()
 _live_env_cache: dict[str, object] = {
     "path": None,
     "values": {},
+    "ok": False,
+    "present": False,
     "read_at": 0.0,
 }
+_live_env_seen = bool(ENV_FILE.is_file())
 
 
 def _bool_value(raw: object, default: bool = False) -> bool:
@@ -57,7 +65,49 @@ def _bool_value(raw: object, default: bool = False) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
-def _live_dotenv_values() -> dict[str, object]:
+def _looks_malformed(text: str) -> bool:
+    """Detect the common .env failures python-dotenv only warns about."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" not in stripped:
+            return True
+        _, _, value = stripped.partition("=")
+        value = value.strip()
+        if not value or value[0] not in ("'", '"'):
+            continue
+        quote = value[0]
+        if value.count(quote) % 2 == 1:
+            return True
+    return False
+
+
+def _read_live_dotenv(path) -> dict[str, object]:
+    """Return ``{'ok', 'values', 'reason'}`` for one .env read (never raises)."""
+    try:
+        is_file = path.is_file()
+    except OSError:
+        is_file = False
+    if not is_file:
+        return {"ok": False, "values": {}, "reason": "missing"}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, PermissionError):
+        return {"ok": False, "values": {}, "reason": "unreadable"}
+    if not text.strip():
+        return {"ok": False, "values": {}, "reason": "empty"}
+    if _looks_malformed(text):
+        return {"ok": False, "values": {}, "reason": "malformed"}
+    try:
+        values = dict(dotenv_values(path))
+    except Exception:  # noqa: BLE001 - any parse failure closes every gate
+        return {"ok": False, "values": {}, "reason": "unreadable"}
+    return {"ok": True, "values": values, "reason": ""}
+
+
+def _live_dotenv_snapshot() -> dict[str, object]:
+    global _live_env_seen
     now = time.monotonic()
     path = ENV_FILE
     with _live_env_lock:
@@ -66,31 +116,60 @@ def _live_dotenv_values() -> dict[str, object]:
             and now - float(_live_env_cache.get("read_at") or 0.0) < LIVE_ENV_CACHE_SEC
         )
         if fresh:
-            return dict(_live_env_cache.get("values") or {})
+            return dict(_live_env_cache)
         try:
-            values: dict[str, object] = dict(dotenv_values(path)) if path.is_file() else {}
-        except Exception:  # noqa: BLE001 - an unreadable file must not open a gate
-            values = {}
-        _live_env_cache["path"] = path
-        _live_env_cache["values"] = values
-        _live_env_cache["read_at"] = now
-        return values
+            path_exists = path.is_file()
+        except OSError:
+            path_exists = False
+        if path_exists:
+            _live_env_seen = True
+        if not _live_env_seen:
+            snapshot: dict[str, object] = {
+                "path": path,
+                "values": {},
+                "ok": False,
+                "present": False,
+                "read_at": now,
+            }
+        else:
+            parsed = _read_live_dotenv(path)
+            snapshot = {
+                "path": path,
+                "values": parsed["values"],
+                "ok": parsed["ok"],
+                "present": True,
+                "read_at": now,
+            }
+        _live_env_cache.clear()
+        _live_env_cache.update(snapshot)
+        return dict(snapshot)
 
 
 def clear_live_env_cache() -> None:
     """Drop the cached .env snapshot (tests / immediately after a file edit)."""
+    global _live_env_seen
     with _live_env_lock:
+        _live_env_seen = False
         _live_env_cache["path"] = None
         _live_env_cache["values"] = {}
+        _live_env_cache["ok"] = False
+        _live_env_cache["present"] = False
         _live_env_cache["read_at"] = 0.0
 
 
 def _live_env_bool(name: str, default: bool = False) -> bool:
-    """Live-gate boolean: the .env file wins, os.environ is the fallback."""
-    values = _live_dotenv_values()
-    if name in values:
-        return _bool_value(values.get(name), default)
-    return _env_bool(name, default)
+    """Fail-closed live gate: (file value AND process env), else False."""
+    snapshot = _live_dotenv_snapshot()
+    if not snapshot.get("present"):
+        # A deployment that never had a .env file may use process env alone.
+        return _env_bool(name, default)
+    if not snapshot.get("ok"):
+        return False
+    values = snapshot.get("values") or {}
+    if name not in values:
+        return False
+    file_value = _bool_value(values.get(name), False)
+    return file_value and _env_bool(name, False)
 
 
 def amazon_automation_enabled() -> bool:
@@ -247,9 +326,57 @@ def run_env() -> str | None:
     return str(value) if value in ("sandbox", "production") else None
 
 
-def state_env() -> str:
-    """Env for listing/token state: the active run's env, else the current one."""
+# ----------------------------------------------------------- eBay operations
+#
+# The eBay environment is a process-wide mutable target.  Every seller / OAuth /
+# account operation runs inside this context manager: it captures one immutable
+# env and increments a process-wide in-flight counter.  While the counter is
+# non-zero the target switch endpoint and an OAuth callback that would change
+# the env are refused, so derived data (base URL, credentials, token record,
+# account cache, persistence target) can never be split across two envs.
+_ebay_ops_lock = threading.RLock()
+_ebay_ops_counter = 0
+_ebay_op_env_local = threading.local()
+
+
+def ebay_ops_in_flight() -> int:
+    with _ebay_ops_lock:
+        return _ebay_ops_counter
+
+
+def ebay_operation_running() -> bool:
+    return ebay_ops_in_flight() > 0
+
+
+@contextmanager
+def ebay_operation(env: str | None = None) -> Iterator[str]:
+    global _ebay_ops_counter
+    captured = normalize_ebay_env(
+        env if env is not None else (run_env() or ebay_env())
+    )
+    previous = getattr(_ebay_op_env_local, "env", None)
+    with _ebay_ops_lock:
+        _ebay_ops_counter += 1
+    _ebay_op_env_local.env = captured
+    try:
+        yield captured
+    finally:
+        _ebay_op_env_local.env = previous
+        with _ebay_ops_lock:
+            _ebay_ops_counter = max(0, _ebay_ops_counter - 1)
+
+
+def operation_env() -> str:
+    """The env captured by the active operation, else the active run/current."""
+    value = getattr(_ebay_op_env_local, "env", None)
+    if value in ("sandbox", "production"):
+        return str(value)
     return run_env() or ebay_env()
+
+
+def state_env() -> str:
+    """Env for listing/token state: captured operation, run, else current."""
+    return operation_env()
 
 
 LIVE_WRITE_GATE_FLAG = "EBAY_LIVE_UPLOAD_ENABLED"
@@ -305,7 +432,7 @@ def ensure_write_target_allowed(url: str) -> None:
                 "LIVE_WRITE_BLOCKED: live run is pinned to eBay production; "
                 f"refusing to contact {host or url}"
             )
-        if ebay_env() != "production":
+        if operation_env() != "production":
             raise RuntimeError(
                 "LIVE_WRITE_BLOCKED: live run is pinned to eBay production "
                 "but the current target changed; refusing to contact "
@@ -327,24 +454,28 @@ def _ebay_credential(env: str, sandbox_key: str, prod_key: str) -> str:
     return os.environ.get(sandbox_key, "").strip()
 
 
+def _credential_env(env: str | None) -> str:
+    return normalize_ebay_env(env) if env is not None else operation_env()
+
+
 def ebay_app_id(env: str | None = None) -> str:
-    return _ebay_credential(env or ebay_env(), "EBAY_SANDBOX_APP_ID", "EBAY_PROD_APP_ID")
+    return _ebay_credential(_credential_env(env), "EBAY_SANDBOX_APP_ID", "EBAY_PROD_APP_ID")
 
 
 def ebay_cert_id(env: str | None = None) -> str:
-    return _ebay_credential(env or ebay_env(), "EBAY_SANDBOX_CERT_ID", "EBAY_PROD_CERT_ID")
+    return _ebay_credential(_credential_env(env), "EBAY_SANDBOX_CERT_ID", "EBAY_PROD_CERT_ID")
 
 
 def ebay_dev_id(env: str | None = None) -> str:
-    return _ebay_credential(env or ebay_env(), "EBAY_SANDBOX_DEV_ID", "EBAY_PROD_DEV_ID")
+    return _ebay_credential(_credential_env(env), "EBAY_SANDBOX_DEV_ID", "EBAY_PROD_DEV_ID")
 
 
 def ebay_runame(env: str | None = None) -> str:
-    return _ebay_credential(env or ebay_env(), "EBAY_SANDBOX_RUNAME", "EBAY_PROD_RUNAME")
+    return _ebay_credential(_credential_env(env), "EBAY_SANDBOX_RUNAME", "EBAY_PROD_RUNAME")
 
 
 def ebay_target_gaps(env: str | None = None) -> list[str]:
-    target = normalize_ebay_env(env) if env is not None else ebay_env()
+    target = _credential_env(env)
     if target == "production":
         pairs = (
             ("EBAY_PROD_APP_ID", ebay_app_id(target)),
@@ -364,14 +495,16 @@ def ebay_target_ready(env: str | None = None) -> bool:
     return not ebay_target_gaps(env)
 
 
-def ebay_api_base() -> str:
-    if ebay_env() == "production":
+def ebay_api_base(env: str | None = None) -> str:
+    target = normalize_ebay_env(env) if env is not None else operation_env()
+    if target == "production":
         return "https://api.ebay.com"
     return "https://api.sandbox.ebay.com"
 
 
-def ebay_auth_base() -> str:
-    if ebay_env() == "production":
+def ebay_auth_base(env: str | None = None) -> str:
+    target = normalize_ebay_env(env) if env is not None else operation_env()
+    if target == "production":
         return "https://auth.ebay.com"
     return "https://auth.sandbox.ebay.com"
 

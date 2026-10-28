@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Callable
 
 from dropship_desk import config
@@ -23,6 +24,18 @@ _GTIN_RE = re.compile(r"(?:[0-9]{8}|[0-9]{12}|[0-9]{13}|[0-9]{14})")
 
 def sku_for_asin(asin: str) -> str:
     return f"{SKU_PREFIX}{asin.strip().upper()}"
+
+
+PRICE_STEP = Decimal("0.01")
+
+
+def canonical_price(value: Any) -> float:
+    """Canonical EUR amount: two decimals, ROUND_HALF_UP via Decimal.
+
+    One canonical amount is used for the price comparison, the eBay wire
+    payload and the listing state/audit result.
+    """
+    return float(Decimal(str(value)).quantize(PRICE_STEP, rounding=ROUND_HALF_UP))
 
 
 def _state_env(env: str | None = None) -> str:
@@ -118,6 +131,27 @@ def stage_unpublished(
     match it at staging time, so a concurrent ``/api/evaluate`` can never
     change what an in-flight live/publish row uploads.
     """
+    request_env = _state_env(env)
+    # One frozen env for the whole stage: base URL, credentials, token record,
+    # account cache and the persistence target.
+    with config.ebay_operation(request_env) as captured_env:
+        return _stage_unpublished(
+            asin,
+            draft_patch,
+            expected_price=expected_price,
+            http=http,
+            env=captured_env,
+        )
+
+
+def _stage_unpublished(
+    asin: str,
+    draft_patch: dict[str, Any] | None = None,
+    *,
+    expected_price: float | None = None,
+    http: HttpFn | None = None,
+    env: str | None = None,
+) -> dict[str, Any]:
     requester = http or ebay_http.request
     request_env = _state_env(env)
     asin = asin.strip().upper()
@@ -136,9 +170,9 @@ def stage_unpublished(
         raise RuntimeError(
             "This ASIN is a variation parent. Send a child size/color row, not this one."
         )
-    stored_price = float(row["ebay_price"])
+    stored_price = canonical_price(row["ebay_price"])
     if expected_price is not None:
-        price = float(expected_price)
+        price = canonical_price(expected_price)
         if abs(stored_price - price) > 0.005:
             raise RuntimeError(
                 "PRICE_BINDING_MISMATCH: the candidate price changed after the "
@@ -246,6 +280,17 @@ def publish_offer(
     started, never a process-wide target that flipped while the response was
     in flight.
     """
+    request_env = _state_env(env)
+    with config.ebay_operation(request_env) as captured_env:
+        return _publish_offer(asin, http=http, env=captured_env)
+
+
+def _publish_offer(
+    asin: str,
+    *,
+    http: HttpFn | None = None,
+    env: str | None = None,
+) -> dict[str, Any]:
     requester = http or ebay_http.request
     request_env = _state_env(env)
     asin = asin.strip().upper()

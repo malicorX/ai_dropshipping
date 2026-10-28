@@ -52,18 +52,18 @@ def request(
     extra_headers: dict[str, str] | None = None,
 ) -> Any:
     """Call api.ebay.com / sandbox REST. Returns parsed JSON or None for empty bodies."""
+    # The URL is built from the operation-captured env, so a later target flip
+    # cannot redirect this request to the other host.
     url = f"{config.ebay_api_base()}{path}"
-    # Guard before token acquisition as well: access_token() may itself hit
-    # the auth host.  The URL is fixed at this point, so a later env flip
-    # cannot redirect this request to production.
+    # Early gate: access_token() may itself hit the auth host.
     ensure_write_target_allowed(url)
+    # Read/bind the token record (or use the explicit token) BEFORE the final
+    # gate.  The token record's env must match the host we are about to contact.
     token_value = token if token is not None else ebay_oauth.access_token()
-    # Re-check AFTER the token exists: a refresh can take long enough for the
-    # operator/target to change.  The token record's env must also match the
-    # host we are about to contact, so a sandbox token can never be sent to a
-    # production URL (and vice versa).
-    ensure_write_target_allowed(url)
     ebay_oauth.ensure_token_env_matches(url)
+    # This is deliberately the last check immediately before dispatch: a flag
+    # or target flip during the token read has to be observed here.
+    ensure_write_target_allowed(url)
     headers = {
         "Authorization": f"Bearer {token_value}",
         "Accept": "application/json",
@@ -92,9 +92,6 @@ def request(
 
 
 def trading_endpoint() -> str:
-    if config.ebay_env() == "production":
-        endpoint = "https://api.ebay.com/ws/api.dll"
-    else:
-        endpoint = "https://api.sandbox.ebay.com/ws/api.dll"
+    endpoint = f"{config.ebay_api_base()}/ws/api.dll"
     ensure_write_target_allowed(endpoint)
     return endpoint

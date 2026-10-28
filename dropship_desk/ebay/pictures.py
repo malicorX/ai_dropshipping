@@ -74,14 +74,12 @@ def _upload_one(path: Path) -> str:
         "file": (path.name, path.read_bytes(), "application/octet-stream"),
     }
     endpoint = ebay_http.trading_endpoint()
-    # Guard before token acquisition (which can itself use the auth host) and
-    # before any HTTP client is constructed.
-    ebay_http.ensure_write_target_allowed(endpoint)
+    # Read/bind the token first, then make the final gate the last step before
+    # the socket is opened.  A flag/target flip during the token read is
+    # therefore observed here.
     token = ebay_oauth.access_token()
-    # Re-check after the token: the target/token record must still match the
-    # host we are about to contact.
-    ebay_http.ensure_write_target_allowed(endpoint)
     ebay_oauth.ensure_token_env_matches(endpoint)
+    ebay_http.ensure_write_target_allowed(endpoint)
     headers = {
         "X-EBAY-API-SITEID": "77",
         "X-EBAY-API-COMPATIBILITY-LEVEL": "1399",

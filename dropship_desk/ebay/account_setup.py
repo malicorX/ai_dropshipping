@@ -12,13 +12,19 @@ MERCHANT_LOCATION_KEY = "dropship_desk"
 POLICY_NAME_PREFIX = "Dropship Desk"
 
 
-def account_cache_path():
+def _account_env(env: str | None = None) -> str:
+    return config.normalize_ebay_env(
+        env if env is not None else config.operation_env()
+    )
+
+
+def account_cache_path(env: str | None = None):
     config.ensure_data_dir()
-    return config.DATA_DIR / f"ebay_account_{config.ebay_env()}.json"
+    return config.DATA_DIR / f"ebay_account_{_account_env(env)}.json"
 
 
-def load_account_cache() -> dict[str, Any]:
-    path = account_cache_path()
+def load_account_cache(env: str | None = None) -> dict[str, Any]:
+    path = account_cache_path(env)
     if not path.is_file():
         return {}
     try:
@@ -27,14 +33,22 @@ def load_account_cache() -> dict[str, Any]:
         return {}
 
 
-def save_account_cache(data: dict[str, Any]) -> None:
-    account_cache_path().write_text(json.dumps(data, indent=2), encoding="utf-8")
+def save_account_cache(data: dict[str, Any], env: str | None = None) -> None:
+    account_cache_path(env).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
-def ensure_seller_setup(*, http=ebay_http.request) -> dict[str, str]:
+def ensure_seller_setup(*, http=ebay_http.request, env: str | None = None) -> dict[str, str]:
     """Return merchantLocationKey + policy IDs, creating them if the account has none."""
+    target = _account_env(env)
+    # Account setup is one operation: the cache path and every derived request
+    # stay on the env captured here even if the target flips mid-setup.
+    with config.ebay_operation(target) as request_env:
+        return _ensure_seller_setup(http=http, env=request_env)
+
+
+def _ensure_seller_setup(*, http, env: str) -> dict[str, str]:
     ensure_business_policy_opt_in(http=http)
-    cached = load_account_cache()
+    cached = load_account_cache(env)
     location_key = ensure_inventory_location(http=http)
     payment_id = _first_policy_id(
         http, "/sell/account/v1/payment_policy", "paymentPolicies", "paymentPolicyId"
@@ -93,7 +107,7 @@ def ensure_seller_setup(*, http=ebay_http.request) -> dict[str, str]:
         "return_policy_id": return_id,
         "fulfillment_policy_id": fulfill_id,
     }
-    save_account_cache(record)
+    save_account_cache(record, env=env)
     return record
 
 

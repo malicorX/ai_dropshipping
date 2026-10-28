@@ -207,6 +207,21 @@ def create_app() -> FastAPI:
                     ),
                 },
             )
+        if config.ebay_operation_running():
+            # The eBay env is frozen while any seller/OAuth/account operation
+            # is in flight; a real switch would split that operation across
+            # two environments.  A redundant no-op request is harmless.
+            if env != config.normalize_ebay_env(config.ebay_env()):
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "code": "EBAY_OPERATION_RUNNING",
+                        "detail": (
+                            "EBAY_OPERATION_RUNNING: an eBay operation is in "
+                            "flight; the target cannot change until it finishes"
+                        ),
+                    },
+                )
         if env == "production" and not config.ebay_target_ready("production"):
             gaps = ", ".join(config.ebay_target_gaps("production")) or "production keys"
             raise HTTPException(
@@ -250,6 +265,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="missing code")
         if state:
             callback_env = config.normalize_ebay_env(state)
+            current_env = config.normalize_ebay_env(config.ebay_env())
             if callback_env == "production" and UPLOAD_JOB.status().get("running"):
                 return JSONResponse(
                     status_code=409,
@@ -259,6 +275,17 @@ def create_app() -> FastAPI:
                             "UPLOAD_RUNNING: an upload-from-file run is active; "
                             "switching to production is locked until it finishes "
                             "(sandbox is allowed)"
+                        ),
+                    },
+                )
+            if callback_env != current_env and config.ebay_operation_running():
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "code": "EBAY_OPERATION_RUNNING",
+                        "detail": (
+                            "EBAY_OPERATION_RUNNING: an eBay operation is in "
+                            "flight; the target cannot change until it finishes"
                         ),
                     },
                 )
@@ -324,7 +351,8 @@ def create_app() -> FastAPI:
             return _legacy_live_response()
         _require_ebay_sell(body)
         try:
-            return ebay_listing.stage_unpublished(asin, body or None)
+            with config.ebay_operation(config.ebay_env()):
+                return ebay_listing.stage_unpublished(asin, body or None)
         except EbayApiError as e:
             sys.stderr.write(f"[ebay] stage failed: {e}\n")
             raise HTTPException(status_code=502, detail=str(e)) from e
@@ -338,7 +366,8 @@ def create_app() -> FastAPI:
             return _legacy_live_response()
         _require_ebay_sell(body)
         try:
-            return ebay_listing.publish_offer(asin)
+            with config.ebay_operation(config.ebay_env()):
+                return ebay_listing.publish_offer(asin)
         except EbayApiError as e:
             sys.stderr.write(f"[ebay] publish failed: {e}\n")
             raise HTTPException(status_code=502, detail=str(e)) from e

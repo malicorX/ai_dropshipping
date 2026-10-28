@@ -81,6 +81,7 @@ LIVE_AUDIT_FILENAME = "live_audit.jsonl"
 # A live plan is confirmed by a server-issued, single-use nonce that expires
 # after ten minutes.  It is kept in memory only; a restart invalidates plans.
 LIVE_NONCE_TTL_SEC = 600.0
+LIVE_NONCE_STORE_LIMIT = 32
 _live_nonce_lock = threading.Lock()
 _live_nonces: dict[str, dict[str, Any]] = {}
 
@@ -473,7 +474,9 @@ def read_upload_snapshot(path: Path) -> tuple[list[UploadRow], str]:
 
 def live_gate_missing(env: str | None = None) -> list[str]:
     """Names of every closed live gate (never values/secrets)."""
-    target = config.normalize_ebay_env(env if env is not None else config.ebay_env())
+    target = config.normalize_ebay_env(
+        env if env is not None else config.operation_env()
+    )
     missing: list[str] = []
     if target != "production":
         missing.append(LIVE_MISSING_ENV)
@@ -546,21 +549,65 @@ def _prune_live_nonces(now: float | None = None) -> None:
         _live_nonces.pop(nonce, None)
 
 
-def issue_live_nonce(*, mode: str, env: str, batch_hash: str) -> str:
-    """Server-generated, single-use confirmation nonce for one plan."""
+def issue_live_nonce(*, mode: str, env: str, batch_hash: str, n: int | None = None) -> str:
+    """Server-generated, single-use confirmation nonce for one plan.
+
+    The store is bounded: older plans are dropped once 32 are outstanding.
+    """
     nonce = secrets.token_urlsafe(24)
     with _live_nonce_lock:
         _prune_live_nonces()
+        while len(_live_nonces) >= LIVE_NONCE_STORE_LIMIT:
+            oldest = next(iter(_live_nonces), None)
+            if oldest is None:
+                break
+            _live_nonces.pop(oldest, None)
         _live_nonces[nonce] = {
             "mode": mode,
             "env": config.normalize_ebay_env(env),
             "batch_hash": batch_hash,
+            "n": n,
             "issued_at": _monotonic(),
         }
     return nonce
 
 
-def _live_nonce_record(nonce: Any, *, mode: str, env: str, batch_hash: str) -> dict[str, Any]:
+def _nonce_mismatch(
+    record: dict[str, Any],
+    *,
+    mode: str,
+    env: str,
+    batch_hash: str,
+    n: int | None,
+    supplied_hash: str | None,
+) -> bool:
+    return bool(
+        record.get("batch_hash") != batch_hash
+        or record.get("mode") != mode
+        or record.get("env") != config.normalize_ebay_env(env)
+        or (n is not None and record.get("n") is not None and record.get("n") != n)
+        or (supplied_hash is not None and supplied_hash != batch_hash)
+    )
+
+
+def _burn_live_nonce(nonce: Any) -> None:
+    """Drop a nonce (used when an attempt was rejected)."""
+    if not isinstance(nonce, str) or not nonce:
+        return
+    with _live_nonce_lock:
+        _live_nonces.pop(nonce, None)
+
+
+def validate_live_nonce(
+    nonce: Any,
+    *,
+    mode: str,
+    env: str,
+    batch_hash: str,
+    n: int | None = None,
+    supplied_hash: str | None = None,
+) -> None:
+    """Check a nonce atomically; a changed batch/n burns it even on rejection."""
     if not isinstance(nonce, str) or not nonce:
         raise LiveConfirmMismatch(
             "LIVE_CONFIRM_MISMATCH: plan nonce missing; request a fresh plan"
@@ -568,31 +615,59 @@ def _live_nonce_record(nonce: Any, *, mode: str, env: str, batch_hash: str) -> d
     with _live_nonce_lock:
         _prune_live_nonces()
         record = _live_nonces.get(nonce)
-    if record is None:
+        if record is None:
+            raise LiveConfirmMismatch(
+                "LIVE_CONFIRM_MISMATCH: plan nonce is unknown, expired or already used"
+            )
+        if _nonce_mismatch(
+            record,
+            mode=mode,
+            env=env,
+            batch_hash=batch_hash,
+            n=n,
+            supplied_hash=supplied_hash,
+        ):
+            # Single use even when the attempt is rejected: a stale nonce must
+            # never be replayable against a different batch.
+            _live_nonces.pop(nonce, None)
+            raise LiveConfirmMismatch(
+                "LIVE_CONFIRM_MISMATCH: plan nonce was issued for a different batch"
+            )
+
+
+def consume_live_nonce(
+    nonce: Any,
+    *,
+    mode: str,
+    env: str,
+    batch_hash: str,
+    n: int | None = None,
+) -> None:
+    """Atomically validate and burn a nonce; only a successful start reaches this."""
+    if not isinstance(nonce, str) or not nonce:
         raise LiveConfirmMismatch(
-            "LIVE_CONFIRM_MISMATCH: plan nonce is unknown, expired or already used"
+            "LIVE_CONFIRM_MISMATCH: plan nonce missing; request a fresh plan"
         )
-    if (
-        record.get("batch_hash") != batch_hash
-        or record.get("mode") != mode
-        or record.get("env") != config.normalize_ebay_env(env)
-    ):
-        raise LiveConfirmMismatch(
-            "LIVE_CONFIRM_MISMATCH: plan nonce was issued for a different batch"
-        )
-    return record
-
-
-def validate_live_nonce(nonce: Any, *, mode: str, env: str, batch_hash: str) -> None:
-    """Check a nonce without consuming it (start still has to succeed first)."""
-    _live_nonce_record(nonce, mode=mode, env=env, batch_hash=batch_hash)
-
-
-def consume_live_nonce(nonce: Any, *, mode: str, env: str, batch_hash: str) -> None:
-    """Validate and burn a nonce; only a successful start reaches this."""
-    _live_nonce_record(nonce, mode=mode, env=env, batch_hash=batch_hash)
     with _live_nonce_lock:
-        _live_nonces.pop(str(nonce), None)
+        _prune_live_nonces()
+        record = _live_nonces.get(nonce)
+        if record is None:
+            raise LiveConfirmMismatch(
+                "LIVE_CONFIRM_MISMATCH: plan nonce is unknown, expired or already used"
+            )
+        if _nonce_mismatch(
+            record,
+            mode=mode,
+            env=env,
+            batch_hash=batch_hash,
+            n=n,
+            supplied_hash=None,
+        ):
+            _live_nonces.pop(nonce, None)
+            raise LiveConfirmMismatch(
+                "LIVE_CONFIRM_MISMATCH: plan nonce was issued for a different batch"
+            )
+        _live_nonces.pop(nonce, None)
 
 
 
@@ -658,7 +733,9 @@ def plan_live_batch(
     items = [_plan_item(asin) for asin in selected]
     total = round(sum(item["price"] for item in items if item["price"] is not None), 2)
     missing = live_gate_missing(target)
-    nonce = issue_live_nonce(mode=normalized_mode, env=target, batch_hash=batch_hash)
+    nonce = issue_live_nonce(
+        mode=normalized_mode, env=target, batch_hash=batch_hash, n=len(selected)
+    )
     return {
         "mode": normalized_mode,
         "env": target,
@@ -887,13 +964,21 @@ class UploadJobManager:
                 # n is always server-computed from the file; never the client.
                 if n > cap:
                     raise LiveCapExceeded(n, cap)
-                _validate_live_confirmation(confirm, n, batch_hash, computed_hash)
-                validate_live_nonce(
-                    plan_nonce,
-                    mode=LIVE_MODE_UPLOAD,
-                    env=env,
-                    batch_hash=computed_hash,
-                )
+                try:
+                    validate_live_nonce(
+                        plan_nonce,
+                        mode=LIVE_MODE_UPLOAD,
+                        env=env,
+                        batch_hash=computed_hash,
+                        n=n,
+                        supplied_hash=batch_hash,
+                    )
+                    _validate_live_confirmation(confirm, n, batch_hash, computed_hash)
+                except LiveConfirmMismatch:
+                    # A valid-looking nonce tied to a changed batch / n is
+                    # single-use even when the start is rejected.
+                    _burn_live_nonce(plan_nonce)
+                    raise
             # Prepare mode never talks to eBay, so it does not need OAuth.
             if mode == "full" and not ebay_oauth.oauth_connected(env):
                 label = "live" if production else "sandbox"
@@ -925,6 +1010,7 @@ class UploadJobManager:
                     mode=LIVE_MODE_UPLOAD,
                     env=env,
                     batch_hash=computed_hash,
+                    n=n,
                 )
             self.state = UploadJobState(
                 run_id=run_id,
@@ -1006,13 +1092,19 @@ class UploadJobManager:
             if production:
                 if n > cap:
                     raise LiveCapExceeded(n, cap)
-                _validate_live_confirmation(confirm, n, batch_hash, computed_hash)
-                validate_live_nonce(
-                    plan_nonce,
-                    mode=LIVE_MODE_PUBLISH,
-                    env=env,
-                    batch_hash=computed_hash,
-                )
+                try:
+                    validate_live_nonce(
+                        plan_nonce,
+                        mode=LIVE_MODE_PUBLISH,
+                        env=env,
+                        batch_hash=computed_hash,
+                        n=n,
+                        supplied_hash=batch_hash,
+                    )
+                    _validate_live_confirmation(confirm, n, batch_hash, computed_hash)
+                except LiveConfirmMismatch:
+                    _burn_live_nonce(plan_nonce)
+                    raise
             if not ebay_oauth.oauth_connected(env):
                 label = "live" if production else "sandbox"
                 raise NotSignedIn(
@@ -1049,6 +1141,7 @@ class UploadJobManager:
                     mode=LIVE_MODE_PUBLISH,
                     env=env,
                     batch_hash=computed_hash,
+                    n=n,
                 )
             self.state = UploadJobState(
                 run_id=run_id,
@@ -1078,6 +1171,12 @@ class UploadJobManager:
     # ------------------------------------------------------------------ worker
 
     def _run(self) -> None:
+        # One frozen env for the whole worker lifetime.  While this operation
+        # is in flight the target-switch endpoint refuses a change.
+        with config.ebay_operation(self.state.target_env):
+            self._run_worker()
+
+    def _run_worker(self) -> None:
         # The pin covers the whole worker lifetime, including every helper
         # called by stage/publish.  try/finally guarantees release both after
         # a normal finish and after an unexpected crash.  A live run uses the
@@ -1273,9 +1372,17 @@ class UploadJobManager:
     def _abort_target_changed(
         self, row: UploadRow, *, reason: str = ""
     ) -> None:
-        message = reason or "eBay target changed during the run"
-        if not message.startswith("aborted_target_changed"):
-            message = f"aborted_target_changed: {message}"
+        if row.state == "published":
+            # The listing was already created; keep the ids and say exactly
+            # what happened.  The row still ends in ``error``.
+            message = (
+                f"published in {self.state.target_env}; "
+                "target changed after response"
+            )
+        else:
+            message = reason or "eBay target changed during the run"
+            if not message.startswith("aborted_target_changed"):
+                message = f"aborted_target_changed: {message}"
         with self._lock:
             # A row that only got as far as drafting/staging is not a success:
             # the batch aborted around it, so surface it as an error exactly
@@ -1505,7 +1612,7 @@ class UploadJobManager:
 
         with self._lock:
             row.state = "evaluated"
-            row.price = float(evaluation.ebay_price)
+            row.price = ebay_listing.canonical_price(evaluation.ebay_price)
 
         self._check_target()
         # Final re-check: a previous row in this run (or another process) may
@@ -1520,7 +1627,7 @@ class UploadJobManager:
         try:
             generated = generate_draft(
                 asin,
-                ebay_price=float(evaluation.ebay_price),
+                ebay_price=ebay_listing.canonical_price(evaluation.ebay_price),
                 amazon_total=float(offer.amazon_total),
                 title=offer.title,
                 offer=offer,
@@ -1646,7 +1753,11 @@ class UploadJobManager:
 
         candidate = get_candidate_by_asin(asin) or {}
         stored_price = candidate.get("ebay_price")
-        prepared_price = float(stored_price) if stored_price is not None else None
+        prepared_price = (
+            ebay_listing.canonical_price(stored_price)
+            if stored_price is not None
+            else None
+        )
 
         with self._lock:
             row.state = "fetching"
@@ -1704,7 +1815,7 @@ class UploadJobManager:
             row.price = (
                 prepared_price
                 if prepared_price is not None
-                else float(evaluation.ebay_price)
+                else ebay_listing.canonical_price(evaluation.ebay_price)
             )
 
         self._check_target()

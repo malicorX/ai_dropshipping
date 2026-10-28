@@ -286,7 +286,13 @@ def test_live_pin_rechecks_flag_automation_and_allow_list(monkeypatch):
 
 def test_live_flag_is_reread_from_env_file(tmp_path, monkeypatch):
     env_file = tmp_path / ".env"
-    env_file.write_text("EBAY_LIVE_UPLOAD_ENABLED=false\n", encoding="utf-8")
+    # Every live-gate key must be present: a missing key now fails closed.
+    env_file.write_text(
+        "EBAY_LIVE_UPLOAD_ENABLED=false\n"
+        "EBAY_AUTOMATION_ENABLED=true\n"
+        "EBAY_ALLOW_LIST=true\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(cfg, "ENV_FILE", env_file, raising=False)
     monkeypatch.setenv("EBAY_ENV", "production")
     monkeypatch.setenv("EBAY_LIVE_UPLOAD_ENABLED", "true")
@@ -299,7 +305,12 @@ def test_live_flag_is_reread_from_env_file(tmp_path, monkeypatch):
         with pytest.raises(RuntimeError, match="LIVE_WRITE_BLOCKED"):
             cfg.ensure_write_target_allowed(url)
 
-        env_file.write_text("EBAY_LIVE_UPLOAD_ENABLED=true\n", encoding="utf-8")
+        env_file.write_text(
+            "EBAY_LIVE_UPLOAD_ENABLED=true\n"
+            "EBAY_AUTOMATION_ENABLED=true\n"
+            "EBAY_ALLOW_LIST=true\n",
+            encoding="utf-8",
+        )
         getattr(cfg, "clear_live_env_cache", lambda: None)()
         cfg.ensure_write_target_allowed(url)
     finally:
