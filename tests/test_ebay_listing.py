@@ -473,3 +473,82 @@ def test_collect_image_urls_never_falls_back_to_amazon_links(monkeypatch):
     draft = {"media": {"source_urls": ["https://m.media-amazon.com/images/I/x.jpg"]}}
     with pytest.raises(RuntimeError, match="never sent"):
         pictures.collect_image_urls("B0TESTIMG1", draft)
+
+
+_BAG_OFFER = {
+    "title": "Familie Einkaufstasche Faltbar Einkaufskorb mit Deckel",
+    "bullets": [
+        "Maße: 40 x 27 x 28 cm(L x W x H), Tragkraft: 15kg.",
+        "Der Rahmen ist 2,5 x 0,6 cm (B*T) breit.",
+    ],
+    "specs": {"Marke": "Diurwur", "Produktabmessungen": "27T x 27B x 28H cm", "Farbe": "Schwarz"},
+}
+
+
+def _defs(*names):
+    return [
+        {
+            "localizedAspectName": n,
+            "aspectConstraint": {"aspectRequired": True, "aspectMode": "FREE_TEXT"},
+            "aspectValues": [],
+        }
+        for n in names
+    ]
+
+
+def test_aspects_use_amazon_facts_not_the_first_ebay_value():
+    from dropship_desk.ebay import aspects
+
+    filled, problems = aspects.resolve_aspects(
+        _defs("Länge", "Breite", "Höhe", "Marke"), _BAG_OFFER
+    )
+    assert problems == []
+    assert filled["Länge"] == ["40 cm"] and filled["Breite"] == ["27 cm"]
+    assert filled["Höhe"] == ["28 cm"] and filled["Marke"] == ["Diurwur"]
+
+
+def test_unproven_required_aspect_is_a_problem_not_a_guess():
+    from dropship_desk.ebay import aspects
+
+    offer = {"title": "Tasche", "bullets": [], "specs": {}}
+    filled, problems = aspects.resolve_aspects(_defs("Länge", "Material"), offer)
+    assert filled == {}
+    assert len(problems) == 2 and all("nicht auf der Amazon-Seite belegt" in p for p in problems)
+
+
+def test_conflicting_dimensions_are_reported():
+    from dropship_desk.ebay import aspects
+
+    offer = {"title": "x", "bullets": ["40 x 27 x 28 cm (L x W x H)"], "specs": {"Maße": "50 x 27 x 28 cm (L x W x H)"}}
+    filled, problems = aspects.resolve_aspects(_defs("Länge"), offer)
+    assert filled == {} and "widersprüchliche" in problems[0]
+
+
+def test_operator_override_wins_and_selection_only_needs_allowed_value():
+    from dropship_desk.ebay import aspects
+
+    defs = [
+        {
+            "localizedAspectName": "Farbe",
+            "aspectConstraint": {"aspectRequired": True, "aspectMode": "SELECTION_ONLY"},
+            "aspectValues": [{"localizedValue": "Schwarz"}, {"localizedValue": "Rot"}],
+        }
+    ]
+    filled, problems = aspects.resolve_aspects(defs, _BAG_OFFER)
+    assert filled == {"Farbe": ["Schwarz"]} and problems == []
+    _, problems = aspects.resolve_aspects(defs, _BAG_OFFER, {"aspects": {"Farbe": ["Blau"]}})
+    assert "kein erlaubter eBay-Wert" in problems[0]
+
+
+def test_category_must_share_a_word_with_the_title():
+    from dropship_desk.ebay import aspects
+
+    def sug(cid, name, *anc):
+        return {
+            "category": {"categoryId": cid, "categoryName": name},
+            "categoryTreeNodeAncestors": [{"categoryName": a} for a in anc],
+        }
+
+    title = "Familie Einkaufstasche Faltbar Einkaufskorb"
+    assert aspects.category_fits(title, [sug("1", "Damentaschen", "Damen"), sug("2", "Einkaufstaschen", "Haushalt")])["category_id"] == "2"
+    assert aspects.category_fits(title, [sug("1", "Damentaschen", "Damen")]) is None

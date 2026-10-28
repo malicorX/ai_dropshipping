@@ -151,10 +151,18 @@ def _stub_stage_io(monkeypatch) -> None:
         },
     )
     monkeypatch.setattr(
-        taxonomy, "suggest_category", lambda title, http=None: {"category_id": "1", "tree_id": "0"}
+        taxonomy,
+        "verified_listing_specifics",
+        lambda asin, amazon_title, draft_title, offer, http=None: {
+            "category_id": "1",
+            "category_name": "Cat",
+            "category_path": "Root > Cat",
+            "tree_id": "0",
+            "aspects": {},
+            "brand": "Markenlos",
+            "mpn": "Nicht zutreffend",
+        },
     )
-    monkeypatch.setattr(taxonomy, "aspects_for_category", lambda cid, tid, http=None: {})
-    monkeypatch.setattr(taxonomy, "brand_mpn_fields", lambda aspects: ("Markenlos", "Nicht zutreffend"))
     monkeypatch.setattr(
         pictures, "collect_image_urls", lambda asin, draft: ["https://i.ebayimg.com/00/s/x.jpg"]
     )

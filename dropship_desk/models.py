@@ -25,6 +25,9 @@ class OfferIn(BaseModel):
     local_images: list[dict[str, Any]] = Field(default_factory=list)
     parent_asin: str = ""
     variation_label: str = ""
+    # Facts shown on the Amazon page; the only source eBay item specifics may use.
+    bullets: list[str] = Field(default_factory=list)
+    specs: dict[str, str] = Field(default_factory=dict)
 
 
 class EvaluateRequest(BaseModel):

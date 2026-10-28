@@ -203,11 +203,13 @@ def _stage_unpublished(
     save_draft_artifacts(asin, draft, draft.get("media"))
 
     setup = account_setup.ensure_seller_setup(http=requester)
-    category = taxonomy.suggest_category(title, http=requester)
-    aspects = taxonomy.aspects_for_category(
-        category["category_id"], category["tree_id"], http=requester
+    amazon_title = str((row.get("offer") or {}).get("title") or "")
+    specifics = taxonomy.verified_listing_specifics(
+        asin, amazon_title, title, row.get("offer") or {}, http=requester
     )
-    brand, mpn = taxonomy.brand_mpn_fields(aspects)
+    category = specifics
+    aspects = specifics["aspects"]
+    brand, mpn = specifics["brand"], specifics["mpn"]
     ean = _candidate_ean(row)
     image_urls = pictures.collect_image_urls(asin, draft)
     if not image_urls:
@@ -260,6 +262,7 @@ def _stage_unpublished(
             "listing_id": "",
             "category_id": category["category_id"],
             "category_name": category.get("category_name") or "",
+            "category_path": category.get("category_path") or "",
             "price": price,
             "image_count": len(image_urls),
             "error": "",

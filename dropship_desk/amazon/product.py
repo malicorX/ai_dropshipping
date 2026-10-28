@@ -219,8 +219,30 @@ _PDP_EXTRACT_JS = """
       children.push({ asin: kid, label });
     }
   }
+  const clean = (t) => (t || '').replace(/[\\u200e\\u200f]/g, '').replace(/\\s+/g, ' ').trim();
+  const bullets = Array.from(document.querySelectorAll('#feature-bullets li span.a-list-item, #feature-bullets li'))
+    .map(e => clean(e.textContent)).filter(t => t && t.length > 3).slice(0, 12);
+  const specs = {};
+  const addSpec = (k, v) => {
+    k = clean(k).replace(/[:：]$/, '').trim(); v = clean(v);
+    if (k && v && k.length < 60 && !(k in specs)) specs[k] = v.slice(0, 300);
+  };
+  for (const row of document.querySelectorAll(
+    '#productOverview_feature_div tr, #productDetails_techSpec_section_1 tr, ' +
+    '#productDetails_techSpec_section_2 tr, #productDetails_detailBullets_sections1 tr, ' +
+    '#technicalSpecifications_section_1 tr')) {
+    const th = row.querySelector('th, td:first-child');
+    const td = row.querySelector('td:last-child');
+    if (th && td && th !== td) addSpec(th.textContent, td.textContent);
+  }
+  for (const li of document.querySelectorAll('#detailBullets_feature_div li')) {
+    const parts = clean(li.textContent).split(/\\s*[:：]\\s*/);
+    if (parts.length >= 2) addSpec(parts[0], parts.slice(1).join(': '));
+  }
   return {
     title,
+    bullets,
+    specs,
     price: priceEl ? priceEl.textContent.trim() : null,
     stars: starsEl ? starsEl.textContent.trim() : null,
     reviews: reviewsEl ? reviewsEl.textContent.trim() : null,
@@ -370,6 +392,8 @@ def _offer_from_raw(asin: str, url: str, raw: dict[str, Any]) -> OfferIn:
         image_urls=[str(u) for u in (raw.get("image_urls") or []) if u],
         parent_asin="",
         variation_label="",
+        bullets=[str(b) for b in (raw.get("bullets") or []) if b],
+        specs={str(k): str(v) for k, v in (raw.get("specs") or {}).items()},
     )
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from dropship_desk.ebay import aspects as aspects_mod
 from dropship_desk.ebay import client as ebay_http
 from dropship_desk.ebay import oauth as ebay_oauth
 
@@ -161,3 +162,72 @@ def _category_tree_id(*, http: HttpFn | None = None) -> str:
     if not tree_id:
         raise RuntimeError("Could not resolve eBay DE category tree")
     return tree_id
+
+
+def verified_listing_specifics(
+    asin: str,
+    amazon_title: str,
+    draft_title: str,
+    offer: dict[str, Any],
+    *,
+    http: HttpFn | None = None,
+) -> dict[str, Any]:
+    """Category + item specifics proven from the Amazon page, or AspectsUnverified.
+
+    The category must be one of eBay's top suggestions that shares a word with
+    the product title; every required specific must be backed by Amazon facts
+    (or an operator override file).  Nothing is guessed or defaulted to the
+    first value of eBay's list.
+    """
+    requester = http or ebay_http.request
+    overrides = aspects_mod.load_overrides(asin)
+    tree_id = _category_tree_id(http=requester)
+    token = ebay_oauth.application_token()
+    override_cat = str(overrides.get("category_id") or "").strip()
+    if override_cat:
+        category = {
+            "category_id": override_cat,
+            "category_name": str(overrides.get("category_name") or ""),
+            "category_path": "operator override",
+        }
+    else:
+        data = requester(
+            "GET",
+            f"/commerce/taxonomy/v1/category_tree/{tree_id}/get_category_suggestions",
+            params={"q": (amazon_title or draft_title)[:200]},
+            token=token,
+        ) or {}
+        suggestions = data.get("categorySuggestions") or []
+        category = aspects_mod.category_fits(amazon_title or draft_title, suggestions)
+        if not category:
+            seen = ", ".join(
+                str((s.get("category") or {}).get("categoryName") or "?")
+                for s in suggestions[:5]
+            )
+            raise aspects_mod.AspectsUnverified(
+                "CATEGORY_UNVERIFIED: no eBay category suggestion matches the product "
+                f"title (suggestions: {seen or 'none'}). Set category_id in "
+                f"data/products/{asin}/{aspects_mod.OVERRIDE_FILE} after checking it."
+            )
+    data = requester(
+        "GET",
+        f"/commerce/taxonomy/v1/category_tree/{tree_id}/get_item_aspects_for_category",
+        params={"category_id": category["category_id"]},
+        token=token,
+    ) or {}
+    filled, problems = aspects_mod.resolve_aspects(
+        data.get("aspects") or [],
+        offer,
+        overrides,
+        category_name=category.get("category_name", ""),
+    )
+    if problems:
+        raise aspects_mod.AspectsUnverified(
+            "ASPECTS_UNVERIFIED: "
+            + "; ".join(problems)
+            + f". eBay category {category['category_name']} requires them. "
+            f"Fix the Amazon data or add them to data/products/{asin}/{aspects_mod.OVERRIDE_FILE} "
+            '(\"aspects\": {\"Name\": [\"Wert\"]}) after checking them yourself.'
+        )
+    brand, mpn = brand_mpn_fields(filled)
+    return {**category, "tree_id": tree_id, "aspects": filled, "brand": brand, "mpn": mpn}
