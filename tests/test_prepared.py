@@ -28,6 +28,15 @@ def _write_upload(tmp_path: Path, monkeypatch, text: str) -> Path:
     return path
 
 
+_DEFAULT_RETRY_PASSES = upload_items.MAX_RETRY_PASSES
+
+
+@pytest.fixture(autouse=True)
+def _retry_passes_enabled(monkeypatch):
+    """Retries are off by default; these tests exercise the mechanism itself."""
+    monkeypatch.setattr(upload_items, "MAX_RETRY_PASSES", 2)
+
+
 def _offer(asin: str, total: float = 20.0, label: str = "") -> OfferIn:
     return OfferIn(
         title=f"Product {asin}",

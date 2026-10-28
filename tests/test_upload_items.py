@@ -27,6 +27,15 @@ def _write_upload(tmp_path: Path, monkeypatch, text: str) -> Path:
     return path
 
 
+_DEFAULT_RETRY_PASSES = upload_items.MAX_RETRY_PASSES
+
+
+@pytest.fixture(autouse=True)
+def _retry_passes_enabled(monkeypatch):
+    """Retries are off by default; these tests exercise the mechanism itself."""
+    monkeypatch.setattr(upload_items, "MAX_RETRY_PASSES", 2)
+
+
 def _offer(asin: str, total: float = 20.0) -> OfferIn:
     return OfferIn(
         title=f"Product {asin}",
@@ -1843,3 +1852,20 @@ def test_start_without_file_uses_the_default_file(client, tmp_path, monkeypatch)
     assert status["file"] == "upload_items.txt"
     assert calls["fetch"] == ["B0DEFAULT1"]
     assert status["rows"][0]["state"] == "prepared"
+
+
+def test_default_is_no_retry_every_row_tried_once(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(upload_items, "MAX_RETRY_PASSES", _DEFAULT_RETRY_PASSES)
+    assert _DEFAULT_RETRY_PASSES == 0
+    calls = _install_stubs(
+        monkeypatch, fetch_hook=lambda asin: (_ for _ in ()).throw(_unreachable(asin))
+    )
+    _write_upload(tmp_path, monkeypatch, "https://www.amazon.de/dp/B0ONCE0001\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    assert calls["fetch"] == ["B0ONCE0001"]
+    assert status["rows"][0]["state"] == "error"
+    assert status["rows"][0]["attempts"] == 1
+    assert status["retry_pass"] == 0

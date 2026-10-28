@@ -58,9 +58,9 @@ PREPARED_REASON = "haben wir schon (vorbereitet)"
 TITLE_LIMIT = 80
 VARIATION_SEPARATOR = " - "
 DEFAULT_UPLOAD_FILE = "upload_items.txt"
-# Transient Amazon failures (connection reset/PDP unreachable) get a bounded
-# number of extra full passes.  The pause is patchable so tests run instantly.
-MAX_RETRY_PASSES = 2
+# Retries are disabled (operator 2026-10-28): every row is tried exactly once.
+# Raise MAX_RETRY_PASSES to re-enable bounded extra passes for AMAZON_UNREACHABLE.
+MAX_RETRY_PASSES = 0
 RETRY_PASS_PAUSE_SEC = 30
 RETRYABLE_ERROR_PREFIX = "AMAZON_UNREACHABLE"
 _RETRY_PAUSE_STEP_SEC = 0.25
