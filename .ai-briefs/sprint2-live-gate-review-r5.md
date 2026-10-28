@@ -1,0 +1,7 @@
+# Round 5 (delta only): guarded LIVE path, branch s2-live-gate, worktree M:\ai_tmp\wt-s2-live. Delta: `git diff 6d8a4fa..HEAD` (fix4, 5 inserted lines + test updates).
+Your round-4 BLOCK (`M:\Data\Projects\ai_aiRouter\.ai-router\runs\20261028_213956_846f\response.md`): the final gate check preceded `httpx.Client` construction/TLS setup, so a flag disabled in that window still let a production write dispatch. Opus r4 gave PASS (`...\runs\20261028_214121_4efe\response.md`), noting only test gaps M3/M10 (non-blocking).
+Fix4: `ensure_write_target_allowed(...)` is now repeated as the first line inside every `with httpx.Client(...) as client:` block (client.py, pictures.py, oauth.py x3), immediately before request/post; the early checks stay. Driver verified: 368 pytest pass; 3 existing order-asserting tests updated to the new order (guard, token, token-env, guard, guard, dispatch); new test scans that all 5 client blocks start with the guard.
+HARD RULES: work only in a COPY (M:\ai_tmp\review_<id>); no network, fake transport only; never set the live flag in a real .env; do not modify project files.
+1. Re-run your 8 late-disable probes (flag off during client construction, real httpx.Client + TLS, file-switch case): does any production dispatch remain? Residual window between the last guard and the socket write is acceptable if it is only the request send itself; say so explicitly.
+2. Anything else in fix4 that could open production or break sandbox?
+Reply short; end VERDICT: PASS | PASS-WITH-FIX | BLOCK. A BLOCK names a reproducible production write.
