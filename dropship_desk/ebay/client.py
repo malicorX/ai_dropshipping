@@ -35,7 +35,14 @@ def _error_text(response: httpx.Response) -> str:
                 continue
             msg = str(err.get("longMessage") or err.get("message") or "").strip()
             if msg:
-                parts.append(msg)
+                extra = f" [errorId {err['errorId']}]" if err.get("errorId") else ""
+                params = err.get("parameters")
+                if isinstance(params, list) and params:
+                    pairs = ", ".join(
+                        f"{p.get('name')}={p.get('value')}" for p in params if isinstance(p, dict)
+                    )
+                    extra += f" [{pairs}]"
+                parts.append(msg + extra)
         if parts:
             return " | ".join(parts)
     return response.text[:800]

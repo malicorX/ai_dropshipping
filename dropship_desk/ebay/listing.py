@@ -432,6 +432,11 @@ def ebay_safe_description(html: str) -> str:
     text = re.sub(r"</?(details|summary)\b[^>]*>", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+class=\"[^\"]*\"", "", text)
     text = re.sub(r"PayPal,\s*", "", text)
+    # Brand/phrases that read as dropshipping, which eBay Germany bans.
+    text = re.sub(r"<div[^>]*>\s*Dropship Desk Shop\s*</div>", "", text)
+    text = re.sub(r"Dropship Desk Shop( . Angebotstext)?", "", text)
+    text = text.replace("Abweichungen durch Lieferanten m"+chr(246)+"glich.", "Abweichungen m"+chr(246)+"glich.")
+    text = text.replace("zügig weitergeleitet", "zügig bearbeitet")
     return re.sub(r"\n\s*\n+", "\n", text).strip()
 
 
