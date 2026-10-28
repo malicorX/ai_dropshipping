@@ -136,7 +136,7 @@ def test_upload_pin_allows_sandbox_rest_transport(monkeypatch):
         config.pin_sandbox_for_upload(False)
 
 
-def test_upload_pin_blocks_production_trading_endpoint(monkeypatch):
+def test_upload_pin_blocks_production_media_endpoint(monkeypatch):
     import pytest
 
     from dropship_desk.ebay import client as ebay_http
@@ -145,7 +145,7 @@ def test_upload_pin_blocks_production_trading_endpoint(monkeypatch):
     try:
         monkeypatch.setattr(config, "ebay_env", lambda: "production")
         with pytest.raises(RuntimeError, match="LIVE_WRITE_BLOCKED"):
-            ebay_http.trading_endpoint()
+            ebay_http.media_endpoint()
     finally:
         config.pin_sandbox_for_upload(False)
 
@@ -247,8 +247,8 @@ def test_upload_pin_blocks_picture_upload_before_http(tmp_path, monkeypatch):
         monkeypatch.setattr(config, "ebay_env", lambda: "production")
         monkeypatch.setattr(
             pictures.ebay_http,
-            "trading_endpoint",
-            lambda: "https://api.ebay.com/ws/api.dll",
+            "media_endpoint",
+            lambda: "https://apim.ebay.com/commerce/media/v1_beta/image/create_image_from_file",
         )
         monkeypatch.setattr(pictures.ebay_oauth, "access_token", lambda: "token")
         constructed: list[str] = []
@@ -260,7 +260,9 @@ def test_upload_pin_blocks_picture_upload_before_http(tmp_path, monkeypatch):
         monkeypatch.setattr(pictures.httpx, "Client", _Client)
 
         picture = tmp_path / "photo.jpg"
-        picture.write_bytes(b"fake")
+        from PIL import Image
+
+        Image.new("RGB", (8, 8)).save(picture, format="JPEG")
         with pytest.raises(RuntimeError, match="LIVE_WRITE_BLOCKED"):
             pictures._upload_one(picture)
         assert constructed == []

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -16,32 +17,19 @@ from dropship_desk.product_media import images_dir, resolve_image_file
 _NS = {"e": "urn:ebay:apis:eBLBaseComponents"}
 
 
+MAX_IMAGES = 12
+MAX_EDGE_PX = 1600
+
+
 def collect_image_urls(asin: str, draft: dict[str, Any]) -> list[str]:
-    """Prefer EPS uploads of local files; otherwise Amazon/source URLs eBay can fetch."""
+    """eBay-hosted URLs of our own re-encoded copies; never Amazon links."""
     uploaded = upload_local_images(asin)
-    if uploaded:
-        return uploaded[:12]
-    sources: list[str] = []
-    media = draft.get("media") or {}
-    for img in media.get("local_images") or []:
-        url = str(img.get("source_url") or "").strip()
-        if url.startswith("http"):
-            sources.append(url)
-    for url in media.get("source_urls") or []:
-        if str(url).startswith("http"):
-            sources.append(str(url))
-    plan = draft.get("image_plan") or {}
-    for url in plan.get("ordered_urls") or []:
-        if str(url).startswith("http"):
-            sources.append(str(url))
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for url in sources:
-        if url in seen:
-            continue
-        seen.add(url)
-        deduped.append(url)
-    return deduped[:12]
+    if not uploaded:
+        raise RuntimeError(
+            f"No product images could be uploaded to eBay for {asin} "
+            "(Amazon image links are never sent to eBay)"
+        )
+    return uploaded[:MAX_IMAGES]
 
 
 def upload_local_images(asin: str) -> list[str]:
@@ -49,53 +37,69 @@ def upload_local_images(asin: str) -> list[str]:
     if not folder.is_dir():
         return []
     urls: list[str] = []
+    errors: list[str] = []
     files = sorted(p for p in folder.iterdir() if p.is_file())
     for path in files:
         if resolve_image_file(asin, path.name) is None:
             continue
         try:
             urls.append(_upload_one(path))
-        except Exception:  # noqa: BLE001
-            continue
-        if len(urls) >= 12:
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{path.name}: {exc}")
+            # A closed live gate / wrong target must stop the item, not skip a photo.
+            if "LIVE_WRITE_BLOCKED" in str(exc) or "token env mismatch" in str(exc):
+                raise
+        if len(urls) >= MAX_IMAGES:
             break
+    if not urls and errors:
+        raise RuntimeError("picture upload failed: " + "; ".join(errors[:3]))
     return urls
 
 
+def prepare_image(path: Path) -> tuple[str, bytes]:
+    """Our own copy of a product photo: neutral file name, metadata stripped,
+    re-encoded (EXIF orientation applied, long edge capped, RGB JPEG)."""
+    from io import BytesIO
+
+    from PIL import Image, ImageOps
+
+    raw = path.read_bytes()
+    with Image.open(BytesIO(raw)) as img:
+        img = ImageOps.exif_transpose(img)
+        if img.mode != "RGB":
+            background = Image.new("RGB", img.size, (255, 255, 255))
+            alpha = img.convert("RGBA")
+            background.paste(alpha, mask=alpha.split()[-1])
+            img = background
+        img.thumbnail((MAX_EDGE_PX, MAX_EDGE_PX))
+        out = BytesIO()
+        img.save(out, format="JPEG", quality=90, optimize=True)
+    name = "img-" + hashlib.sha1(raw).hexdigest()[:12] + ".jpg"
+    return name, out.getvalue()
+
+
 def _upload_one(path: Path) -> str:
-    xml_body = (
-        '<?xml version="1.0" encoding="utf-8"?>'
-        '<UploadSiteHostedPicturesRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
-        f"<PictureName>{_xml_escape(path.stem)}</PictureName>"
-        "</UploadSiteHostedPicturesRequest>"
-    )
-    files = {
-        "XML Payload": (None, xml_body, "text/xml; charset=utf-8"),
-        "file": (path.name, path.read_bytes(), "application/octet-stream"),
-    }
-    endpoint = ebay_http.trading_endpoint()
+    name, data = prepare_image(path)
+    files = {"image": (name, data, "image/jpeg")}
+    endpoint = ebay_http.media_endpoint()
     # Read/bind the token first, then make the final gate the last step before
     # the socket is opened.  A flag/target flip during the token read is
     # therefore observed here.
     token = ebay_oauth.access_token()
     ebay_oauth.ensure_token_env_matches(endpoint)
     ebay_http.ensure_write_target_allowed(endpoint)
-    headers = {
-        "X-EBAY-API-SITEID": "77",
-        "X-EBAY-API-COMPATIBILITY-LEVEL": "1399",
-        "X-EBAY-API-CALL-NAME": "UploadSiteHostedPictures",
-        "X-EBAY-API-IAF-TOKEN": token,
-    }
+    headers = {"Authorization": f"Bearer {token}"}
     with httpx.Client(timeout=60.0) as client:
         ebay_http.ensure_write_target_allowed(endpoint)  # re-check after client/TLS setup, right before dispatch
         response = client.post(endpoint, headers=headers, files=files)
     if response.status_code >= 400:
-        raise RuntimeError(f"picture upload HTTP {response.status_code}")
-    url = _full_url_from_xml(response.text)
-    if not url:
-        ack = _xml_text(response.text, "Ack")
-        err = _xml_text(response.text, "LongMessage") or _xml_text(response.text, "ShortMessage")
-        raise RuntimeError(f"picture upload failed ack={ack} {err}".strip())
+        raise RuntimeError(f"picture upload HTTP {response.status_code}: {response.text[:200]}")
+    try:
+        url = str(response.json().get("imageUrl") or "")
+    except Exception:  # noqa: BLE001
+        url = ""
+    if not url.startswith("https://"):
+        raise RuntimeError(f"picture upload returned no imageUrl: {response.text[:200]}")
     return url
 
 

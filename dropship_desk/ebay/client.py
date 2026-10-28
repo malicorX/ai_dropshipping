@@ -103,3 +103,15 @@ def trading_endpoint() -> str:
     endpoint = f"{config.ebay_api_base()}/ws/api.dll"
     ensure_write_target_allowed(endpoint)
     return endpoint
+
+
+def media_endpoint() -> str:
+    """eBay Media API (picture upload to eBay Picture Services); same env pin rules."""
+    host = (
+        "https://apim.ebay.com"
+        if config.operation_env() == "production"
+        else "https://apim.sandbox.ebay.com"
+    )
+    endpoint = f"{host}/commerce/media/v1_beta/image/create_image_from_file"
+    ensure_write_target_allowed(endpoint)
+    return endpoint

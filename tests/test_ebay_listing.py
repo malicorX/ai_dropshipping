@@ -444,3 +444,32 @@ def test_ebay_safe_description_strips_document_style_details_and_feedback():
     for bad in ("<style", "doctype", "<html", "<head", "<details", "<summary", "class=", "bewertung", "paypal", "dropship", "weitergeleitet", "lieferant"):
         assert bad not in low, (bad, out)
     assert "<h3>Versand</h3>" in out and "3-7 Tage" in out and "<h1>T</h1>" in out
+
+
+def test_prepare_image_makes_a_clean_neutral_copy(tmp_path):
+    from PIL import Image
+
+    from dropship_desk.ebay import pictures
+
+    src = tmp_path / "01.jpg"
+    exif = Image.Exif()
+    exif[0x010E] = "amazon original"
+    Image.new("RGB", (3000, 2000), (10, 120, 200)).save(src, format="JPEG", exif=exif)
+
+    name, data = pictures.prepare_image(src)
+
+    from io import BytesIO
+
+    out = Image.open(BytesIO(data))
+    assert name.startswith("img-") and name.endswith(".jpg") and "01" not in name
+    assert max(out.size) == pictures.MAX_EDGE_PX
+    assert not out.getexif()
+
+
+def test_collect_image_urls_never_falls_back_to_amazon_links(monkeypatch):
+    from dropship_desk.ebay import pictures
+
+    monkeypatch.setattr(pictures, "upload_local_images", lambda asin: [])
+    draft = {"media": {"source_urls": ["https://m.media-amazon.com/images/I/x.jpg"]}}
+    with pytest.raises(RuntimeError, match="never sent"):
+        pictures.collect_image_urls("B0TESTIMG1", draft)

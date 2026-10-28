@@ -823,7 +823,9 @@ def test_access_token_record_without_env_under_live_pin(tmp_path, monkeypatch):
 
 def _picture_file(tmp_path):
     path = tmp_path / "picture.jpg"
-    path.write_bytes(b"\xff\xd8\xff\xe0fakejpeg")
+    from PIL import Image
+
+    Image.new("RGB", (8, 8), (200, 10, 10)).save(path, format="JPEG")
     return path
 
 
@@ -832,8 +834,9 @@ def test_picture_upload_final_guard_is_last_before_dispatch(tmp_path, monkeypatc
     order: list[str] = []
     monkeypatch.setattr(
         pictures.ebay_http,
-        "trading_endpoint",
-        lambda: order.append("endpoint") or "https://api.sandbox.ebay.com/ws/api.dll",
+        "media_endpoint",
+        lambda: order.append("endpoint")
+        or "https://apim.sandbox.ebay.com/commerce/media/v1_beta/image/create_image_from_file",
     )
     monkeypatch.setattr(
         pictures.ebay_oauth,
@@ -853,12 +856,10 @@ def test_picture_upload_final_guard_is_last_before_dispatch(tmp_path, monkeypatc
 
     class _Response:
         status_code = 200
-        text = (
-            '<UploadSiteHostedPicturesResponse '
-            'xmlns="urn:ebay:apis:eBLBaseComponents">'
-            "<FullURL>https://i.ebayimg.com/x.jpg</FullURL>"
-            "</UploadSiteHostedPicturesResponse>"
-        )
+        text = '{"imageUrl": "https://i.ebayimg.com/x.jpg"}'
+
+        def json(self):
+            return {"imageUrl": "https://i.ebayimg.com/x.jpg"}
 
     class _Client:
         def __init__(self, *args, **kwargs):
