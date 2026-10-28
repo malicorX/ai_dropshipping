@@ -593,3 +593,21 @@ def test_unproven_aspects_become_honest_placeholders_when_allowed():
     )
     assert filled == {"Länge": ["Keine Angabe"], "Stil": ["Keine Angabe"]}
     assert len(problems) == 1 and problems[0].startswith("Form")
+
+
+def test_copy_closeness_and_claim_words():
+    from dropship_desk.ollama_client import copy_closeness, enforce_facts
+
+    bullets = ["Hochwertige Materialien aus 300D Polyester Oxford mit PVC-Beschichtung"]
+    copy = {"advantages": ["Hochwertige Materialien aus 300D Polyester Oxford mit PVC-Beschichtung"]}
+    reworded = {"advantages": ["Der Stoff besteht aus robustem Polyester (300D Oxford), PVC beschichtet"]}
+    assert copy_closeness(copy, "", bullets, {}) > 0.9
+    assert copy_closeness(reworded, "", bullets, {}) < 0.3
+    out, dropped = enforce_facts(
+        {"advantages": ["Wasserdicht und robust beschichtet", "Aus Polyester Oxford gefertigt"]},
+        "Tasche Polyester",
+        ["Stoff: 300D Polyester Oxford, robust beschichtet"],
+        {},
+    )
+    assert out["advantages"] == ["Aus Polyester Oxford gefertigt"]
+    assert any("Wasserdicht" in d for d in dropped)

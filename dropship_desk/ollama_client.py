@@ -53,7 +53,11 @@ Strikte Regeln:
 - Verwende ausschließlich Aussagen, die in den Fakten stehen. Erfinde nichts: keine Eigenschaften,
   Materialien, Maße, Zahlen, Lieferumfang, Garantien, Einsatzzwecke oder Wirkungen, die nicht dort stehen.
 - Lieber weniger Punkte als ein erfundener Punkt. Wenn die Fakten dünn sind, schreibe kurz.
-- Eigene Formulierungen sind erlaubt, aber keine neuen Behauptungen. Keine Marketing-Superlative.
+- UMFORMULIEREN ist Pflicht: andere Satzstruktur und andere Wortwahl als die Amazon-Texte, in
+  zusammenhängenden, gut lesbaren Sätzen. Übernimm KEINE Amazon-Satzteile wörtlich.
+  Alle Zahlen, Maße, Materialien und Eigenschaften bleiben exakt wie in den Fakten.
+- Keine neuen Behauptungen, keine Marketing-Superlative, keine Garantien, kein „wasserdicht“,
+  „langlebig“, „hochwertig“ o. Ä., wenn es nicht wörtlich in den Fakten steht.
 - Keine Amazon-Markennamen im Fließtext.
 
 Fakten (Amazon-Produktseite):
@@ -83,23 +87,35 @@ WICHTIG: Nur Produktinhalt. KEIN Versand-, Rückgabe-, Zahlungs-, Feedback- oder
 Antworte ausschließlich mit dem JSON-Objekt. Kein Markdown, kein Denken, kein Prolog.
 Das erste Zeichen der Antwort muss {{ sein.
 """
-    payload = {
-        "model": config.OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "format": "json",
-        "options": {
-            "temperature": 0.6,
-            # Thinking models burn tokens before JSON; leave headroom.
-            "num_predict": 4096,
-        },
-    }
-    with httpx.Client(timeout=240.0) as client:
-        r = client.post(f"{config.OLLAMA_BASE_URL}/api/generate", json=payload)
-        r.raise_for_status()
-        data = r.json()
-    text = str(data.get("response") or "").strip()
-    draft = _parse_json_object(text)
+    def _generate(extra: str = "") -> dict[str, Any]:
+        payload = {
+            "model": config.OLLAMA_MODEL,
+            "prompt": prompt + extra,
+            "stream": False,
+            "format": "json",
+            "options": {
+                "temperature": 0.7,
+                # Thinking models burn tokens before JSON; leave headroom.
+                "num_predict": 4096,
+            },
+        }
+        with httpx.Client(timeout=240.0) as client:
+            r = client.post(f"{config.OLLAMA_BASE_URL}/api/generate", json=payload)
+            r.raise_for_status()
+            data = r.json()
+        return _parse_json_object(str(data.get("response") or "").strip())
+
+    draft = _generate()
+    if copy_closeness(draft, amazon_title, bullets, specs) > MAX_CLOSENESS:
+        retry = _generate(
+            "\n\nDeine letzte Antwort war zu nah an den Amazon-Texten. Schreibe ALLE Texte "
+            "deutlich anders: neue Satzstruktur, Synonyme, andere Reihenfolge. Fakten und Zahlen "
+            "bleiben unverändert."
+        )
+        if copy_closeness(retry, amazon_title, bullets, specs) < copy_closeness(
+            draft, amazon_title, bullets, specs
+        ):
+            draft = retry
     draft, dropped = enforce_facts(draft, amazon_title, bullets, specs)
     draft = apply_listing_template(draft)
     draft["unsupported_claims_dropped"] = dropped
@@ -198,20 +214,24 @@ def enforce_facts(
     """Drop every generated statement the Amazon facts do not support.
 
     A line is kept only if every number in it appears in the facts and at least
-    60 % of its content words (>=5 letters, by 6-letter stem) do too.  Dropped
+    50 % of its content words (>=5 letters, by 6-letter stem) do too.  Dropped
     lines are returned so the operator can see what was removed.
     """
     facts = " ".join([title, *bullets, *[f"{k} {v}" for k, v in specs.items()]])
     fact_stems, fact_nums = _stems(facts), _numbers(facts)
+    fact_text = facts.casefold()
     dropped: list[str] = []
 
     def supported(line: str) -> bool:
         if _numbers(line) - fact_nums:
             return False
+        low = str(line).casefold()
+        if any(w in low and w not in fact_text for w in _CLAIM_WORDS):
+            return False
         words = _stems(line)
         if not words:
             return True
-        return len(words & fact_stems) / len(words) >= 0.6
+        return len(words & fact_stems) / len(words) >= 0.5
 
     out = dict(draft)
     for key in ("advantages", "functions"):
@@ -244,3 +264,30 @@ def enforce_facts(
             dropped.append(str(out.get("subtitle")))
         out["subtitle"] = ""
     return out, dropped
+
+
+MAX_CLOSENESS = 0.55
+_CLAIM_WORDS = (
+    "wasserdicht", "wasserabweisend", "garantie", "langlebig", "atmungsaktiv", "rutschfest",
+    "antibakteriell", "umweltfreundlich", "nachhaltig", "bruchsicher", "unzerstörbar",
+    "hypoallergen", "zertifiziert", "geprüft", "bestseller", "testsieger", "premium",
+)
+
+
+def _shingles(text: str, n: int = 3) -> set[tuple[str, ...]]:
+    words = re.findall(r"[a-zäöüß0-9]+", str(text).casefold())
+    return {tuple(words[i : i + n]) for i in range(max(0, len(words) - n + 1))}
+
+
+def copy_closeness(
+    draft: dict[str, Any], title: str, bullets: list[str], specs: dict[str, str]
+) -> float:
+    """Share of the draft's 3-word sequences that appear verbatim in the Amazon text (0..1)."""
+    source = _shingles(" ".join([title, *bullets, *specs.values()]))
+    lines = [str(draft.get("intro_html") or "")]
+    for key in ("advantages", "functions"):
+        lines += [str(x) for x in draft.get(key) or []]
+    mine: set[tuple[str, ...]] = set()
+    for line in lines:
+        mine |= _shingles(re.sub(r"<[^>]+>", " ", line))
+    return len(mine & source) / len(mine) if mine else 0.0
