@@ -87,6 +87,7 @@ def _upload_one(path: Path) -> str:
         "X-EBAY-API-IAF-TOKEN": token,
     }
     with httpx.Client(timeout=60.0) as client:
+        ebay_http.ensure_write_target_allowed(endpoint)  # re-check after client/TLS setup, right before dispatch
         response = client.post(endpoint, headers=headers, files=files)
     if response.status_code >= 400:
         raise RuntimeError(f"picture upload HTTP {response.status_code}")

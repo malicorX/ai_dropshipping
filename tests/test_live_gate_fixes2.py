@@ -386,7 +386,7 @@ def test_client_request_checks_token_env_before_the_final_guard(monkeypatch):
 
     ebay_http.request("GET", "/sell/inventory/v1/offer")
 
-    assert order == ["guard", "token", "token-env", "guard", "dispatch"]
+    assert order == ["guard", "token", "token-env", "guard", "guard", "dispatch"]
 
 
 def _install_recording_client(monkeypatch) -> dict[str, int]:
@@ -879,7 +879,7 @@ def test_picture_upload_final_guard_is_last_before_dispatch(tmp_path, monkeypatc
     url = pictures._upload_one(_picture_file(tmp_path))
 
     assert url == "https://i.ebayimg.com/x.jpg"
-    assert order == ["endpoint", "token", "token-env", "guard", "dispatch"]
+    assert order == ["endpoint", "token", "token-env", "guard", "guard", "dispatch"]
 
 
 def test_picture_upload_flag_flip_during_token_read_blocks_dispatch(
@@ -1047,3 +1047,19 @@ def test_dotenv_with_odd_quote_in_comment_keeps_gates_open(monkeypatch, tmp_path
     monkeypatch.setenv("EBAY_AUTOMATION_ENABLED", "true")
 
     assert cfg.ebay_automation_enabled() is True
+
+
+def test_every_httpx_client_block_rechecks_the_gate_before_dispatch():
+    """Client construction/TLS setup can take time: guard again once inside."""
+    import re
+    from pathlib import Path
+
+    root = Path(ebay_http.__file__).parent
+    found = 0
+    for name in ("client.py", "pictures.py", "oauth.py"):
+        lines = (root / name).read_text(encoding="utf-8").splitlines()
+        for i, line in enumerate(lines):
+            if re.match(r"\s*with httpx\.Client\(.*\) as client:\s*$", line):
+                found += 1
+                assert "ensure_write_target_allowed" in lines[i + 1], (name, i + 1)
+    assert found == 5

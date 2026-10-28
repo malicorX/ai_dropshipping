@@ -488,7 +488,7 @@ def test_oauth_guards_are_called_before_http(tmp_path, monkeypatch):
     ebay_oauth._refresh_access_token("refresh")
     ebay_oauth.application_token()
 
-    assert len(calls) == 3
+    assert len(calls) == 6  # early guard + re-check inside the client block
     assert recorder.constructed == 3
 
 

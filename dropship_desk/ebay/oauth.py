@@ -220,6 +220,7 @@ def exchange_code(code: str, *, env: str | None = None) -> dict[str, Any]:
         }
         config.ensure_write_target_allowed(url)
         with httpx.Client(timeout=30.0) as client:
+            config.ensure_write_target_allowed(url)  # re-check after client/TLS setup, right before dispatch
             r = client.post(url, data=data, headers=headers)
             if r.status_code >= 400:
                 raise RuntimeError(f"eBay token exchange failed ({r.status_code}): {r.text[:400]}")
@@ -309,6 +310,7 @@ def _refresh_access_token(refresh_token: str, *, env: str | None = None) -> str:
         }
         config.ensure_write_target_allowed(url)
         with httpx.Client(timeout=30.0) as client:
+            config.ensure_write_target_allowed(url)  # re-check after client/TLS setup, right before dispatch
             r = client.post(url, data=data, headers=headers)
             if r.status_code >= 400:
                 raise RuntimeError(f"eBay token refresh failed ({r.status_code}): {r.text[:400]}")
@@ -355,6 +357,7 @@ def application_token(*, env: str | None = None) -> str:
         }
         config.ensure_write_target_allowed(url)
         with httpx.Client(timeout=30.0) as client:
+            config.ensure_write_target_allowed(url)  # re-check after client/TLS setup, right before dispatch
             r = client.post(url, data=data, headers=headers)
             if r.status_code >= 400:
                 raise RuntimeError(f"eBay application token failed ({r.status_code}): {r.text[:400]}")

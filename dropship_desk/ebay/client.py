@@ -74,6 +74,7 @@ def request(
     if extra_headers:
         headers.update(extra_headers)
     with httpx.Client(timeout=timeout) as client:
+        ensure_write_target_allowed(url)  # re-check after client/TLS setup, right before dispatch
         response = client.request(
             method,
             url,
