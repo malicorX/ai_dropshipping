@@ -307,8 +307,9 @@ def create_app() -> FastAPI:
         )
 
     def _require_ebay_sell(body: dict | None = None) -> None:
+        op_env = config.operation_env()
         if not ebay_oauth.load_tokens().get("refresh_token"):
-            label = "live eBay" if config.ebay_env() == "production" else "sandbox eBay"
+            label = "live eBay" if op_env == "production" else "sandbox eBay"
             raise HTTPException(
                 status_code=400,
                 detail=f"eBay is not connected — Settings → Connect {label}",
@@ -316,7 +317,7 @@ def create_app() -> FastAPI:
         decision = check_ebay_sell()
         if not decision.ok:
             raise HTTPException(status_code=403, detail=decision.reason)
-        if config.ebay_env() == "production" and not (body or {}).get("confirm_live"):
+        if op_env == "production" and not (body or {}).get("confirm_live"):
             raise HTTPException(
                 status_code=400,
                 detail="Live eBay Send/Publish needs an explicit confirm in the app",
@@ -347,11 +348,11 @@ def create_app() -> FastAPI:
 
     @app.post("/api/ebay/listings/{asin}/stage")
     def ebay_listing_stage(asin: str, body: dict | None = None):
-        if config.ebay_env() == "production":
-            return _legacy_live_response()
-        _require_ebay_sell(body)
         try:
-            with config.ebay_operation(config.ebay_env()):
+            with config.ebay_operation(config.ebay_env()) as op_env:
+                if op_env == "production":
+                    return _legacy_live_response()
+                _require_ebay_sell(body)
                 return ebay_listing.stage_unpublished(asin, body or None)
         except EbayApiError as e:
             sys.stderr.write(f"[ebay] stage failed: {e}\n")
@@ -362,11 +363,11 @@ def create_app() -> FastAPI:
 
     @app.post("/api/ebay/listings/{asin}/publish")
     def ebay_listing_publish(asin: str, body: dict | None = None):
-        if config.ebay_env() == "production":
-            return _legacy_live_response()
-        _require_ebay_sell(body)
         try:
-            with config.ebay_operation(config.ebay_env()):
+            with config.ebay_operation(config.ebay_env()) as op_env:
+                if op_env == "production":
+                    return _legacy_live_response()
+                _require_ebay_sell(body)
                 return ebay_listing.publish_offer(asin)
         except EbayApiError as e:
             sys.stderr.write(f"[ebay] publish failed: {e}\n")

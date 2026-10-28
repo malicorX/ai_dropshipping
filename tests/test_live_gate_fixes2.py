@@ -991,3 +991,59 @@ def test_published_then_target_changed_keeps_ids_and_reason(
     assert row["offer_id"] == f"OFF-{ASIN_A}"
     assert row["listing_id"] == f"1100{ASIN_A}"
     assert row["item_url"].endswith(f"1100{ASIN_A}")
+
+
+@pytest.mark.parametrize("endpoint", ["stage", "publish"])
+def test_legacy_endpoints_capture_env_once_at_entry(
+    client, tmp_path, monkeypatch, endpoint
+):
+    """A target flip after the first env read must not reach production."""
+    _live_env(monkeypatch, env="sandbox")
+    _write_token(tmp_path, "sandbox")
+    reads = {"n": 0}
+    real = cfg.ebay_env
+
+    def flipping():
+        reads["n"] += 1
+        return real() if reads["n"] == 1 else "production"
+
+    monkeypatch.setattr(cfg, "ebay_env", flipping)
+    seen: dict[str, str] = {}
+
+    def fake(asin, *args, **kwargs):
+        seen["env"] = cfg.operation_env()
+        return {"asin": asin}
+
+    monkeypatch.setattr(
+        ebay_listing,
+        "stage_unpublished" if endpoint == "stage" else "publish_offer",
+        fake,
+    )
+
+    response = client.post(f"/api/ebay/listings/{ASIN_A}/{endpoint}", json={})
+
+    assert response.status_code == 200, response.text
+    assert seen["env"] == "sandbox"
+    assert cfg.ebay_ops_in_flight() == 0
+
+
+def test_dotenv_with_non_utf8_bytes_closes_gates_without_raising(monkeypatch, tmp_path):
+    env = tmp_path / ".env"
+    env.write_bytes("NOTE=Gr\xfc\xdfe\nEBAY_AUTOMATION_ENABLED=true\n".encode("cp1252"))
+    monkeypatch.setattr(cfg, "ENV_FILE", env)
+    cfg.clear_live_env_cache()
+    monkeypatch.setenv("EBAY_AUTOMATION_ENABLED", "true")
+
+    assert cfg.ebay_automation_enabled() is False
+
+
+def test_dotenv_with_odd_quote_in_comment_keeps_gates_open(monkeypatch, tmp_path):
+    env = tmp_path / ".env"
+    env.write_text(
+        "SHOP_NOTE='x' # don't\nEBAY_AUTOMATION_ENABLED=true\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(cfg, "ENV_FILE", env)
+    cfg.clear_live_env_cache()
+    monkeypatch.setenv("EBAY_AUTOMATION_ENABLED", "true")
+
+    assert cfg.ebay_automation_enabled() is True

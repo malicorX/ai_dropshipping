@@ -65,24 +65,6 @@ def _bool_value(raw: object, default: bool = False) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
-def _looks_malformed(text: str) -> bool:
-    """Detect the common .env failures python-dotenv only warns about."""
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if "=" not in stripped:
-            return True
-        _, _, value = stripped.partition("=")
-        value = value.strip()
-        if not value or value[0] not in ("'", '"'):
-            continue
-        quote = value[0]
-        if value.count(quote) % 2 == 1:
-            return True
-    return False
-
-
 def _read_live_dotenv(path) -> dict[str, object]:
     """Return ``{'ok', 'values', 'reason'}`` for one .env read (never raises)."""
     try:
@@ -93,12 +75,10 @@ def _read_live_dotenv(path) -> dict[str, object]:
         return {"ok": False, "values": {}, "reason": "missing"}
     try:
         text = path.read_text(encoding="utf-8")
-    except (OSError, PermissionError):
+    except (OSError, UnicodeDecodeError, ValueError):
         return {"ok": False, "values": {}, "reason": "unreadable"}
     if not text.strip():
         return {"ok": False, "values": {}, "reason": "empty"}
-    if _looks_malformed(text):
-        return {"ok": False, "values": {}, "reason": "malformed"}
     try:
         values = dict(dotenv_values(path))
     except Exception:  # noqa: BLE001 - any parse failure closes every gate
