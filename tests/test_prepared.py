@@ -906,6 +906,37 @@ def test_prepared_overview_sorts_newest_first(client, monkeypatch):
     assert [item["asin"] for item in items] == ["B0SORT0002", "B0SORT0001"]
 
 
+def test_publish_mode_retries_unreachable_row(client, monkeypatch):
+    """A transient Amazon reset during a publish run is retried, then published."""
+    asin = "B0PUBRET01"
+    _seed_prepared(asin)
+    calls = _install_stubs(monkeypatch)
+    monkeypatch.setattr(upload_items, "RETRY_PASS_PAUSE_SEC", 0)
+    seen = {"n": 0}
+
+    def flaky_offers(fetched: str) -> list[OfferIn]:
+        calls["fetch"].append(fetched)
+        seen["n"] += 1
+        if seen["n"] == 1:
+            raise upload_items.AmazonUnreachable(
+                "AMAZON_UNREACHABLE: ASIN B0PUBRET01 failed after 3 attempts: "
+                "ERR_CONNECTION_RESET"
+            )
+        return [_offer(fetched)]
+
+    monkeypatch.setattr(upload_items, "fetch_variation_offers", flaky_offers)
+
+    r = client.post("/api/prepared/publish", json={"asins": [asin]})
+    assert r.status_code == 200
+    status = _wait_done(client)
+
+    row = status["rows"][0]
+    assert row["state"] == "published"
+    assert row["attempts"] == 2
+    assert calls["fetch"] == [asin, asin]
+    assert calls["publish"] == [asin]
+
+
 def test_list_prepared_has_no_env_parameter():
     """The overview always uses the current target; no env argument remains."""
     with pytest.raises(TypeError):

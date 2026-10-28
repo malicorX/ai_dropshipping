@@ -58,14 +58,16 @@ from dropship_desk.models import (
 from dropship_desk.safety import check_ebay_sell
 from dropship_desk.upload_items import (
     UPLOAD_JOB,
+    InvalidUploadFile,
     LiveUploadDisabled,
     NotSignedIn,
     UploadAlreadyRunning,
     UploadFileMissing,
+    list_upload_files,
     mark_row_listed,
     published_listing_state,
     read_upload_file,
-    upload_items_path,
+    resolve_upload_file,
 )
 
 _ALLOWED_OPEN_HOSTS = frozenset(
@@ -91,6 +93,13 @@ def _ebay_health() -> dict:
         "sell_allowed": sell.ok,
         "sell_block_reason": "" if sell.ok else sell.reason,
     }
+
+
+def _invalid_upload_file(exc: InvalidUploadFile) -> JSONResponse:
+    return JSONResponse(
+        status_code=400,
+        content={"code": "INVALID_UPLOAD_FILE", "detail": str(exc)},
+    )
 
 
 class _SkipNoisyAccess(logging.Filter):
@@ -338,11 +347,19 @@ def create_app() -> FastAPI:
     def candidates_enrich_stop() -> dict:
         return ENRICH_JOB.stop()
 
+    @app.get("/api/upload-items/files")
+    def upload_items_files() -> dict:
+        """The selectable ``*.txt`` lists directly inside the upload folder."""
+        return list_upload_files()
+
     @app.get("/api/upload-items/preview")
-    def upload_items_preview() -> dict:
+    def upload_items_preview(file: str | None = None) -> dict:
         env = config.ebay_env()
         try:
-            rows = read_upload_file()
+            path = resolve_upload_file(file)
+            rows = read_upload_file(path)
+        except InvalidUploadFile as e:
+            return _invalid_upload_file(e)
         except UploadFileMissing as e:
             raise HTTPException(
                 status_code=404, detail=f"UPLOAD_FILE_MISSING: {e.path}"
@@ -357,15 +374,17 @@ def create_app() -> FastAPI:
         return {
             "target_env": env,
             "live_disabled": env == "production",
-            "path": str(upload_items_path()),
+            "path": str(path),
+            "file": path.name,
             "rows": [row.to_dict() for row in rows],
         }
 
     @app.post("/api/upload-items/start")
     def upload_items_start(body: dict | None = None) -> dict:
         mode = str((body or {}).get("mode") or "full").strip().lower()
+        file_name = (body or {}).get("file")
         try:
-            return UPLOAD_JOB.start(mode=mode)
+            return UPLOAD_JOB.start(mode=mode, file=file_name)
         except LiveUploadDisabled:
             return JSONResponse(
                 status_code=403,
@@ -377,6 +396,8 @@ def create_app() -> FastAPI:
                     ),
                 },
             )
+        except InvalidUploadFile as e:
+            return _invalid_upload_file(e)
         except UploadAlreadyRunning as e:
             raise HTTPException(status_code=409, detail=str(e)) from e
         except NotSignedIn as e:

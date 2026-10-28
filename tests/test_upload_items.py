@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import stat as stat_module
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -787,6 +789,9 @@ def test_rows_record_monotonic_durations_for_published_and_error(
 ):
     clock = {"t": 100.0}
     monkeypatch.setattr(upload_items, "_monotonic", lambda: clock["t"])
+    # One pass only: this test pins the per-attempt duration, while the retry
+    # timing is covered by test_retry_restamps_duration_per_attempt.
+    monkeypatch.setattr(upload_items, "MAX_RETRY_PASSES", 0)
 
     def timed_fetch(asin: str) -> OfferIn:
         if asin == "B0DUR00001":
@@ -927,6 +932,8 @@ def test_plain_product_with_one_matching_offer_passes(
 
 
 def test_ordinary_amazon_unreachable_is_a_row_error_and_run_continues(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(upload_items, "RETRY_PASS_PAUSE_SEC", 0)
+
     def flaky_fetch(asin: str) -> OfferIn:
         if asin == "B0FLAKY001":
             raise upload_items.AmazonUnreachable(
@@ -946,6 +953,15 @@ def test_ordinary_amazon_unreachable_is_a_row_error_and_run_continues(client, tm
 
     assert [row["state"] for row in status["rows"]] == ["error", "published"]
     assert status["phase"] == "finished"
+    # The transient row is retried twice more; the healthy row is untouched.
+    assert status["rows"][0]["attempts"] == 3
+    assert status["rows"][0]["reason"].startswith("after 3 attempts: ")
+    assert calls["fetch"] == [
+        "B0FLAKY001",
+        "B0AFTER001",
+        "B0FLAKY001",
+        "B0FLAKY001",
+    ]
     assert calls["stage"] == ["B0AFTER001"]
     assert calls["publish"] == ["B0AFTER001"]
 
@@ -1161,3 +1177,669 @@ def test_failure_cap_amazon_unreachable_aborts_the_run(client, tmp_path, monkeyp
     assert status["rows"][1]["duration_sec"] is None
     assert calls["stage"] == []
     assert calls["publish"] == []
+
+
+# --------------------------------------------------- retry passes (A)
+
+
+def _unreachable(asin: str) -> upload_items.AmazonUnreachable:
+    return upload_items.AmazonUnreachable(
+        f"AMAZON_UNREACHABLE: ASIN {asin} failed after 3 attempts: "
+        "net::ERR_CONNECTION_RESET"
+    )
+
+
+def _wait_phase(client: TestClient, phase: str, timeout: float = 5.0) -> dict:
+    deadline = time.time() + timeout
+    last: dict = {}
+    while time.time() < deadline:
+        last = client.get("/api/upload-items/status").json()
+        if last.get("phase") == phase:
+            return last
+        time.sleep(0.01)
+    raise AssertionError(f"phase {phase!r} not reached: {last}")
+
+
+def test_unreachable_row_is_retried_and_succeeds_on_second_pass(
+    client, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(upload_items, "RETRY_PASS_PAUSE_SEC", 0)
+    seen = {"n": 0}
+
+    def flaky_fetch(asin: str) -> OfferIn:
+        seen["n"] += 1
+        if seen["n"] == 1:
+            raise _unreachable(asin)
+        return _offer(asin)
+
+    calls = _install_stubs(monkeypatch, fetch_hook=flaky_fetch)
+    _write_upload(tmp_path, monkeypatch, "https://www.amazon.de/dp/B0RETRY001\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    row = status["rows"][0]
+    assert row["state"] == "published"
+    assert row["attempts"] == 2
+    assert calls["fetch"] == ["B0RETRY001", "B0RETRY001"]
+    assert status["retry_pass"] == 1
+    assert status["phase"] == "finished"
+
+
+def test_unreachable_row_stays_error_after_all_retry_passes(
+    client, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(upload_items, "RETRY_PASS_PAUSE_SEC", 0)
+
+    def always_unreachable(asin: str) -> OfferIn:
+        raise _unreachable(asin)
+
+    calls = _install_stubs(monkeypatch, fetch_hook=always_unreachable)
+    _write_upload(tmp_path, monkeypatch, "https://www.amazon.de/dp/B0RETRY002\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    row = status["rows"][0]
+    assert row["state"] == "error"
+    assert row["attempts"] == 3
+    assert row["reason"].startswith("after 3 attempts: ")
+    assert "AMAZON_UNREACHABLE" in row["reason"]
+    assert len(calls["fetch"]) == 3
+    assert status["retry_pass"] == 2
+    assert status["phase"] == "finished"
+
+
+def test_retry_restamps_duration_per_attempt(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(upload_items, "RETRY_PASS_PAUSE_SEC", 0)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(upload_items, "_monotonic", lambda: clock["t"])
+
+    def ticking_fetch(asin: str) -> OfferIn:
+        clock["t"] += 1.0
+        raise _unreachable(asin)
+
+    _install_stubs(monkeypatch, fetch_hook=ticking_fetch)
+    _write_upload(tmp_path, monkeypatch, "https://www.amazon.de/dp/B0RETRY003\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    row = status["rows"][0]
+    # The duration belongs to the last attempt, not to all attempts summed.
+    assert row["duration_sec"] == 1.0
+    assert row["started_at"]
+    assert row["finished_at"]
+
+
+def test_non_unreachable_error_is_not_retried(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(upload_items, "RETRY_PASS_PAUSE_SEC", 0)
+
+    def broken_fetch(asin: str) -> OfferIn:
+        raise RuntimeError("eBay exploded")
+
+    calls = _install_stubs(monkeypatch, fetch_hook=broken_fetch)
+    _write_upload(tmp_path, monkeypatch, "https://www.amazon.de/dp/B0NORET001\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    row = status["rows"][0]
+    assert row["state"] == "error"
+    assert row["attempts"] == 1
+    assert calls["fetch"] == ["B0NORET001"]
+    assert status["retry_pass"] == 0
+
+
+def test_stop_during_retry_pause_ends_run_without_another_pass(
+    client, tmp_path, monkeypatch
+):
+    # Real pause length and real small step: the run must end after one step.
+    monkeypatch.setattr(upload_items, "RETRY_PASS_PAUSE_SEC", 30)
+
+    def always_unreachable(asin: str) -> OfferIn:
+        raise _unreachable(asin)
+
+    calls = _install_stubs(monkeypatch, fetch_hook=always_unreachable)
+    _write_upload(tmp_path, monkeypatch, "https://www.amazon.de/dp/B0STOPRET1\n")
+
+    client.post("/api/upload-items/start")
+    _wait_phase(client, "retrying")
+    started = time.monotonic()
+    stopped = client.post("/api/upload-items/stop", json={})
+    assert stopped.status_code == 200
+
+    status = _wait_done(client, timeout=2.0)
+
+    assert time.monotonic() - started < 1.5
+    assert status["phase"] == "stopped"
+    assert status["rows"][0]["state"] == "error"
+    assert status["rows"][0]["attempts"] == 1
+    assert calls["fetch"] == ["B0STOPRET1"]
+
+
+def test_target_change_during_retry_pause_aborts_run(client, tmp_path, monkeypatch):
+    holder = {"env": "sandbox"}
+    monkeypatch.setattr(cfg, "ebay_env", lambda: holder["env"])
+    monkeypatch.setattr(upload_items, "RETRY_PASS_PAUSE_SEC", 30)
+
+    def always_unreachable(asin: str) -> OfferIn:
+        raise _unreachable(asin)
+
+    calls = _install_stubs(monkeypatch, fetch_hook=always_unreachable)
+    _write_upload(tmp_path, monkeypatch, "https://www.amazon.de/dp/B0TGTCHG01\n")
+
+    client.post("/api/upload-items/start")
+    _wait_phase(client, "retrying")
+    started = time.monotonic()
+    holder["env"] = "production"
+
+    status = _wait_done(client, timeout=2.0)
+
+    assert time.monotonic() - started < 1.5
+    assert status["phase"] == "aborted_target_changed"
+    assert calls["fetch"] == ["B0TGTCHG01"]
+
+
+def test_systemic_abort_during_retry_pause_ends_run_without_waiting(
+    client, tmp_path, monkeypatch
+):
+    holder = {"env": "sandbox", "browser_gone": False}
+
+    def env() -> str:
+        if holder["browser_gone"]:
+            raise upload_items.ChromeNotFound("CHROME_NOT_FOUND: browser died")
+        return holder["env"]
+
+    monkeypatch.setattr(cfg, "ebay_env", env)
+    monkeypatch.setattr(upload_items, "RETRY_PASS_PAUSE_SEC", 30)
+
+    def always_unreachable(asin: str) -> OfferIn:
+        raise _unreachable(asin)
+
+    calls = _install_stubs(monkeypatch, fetch_hook=always_unreachable)
+    _write_upload(tmp_path, monkeypatch, "https://www.amazon.de/dp/B0SYSABRT1\n")
+
+    client.post("/api/upload-items/start")
+    _wait_phase(client, "retrying")
+    started = time.monotonic()
+    holder["browser_gone"] = True
+
+    status = _wait_done(client, timeout=2.0)
+
+    assert time.monotonic() - started < 1.5
+    assert status["phase"] == "aborted"
+    assert "CHROME_NOT_FOUND" in status["error"]
+    assert calls["fetch"] == ["B0SYSABRT1"]
+
+
+def test_systemic_failure_cap_on_retry_aborts_run(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(upload_items, "RETRY_PASS_PAUSE_SEC", 0)
+    seen = {"n": 0}
+
+    def capped_on_retry(asin: str) -> OfferIn:
+        seen["n"] += 1
+        if seen["n"] > 1:
+            raise upload_items.AmazonUnreachable(
+                "AMAZON_UNREACHABLE: failure cap reached after 20 consecutive "
+                "terminal failures"
+            )
+        raise _unreachable(asin)
+
+    _install_stubs(monkeypatch, fetch_hook=capped_on_retry)
+    _write_upload(tmp_path, monkeypatch, "https://www.amazon.de/dp/B0CAPRET01\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    assert status["phase"] == "aborted"
+    assert "failure cap" in status["error"]
+    assert seen["n"] == 2
+    assert status["rows"][0]["state"] == "error"
+
+
+def test_retry_reason_finalized_when_retry_pass_aborts(client, tmp_path, monkeypatch):
+    """An abort during a retry pass must still stamp "after N attempts"."""
+    monkeypatch.setattr(upload_items, "RETRY_PASS_PAUSE_SEC", 0)
+    attempts: dict[str, int] = {}
+
+    def hook(asin: str) -> OfferIn:
+        attempts[asin] = attempts.get(asin, 0) + 1
+        if asin == "B0FINABT01":
+            raise _unreachable(asin)
+        if attempts[asin] == 1:
+            raise _unreachable(asin)
+        raise upload_items.AmazonUnreachable(
+            "AMAZON_UNREACHABLE: failure cap reached after 20 consecutive "
+            "terminal failures"
+        )
+
+    calls = _install_stubs(monkeypatch, fetch_hook=hook)
+    _write_upload(
+        tmp_path,
+        monkeypatch,
+        "https://www.amazon.de/dp/B0FINABT01\n"
+        "https://www.amazon.de/dp/B0FINABT02\n",
+    )
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    assert status["phase"] == "aborted"
+    first = status["rows"][0]
+    assert first["state"] == "error"
+    assert first["attempts"] == 2
+    assert first["reason"].startswith("after 2 attempts: AMAZON_UNREACHABLE")
+    assert calls["fetch"].count("B0FINABT01") == 2
+
+
+def test_retry_reason_finalized_when_stopped_in_retry_pass(
+    client, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(upload_items, "RETRY_PASS_PAUSE_SEC", 0)
+    second_pass = threading.Event()
+    release = threading.Event()
+    attempts: dict[str, int] = {}
+
+    def hook(asin: str) -> OfferIn:
+        attempts[asin] = attempts.get(asin, 0) + 1
+        if asin == "B0FINSTP01" and attempts[asin] == 2:
+            second_pass.set()
+            assert release.wait(5), "test deadlock waiting for release"
+        raise _unreachable(asin)
+
+    _install_stubs(monkeypatch, fetch_hook=hook)
+    _write_upload(
+        tmp_path,
+        monkeypatch,
+        "https://www.amazon.de/dp/B0FINSTP01\n"
+        "https://www.amazon.de/dp/B0FINSTP02\n",
+    )
+
+    client.post("/api/upload-items/start")
+    assert second_pass.wait(5)
+    assert client.post("/api/upload-items/stop", json={}).status_code == 200
+    release.set()
+    status = _wait_done(client)
+
+    assert status["phase"] == "stopped"
+    first = status["rows"][0]
+    assert first["attempts"] == 2
+    assert first["reason"].startswith("after 2 attempts: AMAZON_UNREACHABLE")
+    assert status["rows"][1]["state"] == "queued"
+
+
+def test_retry_reason_finalized_when_target_changes_in_retry_pass(
+    client, tmp_path, monkeypatch
+):
+    holder = {"env": "sandbox"}
+    monkeypatch.setattr(cfg, "ebay_env", lambda: holder["env"])
+    monkeypatch.setattr(upload_items, "RETRY_PASS_PAUSE_SEC", 0)
+    second_pass = threading.Event()
+    release = threading.Event()
+    attempts: dict[str, int] = {}
+
+    def hook(asin: str) -> OfferIn:
+        attempts[asin] = attempts.get(asin, 0) + 1
+        if asin == "B0FINTGT01" and attempts[asin] == 2:
+            second_pass.set()
+            assert release.wait(5), "test deadlock waiting for release"
+        raise _unreachable(asin)
+
+    _install_stubs(monkeypatch, fetch_hook=hook)
+    _write_upload(
+        tmp_path,
+        monkeypatch,
+        "https://www.amazon.de/dp/B0FINTGT01\n"
+        "https://www.amazon.de/dp/B0FINTGT02\n",
+    )
+
+    client.post("/api/upload-items/start")
+    assert second_pass.wait(5)
+    holder["env"] = "production"
+    release.set()
+    status = _wait_done(client)
+
+    assert status["phase"] == "aborted_target_changed"
+    first = status["rows"][0]
+    assert first["attempts"] == 2
+    assert first["reason"].startswith("after 2 attempts: AMAZON_UNREACHABLE")
+    assert status["rows"][1]["state"] == "error"
+    assert status["rows"][1]["reason"].startswith("aborted_target_changed")
+
+
+def test_retry_only_for_exact_unreachable_prefix():
+    def row(reason: str) -> upload_items.UploadRow:
+        return upload_items.UploadRow(
+            line_no=1, line="x", asin="B0PREFIX01", state="error", reason=reason
+        )
+
+    assert upload_items.UploadJobManager._is_retryable(
+        row("AMAZON_UNREACHABLE: connection reset")
+    )
+    assert upload_items.UploadJobManager._is_retryable(row("AMAZON_UNREACHABLE"))
+    assert not upload_items.UploadJobManager._is_retryable(
+        row("AMAZON_UNREACHABLE_NOT: connection reset")
+    )
+    assert not upload_items.UploadJobManager._is_retryable(
+        row("AMAZON_UNREACHABLE_OTHER")
+    )
+    assert not upload_items.UploadJobManager._is_retryable(
+        row("NOT_AMAZON_UNREACHABLE: x")
+    )
+
+
+def test_unreachable_prefix_with_suffix_word_is_not_retried(
+    client, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(upload_items, "RETRY_PASS_PAUSE_SEC", 0)
+
+    def prefixed_but_different(asin: str) -> OfferIn:
+        raise upload_items.AmazonUnreachable(
+            "AMAZON_UNREACHABLE_NOT: connection reset"
+        )
+
+    calls = _install_stubs(monkeypatch, fetch_hook=prefixed_but_different)
+    _write_upload(tmp_path, monkeypatch, "https://www.amazon.de/dp/B0PREFBAD1\n")
+
+    client.post("/api/upload-items/start")
+    status = _wait_done(client)
+
+    assert status["rows"][0]["state"] == "error"
+    assert status["rows"][0]["attempts"] == 1
+    assert status["retry_pass"] == 0
+    assert calls["fetch"] == ["B0PREFBAD1"]
+
+
+def test_prepare_mode_retries_unreachable_row(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(upload_items, "RETRY_PASS_PAUSE_SEC", 0)
+    seen = {"n": 0}
+
+    def flaky_fetch(asin: str) -> OfferIn:
+        seen["n"] += 1
+        if seen["n"] == 1:
+            raise _unreachable(asin)
+        return _offer(asin)
+
+    calls = _install_stubs(monkeypatch, fetch_hook=flaky_fetch)
+    _write_upload(tmp_path, monkeypatch, "https://www.amazon.de/dp/B0PRERET01\n")
+
+    client.post("/api/upload-items/start", json={"mode": "prepare"})
+    status = _wait_done(client)
+
+    row = status["rows"][0]
+    assert row["state"] == "prepared"
+    assert row["attempts"] == 2
+    assert calls["fetch"] == ["B0PRERET01", "B0PRERET01"]
+    assert calls["stage"] == []
+    assert calls["publish"] == []
+
+
+# --------------------------------------------------- upload file choice (B)
+
+
+def _make_upload_dir(tmp_path: Path, monkeypatch) -> Path:
+    folder = tmp_path / "upload_items"
+    folder.mkdir()
+    monkeypatch.setattr(cfg, "RUNTIME_ROOT", tmp_path)
+    return folder
+
+
+def test_upload_files_listing_only_txt_sorted_newest_first(
+    client, tmp_path, monkeypatch
+):
+    import os
+
+    folder = _make_upload_dir(tmp_path, monkeypatch)
+    old = folder / "upload_items.txt"
+    old.write_text("# comment\nB0DEF00001\n", encoding="utf-8")
+    middle = folder / "a.txt"
+    middle.write_text("one\n", encoding="utf-8")
+    newest = folder / "b.txt"
+    newest.write_text("one\ntwo\n", encoding="utf-8")
+    (folder / "ignore.csv").write_text("x\n", encoding="utf-8")
+    nested = folder / "sub"
+    nested.mkdir()
+    (nested / "nested.txt").write_text("x\n", encoding="utf-8")
+    os.utime(old, (1000, 1000))
+    os.utime(middle, (2000, 2000))
+    os.utime(newest, (3000, 3000))
+
+    r = client.get("/api/upload-items/files")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["dir"].replace("\\", "/").endswith("upload_items")
+    assert [entry["name"] for entry in body["files"]] == [
+        "b.txt",
+        "a.txt",
+        "upload_items.txt",
+    ]
+    assert body["default"] == "upload_items.txt"
+    assert body["files"][0]["size"] == len(newest.read_bytes())
+    assert body["files"][0]["lines"] == 2
+    assert body["files"][0]["modified"]
+
+
+def test_upload_files_listing_skips_symlinks_and_reparse_points(
+    client, tmp_path, monkeypatch
+):
+    folder = _make_upload_dir(tmp_path, monkeypatch)
+    (folder / "normal.txt").write_text("one\n", encoding="utf-8")
+    (folder / "link.txt").write_text("hidden\n", encoding="utf-8")
+    (folder / "junction.txt").write_text("hidden\n", encoding="utf-8")
+
+    real_is_symlink = Path.is_symlink
+    real_stat = Path.stat
+    real_read_text = Path.read_text
+    reparse_flag = getattr(stat_module, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+    def fake_is_symlink(self):
+        if self.name == "link.txt":
+            return True
+        return real_is_symlink(self)
+
+    def fake_stat(self, *args, **kwargs):
+        if self.name == "junction.txt" and kwargs.get("follow_symlinks") is False:
+            return SimpleNamespace(
+                st_file_attributes=reparse_flag,
+                st_mode=stat_module.S_IFREG,
+                st_size=7,
+                st_mtime=1.0,
+            )
+        if self.name in {"link.txt", "junction.txt"}:
+            raise AssertionError(
+                f"listing must not follow {self.name} for size/lines/mtime"
+            )
+        return real_stat(self, *args, **kwargs)
+
+    def fake_read_text(self, *args, **kwargs):
+        if self.name in {"link.txt", "junction.txt"}:
+            raise AssertionError(f"listing must not read {self.name}")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_symlink", fake_is_symlink)
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+
+    body = client.get("/api/upload-items/files").json()
+
+    assert [entry["name"] for entry in body["files"]] == ["normal.txt"]
+    assert body["default"] == "normal.txt"
+
+
+class _FakeColonEntry:
+    """A fake directory entry whose name is an alternate data stream."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.suffix = ".txt"
+        self.accesses: list[str] = []
+
+    def is_symlink(self) -> bool:
+        self.accesses.append("is_symlink")
+        return False
+
+    def is_file(self) -> bool:
+        self.accesses.append("is_file")
+        return True
+
+    def stat(self, *args, **kwargs):
+        self.accesses.append("stat")
+        raise AssertionError(f"must not stat alternate data stream {self.name}")
+
+    def read_text(self, *args, **kwargs):
+        self.accesses.append("read_text")
+        raise AssertionError(f"must not read alternate data stream {self.name}")
+
+
+@pytest.mark.parametrize(
+    "payload", ["upload_items.txt:hid.txt", "ab:c.txt"]
+)
+def test_file_listing_never_offers_alternate_data_streams(
+    client, tmp_path, monkeypatch, payload
+):
+    folder = _make_upload_dir(tmp_path, monkeypatch)
+    fake = _FakeColonEntry(payload)
+    real_iterdir = Path.iterdir
+
+    def fake_iterdir(self):
+        if self == folder:
+            return iter([fake])
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+
+    body = client.get("/api/upload-items/files").json()
+
+    assert body["files"] == []
+    assert fake.accesses == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "../x.txt",
+        "..\\x.txt",
+        "..x.txt",
+        "C:\\x.txt",
+        "/etc/x.txt",
+        "sub/x.txt",
+        "x.csv",
+        "sub.txt",
+        "missing.txt",
+        "upload_items.txt:hid.txt",
+        "ab:c.txt",
+    ],
+)
+def test_invalid_upload_file_names_are_400_and_never_read(
+    client, tmp_path, monkeypatch, payload
+):
+    folder = _make_upload_dir(tmp_path, monkeypatch)
+    (folder / "upload_items.txt").write_text("B0DEF00001\n", encoding="utf-8")
+    (folder / "x.txt").write_text("B0X0000001\n", encoding="utf-8")
+    (folder / "..x.txt").write_text("B0DOTS0001\n", encoding="utf-8")
+    (folder / "sub").mkdir()
+    (folder / "sub" / "x.txt").write_text("B0SUB00001\n", encoding="utf-8")
+    (folder / "sub.txt").mkdir()
+    if payload in {"upload_items.txt:hid.txt", "ab:c.txt"}:
+        # On Windows this creates a real alternate data stream; on POSIX it is
+        # a normal file.  Either way a colon in the name must be rejected.
+        stream_base = payload.split(":", 1)[0]
+        if not (folder / stream_base).exists():
+            (folder / stream_base).write_text("base\n", encoding="utf-8")
+        (folder / payload).write_text("B0HIDDEN01\n", encoding="utf-8")
+    # Every start test must be incapable of reaching a real Amazon fetch.
+    calls = _install_stubs(monkeypatch)
+
+    reads: list[tuple] = []
+
+    def spy_read(*args, **kwargs):
+        reads.append((args, kwargs))
+        raise AssertionError("read_upload_file must not run for an invalid name")
+
+    # start() goes through upload_items.UPLOAD_JOB -> upload_items.read_upload_file
+    monkeypatch.setattr(upload_items, "read_upload_file", spy_read)
+
+    preview = client.get("/api/upload-items/preview", params={"file": payload})
+    assert preview.status_code == 400, preview.text
+    assert "INVALID_UPLOAD_FILE" in preview.text
+
+    started = client.post(
+        "/api/upload-items/start", json={"mode": "prepare", "file": payload}
+    )
+    assert started.status_code == 400, started.text
+    assert "INVALID_UPLOAD_FILE" in started.text
+    assert reads == []
+    assert calls["fetch"] == []
+
+
+def test_whitespace_only_file_name_is_400_not_the_default(
+    client, tmp_path, monkeypatch
+):
+    folder = _make_upload_dir(tmp_path, monkeypatch)
+    (folder / "upload_items.txt").write_text("B0DEFAULT1\n", encoding="utf-8")
+    calls = _install_stubs(monkeypatch)
+
+    reads: list[tuple] = []
+
+    def spy_read(*args, **kwargs):
+        reads.append((args, kwargs))
+        raise AssertionError("whitespace-only file must not fall back to default")
+
+    monkeypatch.setattr(upload_items, "read_upload_file", spy_read)
+
+    for payload in ("   ", "\t\t"):
+        preview = client.get(
+            "/api/upload-items/preview", params={"file": payload}
+        )
+        assert preview.status_code == 400, preview.text
+        assert "INVALID_UPLOAD_FILE" in preview.text
+
+        started = client.post(
+            "/api/upload-items/start", json={"mode": "prepare", "file": payload}
+        )
+        assert started.status_code == 400, started.text
+        assert "INVALID_UPLOAD_FILE" in started.text
+
+    assert reads == []
+    assert calls["fetch"] == []
+
+
+def test_preview_and_start_use_the_selected_file(client, tmp_path, monkeypatch):
+    folder = _make_upload_dir(tmp_path, monkeypatch)
+    (folder / "upload_items.txt").write_text("B0DEFAULT1\n", encoding="utf-8")
+    (folder / "other.txt").write_text("B0OTHER001\n", encoding="utf-8")
+    calls = _install_stubs(monkeypatch)
+
+    preview = client.get(
+        "/api/upload-items/preview", params={"file": "other.txt"}
+    )
+    assert preview.status_code == 200
+    body = preview.json()
+    assert body["file"] == "other.txt"
+    assert body["path"].replace("\\", "/").endswith("/other.txt")
+    assert [row["asin"] for row in body["rows"]] == ["B0OTHER001"]
+
+    client.post(
+        "/api/upload-items/start", json={"mode": "prepare", "file": "other.txt"}
+    )
+    status = _wait_done(client)
+
+    assert status["file"] == "other.txt"
+    assert calls["fetch"] == ["B0OTHER001"]
+    assert status["rows"][0]["state"] == "prepared"
+
+
+def test_start_without_file_uses_the_default_file(client, tmp_path, monkeypatch):
+    folder = _make_upload_dir(tmp_path, monkeypatch)
+    (folder / "upload_items.txt").write_text("B0DEFAULT1\n", encoding="utf-8")
+    (folder / "newer.txt").write_text("B0NEWER001\n", encoding="utf-8")
+    calls = _install_stubs(monkeypatch)
+
+    client.post("/api/upload-items/start", json={"mode": "prepare"})
+    status = _wait_done(client)
+
+    assert status["file"] == "upload_items.txt"
+    assert calls["fetch"] == ["B0DEFAULT1"]
+    assert status["rows"][0]["state"] == "prepared"
