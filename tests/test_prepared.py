@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 import dropship_desk.api as api_mod
 import dropship_desk.prepared as prepared_mod
 import dropship_desk.upload_items as upload_items
+from dropship_desk.models import MarginSettings
 from dropship_desk import config as cfg
 from dropship_desk import db
 from dropship_desk.ebay import listing as ebay_listing
@@ -692,6 +693,8 @@ def test_publish_rejects_when_amazon_price_rose_against_prepared_price(
 def test_publish_still_fine_price_publishes_at_prepared_price(client, monkeypatch):
     asin = "B0PRICE002"
     _seed_prepared(asin)  # stored amazon 20 / prepared eBay price 50
+    # This test is about price binding, not the margin policy: pin the old 50 % floor.
+    db.set_margin_settings(MarginSettings(min_margin_pct=0.50, min_margin_eur=5.0))
     calls = _install_real_evaluate_with_ebay_spies(monkeypatch, total=20.0)
 
     r = client.post("/api/prepared/publish", json={"asins": [asin]})

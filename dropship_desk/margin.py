@@ -13,7 +13,7 @@ class MarginInputs:
     ebay_fee_fixed: float = 0.35
     buffer_eur: float = 3.0
     min_margin_eur: float = 5.0
-    min_margin_pct: float = 0.50
+    min_margin_pct: float = 1.00
 
 
 @dataclass(frozen=True)
@@ -82,7 +82,7 @@ def suggest_ebay_price(
     fee_fixed: float = 0.35,
     buffer_eur: float = 3.0,
     min_margin_eur: float = 5.0,
-    min_margin_pct: float = 0.50,
+    min_margin_pct: float = 1.00,
 ) -> float:
     """Smallest psychological *.99 price that PASSes margin rules."""
     if amazon_total <= 0:

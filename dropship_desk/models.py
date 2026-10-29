@@ -43,7 +43,7 @@ class MarginSettings(BaseModel):
     ebay_fee_fixed: float = 0.35
     buffer_eur: float = 3.0
     min_margin_eur: float = 5.0
-    min_margin_pct: float = 0.50
+    min_margin_pct: float = 1.00
     max_delivery_days: int = 10
     min_stock: int = 10
     skip_sold_by_amazon: bool = True

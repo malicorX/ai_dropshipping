@@ -117,11 +117,11 @@ def get_margin_settings() -> MarginSettings:
 
 
 def ensure_margin_policy() -> MarginSettings:
-    """Migrate old factory default (20%) to 50%; leave custom Settings alone."""
+    """Migrate old factory defaults (20 %, 50 %) to 100 %; leave custom Settings alone."""
     current = get_margin_settings()
-    if abs(current.min_margin_pct - 0.20) < 1e-9:
+    if any(abs(current.min_margin_pct - old) < 1e-9 for old in (0.20, 0.50)):
         return set_margin_settings(
-            current.model_copy(update={"min_margin_eur": 5.0, "min_margin_pct": 0.50})
+            current.model_copy(update={"min_margin_eur": 5.0, "min_margin_pct": 1.00})
         )
     return current
 

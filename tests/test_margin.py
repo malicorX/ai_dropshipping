@@ -2,13 +2,13 @@ from dropship_desk.margin import MarginInputs, evaluate_margin, suggest_ebay_pri
 
 
 def test_margin_pass_known_case():
-    # amazon 20, ebay needs ~50% → roughly mid-40s+
+    # amazon 20, ebay needs 100 % → roughly 65+
     result = evaluate_margin(
         MarginInputs(amazon_total=20.0, ebay_price=55.0)
     )
     assert result.passed
     assert result.net_profit >= 5.0
-    assert result.margin_pct >= 0.50
+    assert result.margin_pct >= 1.00
 
 
 def test_margin_fail_low_profit():
