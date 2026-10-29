@@ -19,7 +19,7 @@ class EbayApiError(RuntimeError):
         self.status_code = status_code
         self.path = path
         self.body = body
-        super().__init__(f"eBay {status_code} {path}: {body[:500]}")
+        super().__init__(f"eBay {status_code} {path}: {body[:2000]}")
 
 
 def _error_text(response: httpx.Response) -> str:
