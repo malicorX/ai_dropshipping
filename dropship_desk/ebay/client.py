@@ -90,7 +90,13 @@ def request(
             params=params,
         )
     if response.status_code >= 400:
-        raise EbayApiError(response.status_code, path, _error_text(response))
+        ids = {
+            k.lower(): v
+            for k, v in response.headers.items()
+            if k.lower() in ("rlogid", "x-ebay-c-request-id", "x-ebay-request-id")
+        }
+        tail = f" [headers: {ids}]" if ids else ""
+        raise EbayApiError(response.status_code, path, _error_text(response) + tail)
     if not response.content:
         return None
     try:
