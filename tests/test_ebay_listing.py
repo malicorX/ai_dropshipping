@@ -155,6 +155,11 @@ def test_stage_unpublished_then_publish(tmp_path, monkeypatch):
     assert staged["status"] == "unpublished"
     assert staged["offer_id"] == "OFFER-99"
     assert staged.get("item_url") in ("", None)
+    offer_body = next(
+        payload for method, path, payload in fake.bodies
+        if method == "POST" and path == "/sell/inventory/v1/offer"
+    )
+    assert offer_body["tax"] == {"applyTax": True, "vatPercentage": 19.0}
     rows = list_candidates(status="pipeline")
     assert rows[0]["status"] == "ebay_unpublished"
 

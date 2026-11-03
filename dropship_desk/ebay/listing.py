@@ -18,6 +18,8 @@ HttpFn = Callable[..., Any]
 SKU_PREFIX = "DD-"
 DEFAULT_QUANTITY = 5
 EAN_NOT_APPLICABLE = "Nicht zutreffend"
+# Operator 2026-11-03: seller is regular-rate VAT (19 %); prices are gross.
+VAT_PERCENTAGE = 19.0
 _EAN_KEYS = frozenset({"ean", "EAN", "gtin", "GTIN"})
 _GTIN_RE = re.compile(r"(?:[0-9]{8}|[0-9]{12}|[0-9]{13}|[0-9]{14})")
 
@@ -245,6 +247,7 @@ def _stage_unpublished(
         "categoryId": category["category_id"],
         "merchantLocationKey": setup["merchant_location_key"],
         "listingDuration": "GTC",
+        "tax": {"applyTax": True, "vatPercentage": VAT_PERCENTAGE},
         "pricingSummary": {"price": {"value": f"{price:.2f}", "currency": "EUR"}},
         "listingPolicies": {
             "fulfillmentPolicyId": setup["fulfillment_policy_id"],
