@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from dropship_desk import ollama_client
 from dropship_desk.ebay import aspects as aspects_mod
 from dropship_desk.ebay import client as ebay_http
 from dropship_desk.ebay import oauth as ebay_oauth
@@ -191,22 +192,48 @@ def verified_listing_specifics(
             "category_path": "operator override",
         }
     else:
-        data = requester(
-            "GET",
-            f"/commerce/taxonomy/v1/category_tree/{tree_id}/get_category_suggestions",
-            params={"q": (amazon_title or draft_title)[:200]},
-            token=token,
-        ) or {}
-        suggestions = data.get("categorySuggestions") or []
-        category = aspects_mod.category_fits(amazon_title or draft_title, suggestions)
-        if not category:
-            seen = ", ".join(
-                str((s.get("category") or {}).get("categoryName") or "?")
-                for s in suggestions[:5]
-            )
+        category, seen = None, []
+        queries: list[str] = []
+        for q in (draft_title, amazon_title):
+            q = (q or "")[:200]
+            if q and q not in queries:
+                queries.append(q)
+        pool: list[dict[str, Any]] = []
+        for q in queries:
+            data = requester(
+                "GET",
+                f"/commerce/taxonomy/v1/category_tree/{tree_id}/get_category_suggestions",
+                params={"q": q},
+                token=token,
+            ) or {}
+            suggestions = data.get("categorySuggestions") or []
+            category = aspects_mod.category_fits(amazon_title or draft_title, suggestions)
+            if category:
+                break
+            pool += [s for s in suggestions[:5] if s not in pool]
+        if not category and pool:
+            # No suggestion shares a word with the title: let the local model pick among
+            # eBay's own suggestions, or reject all of them.
+            paths = [
+                " > ".join(
+                    [str(a.get("categoryName") or "") for a in reversed(s.get("categoryTreeNodeAncestors") or [])]
+                    + [str((s.get("category") or {}).get("categoryName") or "")]
+                )
+                for s in pool
+            ]
+            pick = ollama_client.pick_category(amazon_title or draft_title, paths)
+            if pick is not None:
+                cat = pool[pick].get("category") or {}
+                category = {
+                    "category_id": str(cat.get("categoryId") or ""),
+                    "category_name": str(cat.get("categoryName") or ""),
+                    "category_path": paths[pick] + " (KI-Auswahl)",
+                }
+            seen = [str((s.get("category") or {}).get("categoryName") or "?") for s in pool[:5]]
+        if not category or not category["category_id"]:
             raise aspects_mod.AspectsUnverified(
                 "CATEGORY_UNVERIFIED: no eBay category suggestion matches the product "
-                f"title (suggestions: {seen or 'none'}). Set category_id in "
+                f"title (suggestions: {', '.join(seen) or 'none'}). Set category_id in "
                 f"data/products/{asin}/{aspects_mod.OVERRIDE_FILE} after checking it."
             )
     data = requester(

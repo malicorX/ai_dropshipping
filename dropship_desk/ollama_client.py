@@ -291,3 +291,34 @@ def copy_closeness(
     for line in lines:
         mine |= _shingles(re.sub(r"<[^>]+>", " ", line))
     return len(mine & source) / len(mine) if mine else 0.0
+
+
+def pick_category(title: str, options: list[str]) -> int | None:
+    """Ask the local LLM which eBay category path fits the product; None if none fits or Ollama fails."""
+    if not options:
+        return None
+    listing = "\n".join(f"{i}: {o}" for i, o in enumerate(options))
+    prompt = (
+        "Welche eBay-Kategorie passt zu diesem Produkt? Wähle nur, wenn ein Käufer das Produkt "
+        "dort erwarten würde; sonst null.\n"
+        f"Produkt: {title}\nKategorien:\n{listing}\n"
+        'Antworte nur mit JSON: {"index": <Nummer oder null>}'
+    )
+    try:
+        with httpx.Client(timeout=120.0) as client:
+            r = client.post(
+                f"{config.OLLAMA_BASE_URL}/api/generate",
+                json={
+                    "model": config.OLLAMA_MODEL,
+                    "prompt": prompt,
+                    "stream": False,
+                    "format": "json",
+                    "options": {"temperature": 0.0, "num_predict": 256},
+                },
+            )
+            r.raise_for_status()
+            obj = _parse_json_object(str(r.json().get("response") or ""))
+        idx = obj.get("index")
+        return idx if isinstance(idx, int) and 0 <= idx < len(options) else None
+    except Exception:  # noqa: BLE001
+        return None

@@ -611,3 +611,33 @@ def test_copy_closeness_and_claim_words():
     )
     assert out["advantages"] == ["Aus Polyester Oxford gefertigt"]
     assert any("Wasserdicht" in d for d in dropped)
+
+
+def test_category_falls_back_to_model_pick_among_ebay_suggestions(monkeypatch):
+    from dropship_desk import ollama_client
+    from dropship_desk.ebay import aspects as A, taxonomy
+
+    def sug(cid, name):
+        return {"category": {"categoryId": cid, "categoryName": name}, "categoryTreeNodeAncestors": []}
+
+    calls = []
+
+    def fake(method, path, **kw):
+        calls.append(path)
+        if path.endswith("get_default_category_tree_id"):
+            return {"categoryTreeId": "77"}
+        if path.endswith("get_category_suggestions"):
+            return {"categorySuggestions": [sug("1", "Buecher"), sug("20690", "Sonstige")]}
+        return {"aspects": []}
+
+    monkeypatch.setattr(taxonomy.ebay_oauth, "application_token", lambda: "t")
+    monkeypatch.setattr(ollama_client, "pick_category", lambda title, options: 1)
+    out = taxonomy.verified_listing_specifics("B0TESTCAT1", "Nylonbuerste Karaffe", "x", {}, http=fake)
+    assert out["category_id"] == "20690"
+    assert "KI-Auswahl" in out["category_path"]
+
+    monkeypatch.setattr(ollama_client, "pick_category", lambda title, options: None)
+    import pytest
+
+    with pytest.raises(A.AspectsUnverified, match="CATEGORY_UNVERIFIED"):
+        taxonomy.verified_listing_specifics("B0TESTCAT1", "Nylonbuerste Karaffe", "x", {}, http=fake)
