@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import json
+
 import httpx
 
 from dropship_desk import config
@@ -90,6 +92,23 @@ def request(
             params=params,
         )
     if response.status_code >= 400:
+        try:  # verbatim copy for support tickets (no credentials in it)
+            (config.DATA_DIR / "ebay_last_error.json").write_text(
+                json.dumps(
+                    {
+                        "method": method,
+                        "url": url,
+                        "status": response.status_code,
+                        "rlogid": response.headers.get("rlogid", ""),
+                        "body": response.text,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
         ids = {
             k.lower(): v
             for k, v in response.headers.items()
