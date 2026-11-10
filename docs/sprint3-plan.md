@@ -1,4 +1,4 @@
-# Sprint 3 plan v7 (2026-11-10) - list through the eBay web form, browser out of the way
+# Sprint 3 plan v8 (2026-11-10) - list through the eBay web form, browser out of the way
 
 Repos in this sprint: ai_dropshipping
 
@@ -8,6 +8,15 @@ Open before freeze: operator decisions D1-D3 below; Sprint 2 has no review/retro
 ## Why
 API listing fails at publish with errorId 25019 / `BLOCK_Seller_NonBlackbird_Issue607` (ref 1234519) for account butterflypro.
 The web form works (item 800851564584 by hand). Only eBay can lift the API block (support ticket open).
+
+## Delta v8 (operator, 2026-11-10): first test = ONE item
+Operator: for testing, just list a single one of the items that kept failing over the API. This replaces the 10-draft dry-run as the FIRST measurement
+(the 10-item dry run stays as the later volume bar). Test item: **B0D87HWM4W** (API offer 330522494011 at 69.99; category already verified).
+Sequence: (1) robot fills the form for that one item, reads back from eBay's review page and the Drafts row, 0 mismatches, 0 unproven fields, no submit;
+(2) the operator reviews the screenshots and types `LIVE 1` for that exact verified payload (B4 binding); (3) one live item = the operator-owned live decision
+and the first real use. One live item is therefore inside this sprint's measurement by the operator's order (supersedes the "no live write during measurement"
+rule in SPRINT-PROCESS.md for exactly this one item); D1 is `allowed` for drafts of this item and the single live submit. D2 stays a separate written acceptance
+(for the robot touching the account). B0b (CSV, 1 h) stays available but is no longer a precondition if the operator accepts D2.
 
 ## Goal (operator, 2026-11-10)
 Fully automatic path to a live item through the eBay web form: draft in the app -> real Chrome with its own profile ->
