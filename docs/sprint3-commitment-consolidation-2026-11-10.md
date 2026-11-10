@@ -46,3 +46,8 @@ All applied in plan v5. Vote r4 on v5 to all five.
 
 Disclosure: v6/v7 changes only tighten (token pins, one extra check, two read-back sources, D1-denied blocks B0b); they were not re-sent to codex, deepcode, luna, sol.
 Driver's vote (Claude): APPROVE-AS-IS on v7. Remaining before freeze: operator D1-D3 in `docs/sprint3-decisions.md`, `tools/sprint3_freeze_check.py` (P0), GitHub board cards, the operator's explicit freeze. Sprint 2 review: D3.
+
+## Rounds 7-12 (operator delta v8: first test = one live item; plans v8-v13)
+r7: 6/6 REQUEST-CHANGES (contradictions between the live probe and the zero-submit bar; B0b routing). r8: 6/6 REQUEST-CHANGES (opus explicit APPROVE, B0b scope, new B4 hash + on-disk state, D4 grammar, gate re-read before click). r9: codex, gpt61-sol APPROVE; deepcode, deepseek, luna, opus REQUEST-CHANGES (one hash schema, B0b PASS drops D4, D4 in decisions). r10: deepseek, luna, opus APPROVE; deepcode REQUEST-CHANGES (freeze check two modes). r11/r12: deepcode REQUEST-CHANGES then APPROVE on v13.
+Final: codex APPROVE (v10, r9), gpt61-sol APPROVE (v10, r9), gpt6-luna-max APPROVE (v11, r10), deepseek APPROVE (v11, r10), opus APPROVE (v11, r10; its note taken in v12), deepcode APPROVE (v13, r12). Later versions only tighten wording and were not re-sent to codex and gpt61-sol (disclosed). Driver's vote (Claude): APPROVE-AS-IS on v13.
+Remaining before freeze: operator D1-D4 in `docs/sprint3-decisions.md`, `tools/sprint3_freeze_check.py` (P0), board cards, operator's explicit freeze.
