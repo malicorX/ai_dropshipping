@@ -19,6 +19,6 @@ Rejected: none. Vote r2 follows on plan v3. Absent: none in r1.
 | gpt6-luna-max | APPROVE-AS-IS | none |
 | gpt61-sol | APPROVE-AS-IS | none |
 | opus | REQUEST-CHANGES | source class per field (amazon_page / rule_config) so unproven_fields=0 is reachable; click allowlist |
-| codex | no r2 answer recorded | absent |
+| codex | REQUEST-CHANGES | same provenance inconsistency as opus (Definitions vs B3 vs FAIL criterion); fixed in all three clauses |
 
 All requests applied in plan v4 (freeze gate script added as P0). Vote r3 on the delta to deepcode, opus, codex, deepseek (deepseek re-reads the real docs).

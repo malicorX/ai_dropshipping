@@ -39,7 +39,7 @@ gpt61-sol (B4 binding spec), gpt6-luna-max (provenance matrix). Integrator/drive
 | B0 | Spike: profile, off-screen window, session check, read-only map of the sell form | S | only after B0b = FAIL and D2 file committed |
 | B1 | Launcher + session guard + focus probe (`SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` + `GetForegroundWindow` every 100 ms, by Chrome PID with `browser_profile` in its command line; Notepad-in-front test) | M | pytest counts foreground events by PID |
 | B2 | Form filler from draft (verified category/aspects, fail closed, missing evidence blocks the run) | M | unit tests + dry run of 1 item |
-| B3 | Independent read-back: fresh reload, read eBay's review page (`readback_source: review_page`) and the Drafts row; provenance check (a field without an Amazon key fails); screenshots; draft IDs captured at creation in the `browser_runs.jsonl` line; delete only those exact IDs (never by title/position), reload, record that 0 of them remain; click allowlist: only listed non-submit buttons (Preview / Save for later) may be clicked, any other button counts as `submit_clicks`, a test fails on an unlisted click | M | `browser_runs.jsonl` line |
+| B3 | Independent read-back: fresh reload, read eBay's review page (`readback_source: review_page`) and the Drafts row; provenance check (a field without its listed source-class key fails; `amazon_page` fields need Amazon evidence, `rule_config` fields need the named rule/setting); screenshots; draft IDs captured at creation in the `browser_runs.jsonl` line; delete only those exact IDs (never by title/position), reload, record that 0 of them remain; click allowlist: only listed non-submit buttons (Preview / Save for later) may be clicked, any other button counts as `submit_clicks`, a test fails on an unlisted click | M | `browser_runs.jsonl` line |
 | B4 | Gated submit (one-way door, ceremony L): reuse `upload_items.py` confirmation/nonce machinery; the hash covers the verified field/image/policy payload and the target account; rejects same-count batch replacement, post-verification edits, stale/replayed confirmation; audit written BEFORE the click; no retry; an ambiguous outcome stays UNKNOWN across restart and is never resubmitted | M | acceptance test per rejection; "armed, then disarmed before click" run |
 | B5 | UI: choose Browser path, single-worker queue, progress, resume | M | UI test |
 | B6 | Independent review (opus) + critic (deepseek) of B1-B5 | - | verdicts on the exact commit SHA |
@@ -52,7 +52,7 @@ gpt61-sol (B4 binding spec), gpt6-luna-max (provenance matrix). Integrator/drive
 
 ## Registered bar (robot branch)
 One line in `data/browser_runs.jsonl`: >= 10 real drafts in a no-submit run; `readback_mismatch = 0`; `unproven_fields = 0`; `submit_clicks = 0`; `foreground_events_ours = 0`; one screenshot per item; `readback_source = review_page`; drafts deleted afterwards.
-**FAIL even if every task is done:** a filled value not proven on the Amazon page; any submit click during measurement; a read-back that only echoes typed values; the robot triggers an account restriction.
+**FAIL even if every task is done:** a filled value without its listed key in the per-field source-class table (Definitions); any submit click during measurement; a read-back that only echoes typed values; the robot triggers an account restriction.
 It proves filling and persistence, not publishability and not source truth. The first live submit is a separate operator decision and is the first real use (Rule 10).
 
 ## Freeze gate (mechanical)
