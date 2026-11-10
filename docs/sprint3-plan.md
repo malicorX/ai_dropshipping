@@ -1,4 +1,4 @@
-# Sprint 3 plan v5 (2026-11-10) - list through the eBay web form, browser out of the way
+# Sprint 3 plan v6 (2026-11-10) - list through the eBay web form, browser out of the way
 
 Repos in this sprint: ai_dropshipping
 
@@ -19,7 +19,7 @@ every field read back from eBay and compared -> submit only after typed `LIVE n`
 - **Source class** of every field is one of two, and each has a listed key. **Unproven field** = a filled field without its listed key
   (the field is then left empty / "Keine Angabe" instead).
   - `amazon_page` (must trace to the Amazon page): title (`draft_title` from `amazon_title`), description (`description_html` rewritten from Amazon bullets, no unproven claim), item specifics (`aspects.resolve_aspects` evidence), condition (`condition`), photos (`images`: own re-encoded files, count + hash).
-  - `rule_config` (comes from a recorded rule or setting, not from Amazon): category (`ebay_overrides.json` `category_id`, else `verified_listing_specifics` result), price (`price`, `margin.py` MarginSettings), quantity (`DEFAULT_QUANTITY` in `models.py`), policies (the policy ids in `data/ebay_production.json`). P0 pins the exact key of each in `sprint3-bar-v1.md`.
+  - `rule_config` (comes from a recorded rule or setting, not from Amazon): category (`ebay_overrides.json` `category_id`, else `verified_listing_specifics` result), price (`price`, `margin.py` MarginSettings), quantity (`DEFAULT_QUANTITY` in `dropship_desk/ebay/listing.py`), policies (the policy ids in `data/ebay_production.json`). P0 pins the exact key of each in `sprint3-bar-v1.md`.
   - **A filled field absent from this table, or a required field left empty, = FAIL.**
   `docs/sprint3-bar-v1.md` (P0) carries the same table.
 
@@ -40,7 +40,7 @@ gpt61-sol (B4 binding spec), gpt6-luna-max (provenance matrix). Integrator/drive
 | B0 | Spike: profile, off-screen window, session check, read-only map of the sell form | S | only after B0b = FAIL and D2 file committed |
 | B1 | Launcher + session guard + focus probe (`SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` + `GetForegroundWindow` every 100 ms, by Chrome PID with `browser_profile` in its command line; Notepad-in-front test) | M | pytest counts foreground events by PID |
 | B2 | Form filler from draft (verified category/aspects, fail closed, missing evidence blocks the run) | M | unit tests + dry run of 1 item |
-| B3 | Independent read-back: fresh reload, read eBay's review page (`readback_source: review_page`) and the Drafts row; provenance check (a field without its listed source-class key fails; `amazon_page` fields need Amazon evidence, `rule_config` fields need the named rule/setting); screenshots; draft IDs captured at creation in the `browser_runs.jsonl` line; delete only those exact IDs (never by title/position), reload, record that 0 of them remain; click allowlist: only the listed non-submit buttons, named by the German labels on the form ("Vorschau", "Entwurf speichern"; P0 confirms the exact labels in B0) may be clicked, any other button counts as `submit_clicks`, a test fails on an unlisted click | M | `browser_runs.jsonl` line |
+| B3 | Independent read-back: fresh reload, read eBay's review page (`readback_source: review_page`) and the Drafts row; provenance check (a field without its listed source-class key, or a required field left empty, fails; `amazon_page` fields need Amazon evidence, `rule_config` fields need the named rule/setting); screenshots; draft IDs captured at creation in the `browser_runs.jsonl` line; delete only those exact IDs (never by title/position), reload, record that 0 of them remain; click allowlist: only the listed non-submit buttons, named by the German labels on the form ("Vorschau", "Entwurf speichern"; P0 confirms the exact labels in B0) may be clicked, any other button counts as `submit_clicks`, a test fails on an unlisted click | M | `browser_runs.jsonl` line |
 | B4 | Gated submit (one-way door, ceremony L): reuse `upload_items.py` confirmation/nonce machinery; the hash covers the verified field/image/policy payload and the target account; rejects same-count batch replacement, post-verification edits, stale/replayed confirmation; audit written BEFORE the click; no retry; an ambiguous outcome stays UNKNOWN across restart and is never resubmitted | M | acceptance test per rejection; "armed, then disarmed before click" run |
 | B5 | UI: choose Browser path, single-worker queue, progress, resume | M | UI test |
 | B6 | Independent review (opus) + critic (deepseek) of B1-B5 | - | verdicts on the exact commit SHA |
@@ -53,11 +53,11 @@ gpt61-sol (B4 binding spec), gpt6-luna-max (provenance matrix). Integrator/drive
 
 ## Registered bar (robot branch)
 One line in `data/browser_runs.jsonl`: >= 10 real drafts in a no-submit run; `readback_mismatch = 0`; `unproven_fields = 0`; `submit_clicks = 0`; `foreground_events_ours = 0`; one screenshot per item; `readback_source = review_page`; drafts deleted afterwards.
-**FAIL even if every task is done:** a filled value without its listed key in the per-field source-class table (Definitions); any submit click during measurement; a read-back that only echoes typed values; the robot triggers an account restriction.
+**FAIL even if every task is done:** a filled value without its listed key in the per-field source-class table (Definitions), or a required field left empty; any submit click during measurement; a read-back that only echoes typed values; the robot triggers an account restriction.
 It proves filling and persistence, not publishability and not source truth. The first live submit is a separate operator decision and is the first real use (Rule 10).
 
 ## Freeze gate (mechanical)
-`tools/sprint3_freeze_check.py` (P0) parses `docs/sprint3-decisions.md`; pinned line format `D<n> | value | YYYY-MM-DD` for n = 1,2,3; exits non-zero on a missing/malformed line or a D2 value that is not `accepted`. It is run by `pytest` (so every landing runs it once the file exists as a gate) and by B0/B1 start-up. P0 done-when: a pytest seeds a deleted/garbled D-line and asserts non-zero exit. The check proves the decisions are present; it does not prove the robot is safe.
+`tools/sprint3_freeze_check.py` (P0) parses `docs/sprint3-decisions.md`; pinned line format `D<n> | value | YYYY-MM-DD` for n = 1,2,3; exits non-zero on a missing/malformed line, D1 not in {`allowed`,`denied`}, D2 not in {`accepted`,`declined`,`after-b0b`}, D3 not in {`waived`,`closed`}; D1 `denied` or D2 `declined` blocks every browser task, D2 `after-b0b` allows only B0b. It is run by `pytest` (so every landing runs it once the file exists as a gate) and by B0/B1 start-up. P0 done-when: a pytest seeds a deleted/garbled D-line and asserts non-zero exit. The check proves the decisions are present; it does not prove the robot is safe.
 
 ## Operator decisions needed before freeze
 - **D1** Allow creating unpublished DRAFTS on the production account during Sprint 3 measurement (amends SPRINT-PROCESS.md "no live eBay write": live write is redefined as publish/submit). Without it the bar cannot be measured (the form has no sandbox).
