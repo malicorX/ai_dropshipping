@@ -215,3 +215,22 @@ def test_repository_decisions_pass_default_gate(tmp_path):
     # Every pytest landing validates the committed decisions, from any cwd.
     result = subprocess.run([sys.executable, str(TOOL)], cwd=tmp_path, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("value", ["declined", "after-b0b"])
+def test_live_mode_requires_d2_accepted_with_risk_file_present(decision_file, value):
+    replace_line(decision_file, "D2", f"D2 | {value} | 2026-11-10")
+    assert (decision_file.parent / "sprint3-risk-acceptance.md").is_file()
+    assert_violation(run_check(decision_file, True), "D2: --require-live requires accepted")
+
+
+@pytest.mark.parametrize("kind", ["directory", "invalid-utf8"])
+def test_verdict_that_cannot_be_read_fails_closed(decision_file, kind):
+    data = decision_file.parent.parent / "data"
+    data.mkdir()
+    verdict = data / "b0b_verdict.json"
+    if kind == "directory":
+        verdict.mkdir()
+    else:
+        verdict.write_bytes(b"\xff\xfe\xfa{")
+    assert_violation(run_check(decision_file, True), "B0b verdict")
