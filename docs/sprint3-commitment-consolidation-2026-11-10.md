@@ -22,3 +22,14 @@ Rejected: none. Vote r2 follows on plan v3. Absent: none in r1.
 | codex | REQUEST-CHANGES | same provenance inconsistency as opus (Definitions vs B3 vs FAIL criterion); fixed in all three clauses |
 
 All requests applied in plan v4 (freeze gate script added as P0). Vote r3 on the delta to deepcode, opus, codex, deepseek (deepseek re-reads the real docs).
+
+## Round 3 (plan v4)
+| seat | vote | requests |
+|---|---|---|
+| codex | APPROVE-AS-IS | none |
+| opus | APPROVE-AS-IS | notes (taken): exact config keys, German button labels, UNKNOWN needs a time limit and no default |
+| deepcode | REQUEST-CHANGES | pin D-line format + test; description field missing from table, required-empty = FAIL |
+| deepseek | REQUEST-CHANGES | verbatim PASS rule + on-disk confirmation path; freeze check run by CI/test with seeded-violation test (seat voted on the delta only, retrieval stale) |
+| gpt6-luna-max, gpt61-sol | approved v3 in r2; v4/v5 changes only tighten, re-asked in r4 |
+
+All applied in plan v5. Vote r4 on v5 to all five.
