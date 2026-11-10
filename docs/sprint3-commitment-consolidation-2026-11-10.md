@@ -10,3 +10,15 @@
 
 Converged (>=3 seats) and applied in plan v3: one provenance wording with proving keys (5/5); risk acceptance file before any automated filling, fallback no longer unsigned (4/5); B0b three-outcome verdict (3/5). Two seats: live-write definition + operator decision D1 (a standing-rule conflict, so taken); named builder/reviewer. Single seats, taken: B4 binding, readback_source, CSV-branch bar; Sprint 2 closure -> D3.
 Rejected: none. Vote r2 follows on plan v3. Absent: none in r1.
+
+## Round 2 (plan v3)
+| seat | vote | requests |
+|---|---|---|
+| deepcode | REQUEST-CHANGES | B0b PASS must not rest on a live publish; B3 draft deletion bound to captured IDs |
+| deepseek | APPROVE-AS-IS | D1-D3 need a mechanical freeze gate (note: seat saw only a code-map excerpt, not the docs) |
+| gpt6-luna-max | APPROVE-AS-IS | none |
+| gpt61-sol | APPROVE-AS-IS | none |
+| opus | REQUEST-CHANGES | source class per field (amazon_page / rule_config) so unproven_fields=0 is reachable; click allowlist |
+| codex | no r2 answer recorded | absent |
+
+All requests applied in plan v4 (freeze gate script added as P0). Vote r3 on the delta to deepcode, opus, codex, deepseek (deepseek re-reads the real docs).
