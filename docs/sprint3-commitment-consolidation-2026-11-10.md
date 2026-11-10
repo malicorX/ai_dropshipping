@@ -33,3 +33,16 @@ All requests applied in plan v4 (freeze gate script added as P0). Vote r3 on the
 | gpt6-luna-max, gpt61-sol | approved v3 in r2; v4/v5 changes only tighten, re-asked in r4 |
 
 All applied in plan v5. Vote r4 on v5 to all five.
+
+## Rounds 4-6 (plans v5-v7)
+| seat | r4 (v5) | r5/r6 | final |
+|---|---|---|---|
+| codex | APPROVE | - | APPROVE (on v5) |
+| deepcode | APPROVE | - | APPROVE (on v5; note: D1/D3 tokens, taken in v6) |
+| gpt6-luna-max | APPROVE | - | APPROVE (on v5) |
+| gpt61-sol | APPROVE | - | APPROVE (on v5) |
+| opus | REQUEST-CHANGES (quantity key location, required-empty clause) | r5 APPROVE on v6 | APPROVE (on v6) |
+| deepseek | REQUEST-CHANGES (could not read files) | r5 REQUEST-CHANGES (D1 denied blocks B0b; two read-back sources); r6 APPROVE on v7 | APPROVE (on v7) |
+
+Disclosure: v6/v7 changes only tighten (token pins, one extra check, two read-back sources, D1-denied blocks B0b); they were not re-sent to codex, deepcode, luna, sol.
+Driver's vote (Claude): APPROVE-AS-IS on v7. Remaining before freeze: operator D1-D3 in `docs/sprint3-decisions.md`, `tools/sprint3_freeze_check.py` (P0), GitHub board cards, the operator's explicit freeze. Sprint 2 review: D3.
