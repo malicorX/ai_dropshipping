@@ -1,8 +1,8 @@
-# Sprint 3 plan v10 (2026-11-10) - list through the eBay web form, browser out of the way
+# Sprint 3 plan v11 (2026-11-10) - list through the eBay web form, browser out of the way
 
 Repos in this sprint: ai_dropshipping
 
-**Status: v10 after delta votes r7/r8 (history in sprint3-commitment-consolidation-2026-11-10.md). Not frozen.**
+**Status: v11 after delta votes r7-r9 (history in sprint3-commitment-consolidation-2026-11-10.md). Not frozen.**
 Open before freeze: operator decisions D1-D3 below; Sprint 2 has no review/retro yet (operator waives or closes it first).
 
 ## Why
@@ -55,7 +55,7 @@ gpt61-sol (B4 binding spec), gpt6-luna-max (provenance matrix). Integrator/drive
 | B6 | Independent review (opus) + critic (deepseek) of B1-B5 | - | verdicts on the exact commit SHA |
 
 ## B0b verdict (three outcomes, no silent pass)
-- Scope: PASS-cancels and UNKNOWN-stops below bind only when D2 = `after-b0b`. When D2 = `accepted`, B0b outcomes are recorded but neither cancel nor block B0-B5. A PASS then ends the volume plan for the robot (CSV is chosen for volume); the D4 live probe still needs the operator to re-confirm D4 (ask).
+- Scope: PASS-cancels and UNKNOWN-stops below bind only when D2 = `after-b0b`. When D2 = `accepted`, B0b outcomes are recorded but neither cancel nor block B0-B5. A PASS then ends the volume plan for the robot (CSV is chosen for volume); the D4 live probe is DROPPED with the robot branch (no B4 is built); the operator may reopen it only through a new delta vote.
 - **PASS**: one unpublished draft survives a fresh reload with readable fields within 60 min AND support confirms in writing that CSV publish is not blocked. Verbatim rule: PASS requires `status == PASS` in `data/b0b_verdict.json`; UNKNOWN and FAIL both block; timeout or silence maps to UNKNOWN. The written support confirmation is stored on disk at `data/support/b0b_confirmation.txt` (not chat); no file = no PASS. A live publish, if the operator ever authorises one, is recorded outside B0b and cannot set its verdict. Then B0-B5 are cancelled and the CSV-branch bar applies.
 - **FAIL**: upload impossible or draft unreadable -> go on to B0 (needs D2).
 - **UNKNOWN**: draft-only success, or support silence. A draft does not show 25019 is avoided (the block fires at publish). UNKNOWN is not FAIL: stop and return to the operator. If support is silent for 7 days (from the day the question is sent), the operator is asked to choose: wait longer, accept D2 and go to B0, or manual operation only. There is no automatic default.
@@ -63,7 +63,7 @@ gpt61-sol (B4 binding spec), gpt6-luna-max (provenance matrix). Integrator/drive
 
 ## Registered bar (robot branch)
 Two separate record kinds in `data/browser_runs.jsonl`:
-- `kind = live_probe` (D4, exactly one line, only B0D87HWM4W): fill, read-back 0 mismatches / 0 unproven fields, then ONE operator-typed `LIVE 1` submit; the typed confirmation carries the verified payload hash (reuse `upload_items.py` nonce machinery, hash over env, seller id, all verified fields/images/policies); the pre-click audit records the gate names from `config.live_write_gate_missing()` and the hash, and a closed gate aborts (test). The D4 draft is retained for the submit (not deleted by B3 cleanup). The submit is logged in `live_audit.jsonl` and is not counted in the draft bar.
+- `kind = live_probe` (D4, exactly one line, only B0D87HWM4W): fill, read-back 0 mismatches / 0 unproven fields, then ONE operator-typed `LIVE 1` submit; the typed confirmation carries the verified payload hash in B4's single canonical schema (env, seller id, target account, eBay draft ID, all verified fields/images/policies; on-disk arm/UNKNOWN record, no in-memory nonces); the pre-click audit records the gate names from `config.live_write_gate_missing()` and the hash, and a closed gate aborts (test). The D4 draft is retained for the submit (not deleted by B3 cleanup). The submit is logged in `live_audit.jsonl` and is not counted in the draft bar.
 - `kind = draft_bar`: >= 10 real drafts in a no-submit run; `readback_mismatch = 0`; `unproven_fields = 0`; `submit_clicks = 0`; `foreground_events_ours = 0`; one screenshot per item; `readback_sources = review_page,drafts_row` (both required per line); drafts deleted afterwards.
 **FAIL even if every task is done:** a filled value without its listed key in the per-field source-class table (Definitions), or a required field left empty; any submit click during measurement; a read-back that only echoes typed values; the robot triggers an account restriction.
 It proves filling and persistence, not publishability and not source truth. The first live submit is a separate operator decision and is the first real use (Rule 10).
@@ -75,6 +75,7 @@ It proves filling and persistence, not publishability and not source truth. The 
 `tools/sprint3_freeze_check.py` (P0) parses `docs/sprint3-decisions.md`; pinned line format `D<n> | value | YYYY-MM-DD` for n = 1,2,3 and, as the sole allowed D4 form, exactly one line `D4 | live-1-B0D87HWM4W | YYYY-MM-DD` (ASIN must match; missing, duplicate, other value or malformed = non-zero exit; `LIVE 1` is refused without it; pytest for a malformed D4); exits non-zero on a missing/malformed line, D1 not in {`allowed`,`denied`}, D2 not in {`accepted`,`declined`,`after-b0b`}, D3 not in {`waived`,`closed`}; D1 means unpublished drafts only (live writes are expressed solely by D4, so `allowed` never authorises a submit); D1 `denied` blocks every browser task AND B0b; D2 `declined` blocks every browser task; D2 `after-b0b` permits B0b only when D1 = `allowed`; when D2 = `accepted` the check also fails if `docs/sprint3-risk-acceptance.md` is missing. It is run by `pytest` (so every landing runs it once the file exists as a gate) and by B0/B1 start-up. P0 done-when: a pytest seeds a deleted/garbled D-line and asserts non-zero exit. The check proves the decisions are present; it does not prove the robot is safe.
 
 ## Operator decisions needed before freeze
+- **D4** (live probe of B0D87HWM4W): recorded as `D4 | live-1-B0D87HWM4W | date`. The freeze check requires D1-D3 at every run; D4 is required only at `LIVE 1` time (so landings stay green before it is decided).
 - **D1** Allow creating unpublished DRAFTS on the production account during Sprint 3 measurement (amends SPRINT-PROCESS.md "no live eBay write": live write is redefined as publish/submit). Without it the bar cannot be measured (the form has no sandbox).
 - **D2** Written account-risk acceptance (committed file `docs/sprint3-risk-acceptance.md`, confirmed by the operator in chat) before ANY automated browser filling, including "robot fills, operator clicks submit" (manual submit does not remove the automated-access risk). Declined = manual operation only.
 - **D3** Sprint 2: close with a short review, or explicitly waive it for Sprint 3.
