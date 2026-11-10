@@ -20,7 +20,7 @@ Modelled on malicorX/projects/18 (ai_rsiHelper). Authority for the generic cerem
 
 ## Hard safety rule for every sprint (revised 2026-10-19 by the operator)
 
-No Amazon purchase, ever. No live eBay write during a sprint measurement or a test: the measured bar must be reachable in Sandbox only. A live path may be BUILT behind the gate (both flags `EBAY_AUTOMATION_ENABLED` + `EBAY_ALLOW_LIST`, server-side typed confirmation, batch cap); its first real use is a separate operator decision. Default settings: flags false, Settings on Sandbox. (Sprint 1 said "no live write, ever"; superseded by the operator's Sprint 2 goal.)
+No Amazon purchase, ever. No live eBay write during a sprint measurement or a test: the measured bar must be reachable in Sandbox only. A live path may be BUILT behind the gate (both flags `EBAY_AUTOMATION_ENABLED` + `EBAY_ALLOW_LIST`, server-side typed confirmation, batch cap); its first real use is a separate operator decision. Sprint 3 exception (operator 2026-11-10, recorded as D4): exactly one live submit of B0D87HWM4W through the browser path after all D4 preconditions in docs/sprint3-plan.md. Default settings: flags false, Settings on Sandbox. (Sprint 1 said "no live write, ever"; superseded by the operator's Sprint 2 goal.)
 
 ## Sprint 1 (2026-10-13): SUPERSEDED, never frozen, never run (archive: docs/sprints/sprint-1-overview.md)
 

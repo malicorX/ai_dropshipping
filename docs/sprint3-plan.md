@@ -1,4 +1,4 @@
-# Sprint 3 plan v8 (2026-11-10) - list through the eBay web form, browser out of the way
+# Sprint 3 plan v9 (2026-11-10) - list through the eBay web form, browser out of the way
 
 Repos in this sprint: ai_dropshipping
 
@@ -23,7 +23,7 @@ Fully automatic path to a live item through the eBay web form: draft in the app 
 every field read back from eBay and compared -> submit only after typed `LIVE n`.
 
 ## Definitions (one wording, used everywhere)
-- **Live write** = publish / activate / any submit click that makes an item visible. Forbidden during measurement.
+- **Live write** = publish / activate / any submit click that makes an item visible. Forbidden during the `draft_bar` measurement. The ONLY exception is the single D4 live probe (below): exactly one B0D87HWM4W submit, bound to the post-read-back audited payload hash; a second or unbound submit = FAIL.
 - **Draft** = unpublished item eBay stores (autosave). Creating drafts in the production account needs operator decision D1.
 - **Source class** of every field is one of two, and each has a listed key. **Unproven field** = a filled field without its listed key
   (the field is then left empty / "Keine Angabe" instead).
@@ -45,8 +45,8 @@ gpt61-sol (B4 binding spec), gpt6-luna-max (provenance matrix). Integrator/drive
 | id | task | size | done when |
 |---|---|---|---|
 | P0 | Freeze the bar schema + provenance matrix (fields above, comparison rule per field) before any code | S | committed `docs/sprint3-bar-v1.md`, byte-identical bar text in plan and briefs |
-| B0b | **FIRST GATE, 1 h:** Seller Hub CSV upload of ONE row as unpublished draft (needs D1), read back after fresh reload; ask the open support ticket whether the block covers CSV publish | S | `data/b0b_verdict.json` = PASS / FAIL / UNKNOWN (below) |
-| B0 | Spike: profile, off-screen window, session check, read-only map of the sell form | S | only after B0b = FAIL and D2 file committed |
+| B0b | **FIRST GATE unless D2 = `accepted` (then optional, runs in parallel, verdicts still recorded), 1 h:** Seller Hub CSV upload of ONE row as unpublished draft (needs D1), read back after fresh reload; ask the open support ticket whether the block covers CSV publish | S | `data/b0b_verdict.json` = PASS / FAIL / UNKNOWN (below) |
+| B0 | Spike: profile, off-screen window, session check, read-only map of the sell form | S | routing: D2 `accepted` -> B0 runs first, B0b optional; D2 `after-b0b` -> only after B0b = FAIL; the D2 file `docs/sprint3-risk-acceptance.md` must exist either way. The freeze-check tests enforce this routing |
 | B1 | Launcher + session guard + focus probe (`SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` + `GetForegroundWindow` every 100 ms, by Chrome PID with `browser_profile` in its command line; Notepad-in-front test) | M | pytest counts foreground events by PID |
 | B2 | Form filler from draft (verified category/aspects, fail closed, missing evidence blocks the run) | M | unit tests + dry run of 1 item |
 | B3 | Independent read-back: fresh reload, read eBay's review page (`readback_sources: review_page, drafts_row`) and the Drafts row; provenance check (a field without its listed source-class key, or a required field left empty, fails; `amazon_page` fields need Amazon evidence, `rule_config` fields need the named rule/setting); screenshots; draft IDs captured at creation in the `browser_runs.jsonl` line; delete only those exact IDs (never by title/position), reload, record that 0 of them remain; click allowlist: only the listed non-submit buttons, named by the German labels on the form ("Vorschau", "Entwurf speichern"; P0 confirms the exact labels in B0) may be clicked, any other button counts as `submit_clicks`, a test fails on an unlisted click | M | `browser_runs.jsonl` line |
@@ -61,12 +61,17 @@ gpt61-sol (B4 binding spec), gpt6-luna-max (provenance matrix). Integrator/drive
 - **CSV-branch bar** (if PASS): >= 10 drafts uploaded from app-generated CSV, read back from the Seller Hub Drafts page, 0 mismatches, 0 unproven fields.
 
 ## Registered bar (robot branch)
-One line in `data/browser_runs.jsonl`: >= 10 real drafts in a no-submit run; `readback_mismatch = 0`; `unproven_fields = 0`; `submit_clicks = 0`; `foreground_events_ours = 0`; one screenshot per item; `readback_sources = review_page,drafts_row` (both required per line); drafts deleted afterwards.
+Two separate record kinds in `data/browser_runs.jsonl`:
+- `kind = live_probe` (D4, exactly one line, only B0D87HWM4W): fill, read-back 0 mismatches / 0 unproven fields, then ONE operator-typed `LIVE 1` submit; the typed confirmation carries the verified payload hash (reuse `upload_items.py` nonce machinery, hash over env, seller id, all verified fields/images/policies); the pre-click audit records the gate names from `config.live_write_gate_missing()` and the hash, and a closed gate aborts (test). The D4 draft is retained for the submit (not deleted by B3 cleanup). The submit is logged in `live_audit.jsonl` and is not counted in the draft bar.
+- `kind = draft_bar`: >= 10 real drafts in a no-submit run; `readback_mismatch = 0`; `unproven_fields = 0`; `submit_clicks = 0`; `foreground_events_ours = 0`; one screenshot per item; `readback_sources = review_page,drafts_row` (both required per line); drafts deleted afterwards.
 **FAIL even if every task is done:** a filled value without its listed key in the per-field source-class table (Definitions), or a required field left empty; any submit click during measurement; a read-back that only echoes typed values; the robot triggers an account restriction.
 It proves filling and persistence, not publishability and not source truth. The first live submit is a separate operator decision and is the first real use (Rule 10).
 
+## D4 live probe preconditions (all mechanical or recorded)
+`LIVE 1` is accepted only when: freeze check exit 0 (incl. `D4 | live-1-B0D87HWM4W | <date>` line, which the check validates); B4 acceptance tests pass on the executed commit, incl. durable UNKNOWN across restart; opus has given a B6 verdict on that exact SHA; D2 = `accepted` and the risk-acceptance file exists. Zero read-back mismatches alone never enables the submit. `SPRINT-PROCESS.md` carries the matching one-line exception.
+
 ## Freeze gate (mechanical)
-`tools/sprint3_freeze_check.py` (P0) parses `docs/sprint3-decisions.md`; pinned line format `D<n> | value | YYYY-MM-DD` for n = 1,2,3; exits non-zero on a missing/malformed line, D1 not in {`allowed`,`denied`}, D2 not in {`accepted`,`declined`,`after-b0b`}, D3 not in {`waived`,`closed`}; D1 `denied` blocks every browser task AND B0b; D2 `declined` blocks every browser task; D2 `after-b0b` permits B0b only when D1 = `allowed`; when D2 = `accepted` the check also fails if `docs/sprint3-risk-acceptance.md` is missing. It is run by `pytest` (so every landing runs it once the file exists as a gate) and by B0/B1 start-up. P0 done-when: a pytest seeds a deleted/garbled D-line and asserts non-zero exit. The check proves the decisions are present; it does not prove the robot is safe.
+`tools/sprint3_freeze_check.py` (P0) parses `docs/sprint3-decisions.md`; pinned line format `D<n> | value | YYYY-MM-DD` for n = 1,2,3; exits non-zero on a missing/malformed line, D1 not in {`allowed`,`denied`}, D2 not in {`accepted`,`declined`,`after-b0b`}, D3 not in {`waived`,`closed`}; D1 means unpublished drafts only (live writes are expressed solely by D4, so `allowed` never authorises a submit); D1 `denied` blocks every browser task AND B0b; D2 `declined` blocks every browser task; D2 `after-b0b` permits B0b only when D1 = `allowed`; when D2 = `accepted` the check also fails if `docs/sprint3-risk-acceptance.md` is missing. It is run by `pytest` (so every landing runs it once the file exists as a gate) and by B0/B1 start-up. P0 done-when: a pytest seeds a deleted/garbled D-line and asserts non-zero exit. The check proves the decisions are present; it does not prove the robot is safe.
 
 ## Operator decisions needed before freeze
 - **D1** Allow creating unpublished DRAFTS on the production account during Sprint 3 measurement (amends SPRINT-PROCESS.md "no live eBay write": live write is redefined as publish/submit). Without it the bar cannot be measured (the form has no sandbox).
