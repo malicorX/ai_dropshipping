@@ -1,0 +1,8 @@
+# Sprint 3 B0 fix + form stage (builder: codex) - ai_dropshipping
+Work ONLY in this worktree (branch sprint3-b0, on top of 8511ea4). No push. `PARTIAL: ...` into `_heartbeat.txt` once a minute (not committed). Same hard rules as .ai-briefs/sprint3-B0-build.md (read-only, no click/fill/type/press/bring_to_front, no password handling, off-screen headed).
+Opus review of 8511ea4 (PASS-WITH-FIX), read it as the requirement: fixes
+1. Any `/splashui/` URL path = `challenge_observed` (at hub AND sell stage); the sell stage must stop unless it lands on an allowlisted path; the stop reason must say challenge, not "log in". Tests for both stages (RED first, paste the failure into `_report.md`).
+2. Test that rejects `click|submit|focus|dispatchEvent|.value` inside `SNAPSHOT_SCRIPT`.
+3. Fake page screenshot asserts `full_page=False`.
+New stage (operator go, option 1): after the hub, load the listing form BY URL ONLY (page load, nothing typed or clicked), trying in order at most 3 candidate URLs (module constant, easy to change): `https://www.ebay.de/sl/prelist/suggest`, `https://www.ebay.de/lstng?mode=AddItem`, `https://www.ebay.de/sl/sell`. Stop at the first page whose snapshot shows form-like labels; stop immediately on challenge/logged-out. Record the visited path, all button/link labels and field labels in `data/b0_form_map.json`, and pin exact `Vorschau` / `Entwurf speichern` (or the real labels) into `click_allowlist_candidates` only if observed. Do not run it against eBay yourself.
+Mutants: re-run the survivors opus named (click in SNAPSHOT_SCRIPT, full_page=True) and show they now fail. Full suite result into `_report.md`.
